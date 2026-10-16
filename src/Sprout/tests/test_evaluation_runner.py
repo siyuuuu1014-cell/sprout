@@ -1,12 +1,27 @@
 """The offline evaluator is fail-closed and never reads a user's project."""
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from Sprout.evaluation.fixtures import CASES
-from Sprout.evaluation.runner import run_suite
+from Sprout.evaluation.runner import _repo, run_suite
+
+
+def test_generated_fixture_conftest_passes_ruff(tmp_path):
+    case = next(case for case in CASES if case.id == "C01")
+    repo = _repo(tmp_path, case)
+    result = subprocess.run(
+        [sys.executable, "-m", "ruff", "check", "conftest.py", "--no-cache"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_catalog_has_ten_stable_unique_cases():

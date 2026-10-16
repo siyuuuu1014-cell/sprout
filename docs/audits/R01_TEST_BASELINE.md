@@ -6,10 +6,12 @@
 
 ## 范围与约束
 
-只修改测试 fixture、测试替身/子进程环境、测试运行脚本和 CI。没有修改 Runtime、
-Broker、审批、存储 schema、任务执行或 evaluation 业务实现，也没有恢复八份历史文档。
+修改测试 fixture、测试替身/子进程环境、测试运行脚本和 CI；首轮审查修正另获授权，
+仅在 evaluation 生成的 conftest 导入块后增加空行。没有修改 Runtime、Broker、审批、
+存储 schema、任务执行、评测目标/Oracle/门禁，也没有恢复八份历史文档。
 文档恢复另开分支/PR，按用户决定分别归档至 docs/runbooks 和 docs/archive。
-当前分支未 push、merge、部署；不以本地验证冒充远端 Actions 验收。
+当前已有 [Draft PR #2](https://github.com/siyuuuu1014-cell/sprout/pull/2)。本轮审查修正
+仅允许本地修改/提交，不再 push，不 merge、不转 Ready、不部署。
 
 ## 示例测试：修复真实收集错误
 
@@ -30,8 +32,9 @@ python scripts/ci_baseline.py --output .workbuddy/test-runs/r01-new-run --python
 
 output 必须不存在；脚本不会删除或复用旧证据，也不清理用户 `.venv`。它执行：
 
-1. 复制当前 Git 跟踪源码，以及明确列出的本轮新增 fixture/脚本/CI 文件；保存逐文件
-   SHA256 清单。不会复制任意未跟踪文件、忽略的 .env、用户数据库或既有虚拟环境。
+1. 仅以 `git ls-files -z` 清单复制 Git 跟踪文件的当前工作树内容，保存逐文件 SHA256
+   清单；不再递归扫描补充文件。新文件须显式纳入版本控制后才进入快照。不会复制任意
+   未跟踪文件、忽略的 .env、用户数据库或既有虚拟环境；跟踪文件仍须提交前审查。
 2. 在该新目录中运行 Python/uv 版本、`uv lock --check --python ...`、
    `uv sync --locked --group dev --python ...`。独立 venv/cache，不更新源仓库 uv.lock。
 3. 导入 Sprout、CLI、Web、pytest、ruff；运行 `ruff check . --no-cache`。
@@ -89,8 +92,8 @@ python -m pytest -p scripts.ci_support.pytest_gates --integration-gates=temporal
 - setup-uv v6.1.0 → f0ec1fc3b38f5e7cd731bb6ce540c5af426746bb
 - upload-artifact v4.6.2 → ea165f8d65b6e75b540449e92b4886f43607fa02
 
-远端执行状态：Ubuntu/Python 3.12 **not_run**；Windows/Python 3.13 Actions **not_run**。
-未获 push 授权，不上传分支以触发 CI。本地 Windows 验证另列，不能代替 Ubuntu 结果。
+远端首轮真实结果见末尾“PR #2 首轮审查修正”。两平台均已 completed/failure，
+不是 not_run 或 in_progress；本轮未推送修正，因此远端尚未验证修正后的代码。
 
 ## 首轮真实检查与根因归类
 
@@ -107,11 +110,11 @@ python -m pytest -p scripts.ci_support.pytest_gates --integration-gates=temporal
 |---|---|---|
 | 4 个 preflight 测试替身过期 | `test_coding_preflight.py` 的 SimpleNamespace 缺少 Runtime._isolated_execution_wait；真实调用在 runtime.py:2589，实现在2556 | 测试替身绑定真实 helper，保留所有原断言，不 mock 返回值、不改 Runtime |
 | CLI 子进程失去测试 home bootstrap | `test_lanediag.py:263` 原来覆盖整个 PYTHONPATH，导致隔离环境不能解析 home | 只在测试层保留已有 PYTHONPATH 并附加源码路径，不读取真实 home |
-| 固定评测生成的 conftest 不满足 ruff | `evaluation/runner.py:87` 生成 imports 后缺空行，I001；C01/C02/C03/R01 验证失败，scenario_passed=6，不是10 | **保留失败，不改业务代码/报告/断言**；需用户单独批准最小生成格式修复 |
+| 固定评测生成的 conftest 不满足 ruff | `evaluation/runner.py:87` 生成 imports 后缺空行，I001；C01/C02/C03/R01 验证失败，scenario_passed=6，不是10 | 首轮保留失败；PR #2 审查后用户已批准最小格式修复，见末节 |
 
 最后一项的 pytest 和输入输出可通过，但 ruff 失败使 verified=false，这是正确的
 fail-closed 结果；不能降低门禁或把预期10改成6。查看首轮 C01/verification.json 与
-l1.log 可复核。它使“完整 L1 全绿”的 DoD 尚未满足。
+l1.log 可复核。该段记录首次发现时的证据，修正后结论见末节。
 
 ## TaskStatus 文档纠偏（F14，仅列当前源码事实）
 
@@ -131,7 +134,7 @@ v1 的文字清单漏列 discovering/ready；本轮不新增、重命名或迁�
 最终复验结果在下节填写；只要有失败/未运行的目标平台，就不能宣称完整验收完成。
 本轮到 R01 停止，不进入 R02。
 
-## 最终复验
+## 首次交付复验（历史结果，修正前）
 
 最终证据：`.workbuddy/test-runs/r01-clean-windows-reviewed/`。
 
@@ -144,8 +147,8 @@ v1 的文字清单漏列 discovering/ready；本轮不新增、重命名或迁�
 | 两个示例 | **18 passed，0 failed，0 skipped**，0.13s |
 | R00 disclosure | **67 passed，0 failed，0 skipped**，0.22s；R00两个文件blob与基线相同 |
 | 完整离线L1 | **2336 passed，1 failed，1 skipped，58 deselected/not_run，2 warnings**，261.98s；exit 1 |
-| Ubuntu/Python3.12 Actions | not_run，未push/触发 |
-| Windows/Python3.13 Actions | not_run，本地执行不是Actions证明 |
+| Ubuntu/Python3.12 Actions | 此次本地执行未验证；后续真实 Actions 见末节 |
+| Windows/Python3.13 Actions | 此次为本地执行；后续真实 Actions 见末节 |
 
 18项示例、67项R00和新增13项CI合同均包含在完整L1中，不重复累加。
 跳过1项为 `test_authz.py::test_read_broker_rejects_symlink_escape`：当前Windows环境
@@ -187,21 +190,103 @@ Docker故障+Temporal2、Docker+Temporal+model1、Temporal+model1、外部数据
 
 ### DoD与阻塞
 
-**R01尚未满足完整验收DoD，不应合并为全绿基线。** 示例收集错误已解决，干净环境
-安装/完整收集/R00回归和CI配置已交付；但固定评测仍失败，两个目标平台的远端Actions
-也尚未执行。截至首轮交付没有创建本地提交或PR，没有push/merge；后续分支流程记录见下节。
-
-建议用户下一轮单独批准最小修复：仅在 `src/Sprout/evaluation/runner.py:87` 生成的
-conftest导入块后补规范空行，保留十场景要求、所有验证命令与断言，再复验L1。
-这是建议，**本轮未修改该业务文件**。远端CI则须用户审查后另行授权push/PR，不能在
-本轮自行执行。R02不启动。
+首次交付因固定评测失败未满足 DoD；该结论保留为历史记录。当前审查修正状态、
+真实远端结果及剩余阻塞见末节。R02不启动。
 
 ## 独立分支流程复核（2026-10-16）
 
 用户再次确认每个Rxx独立开发分支、独立PR、审核后合并。本轮开始时已在
 codex/r01-baseline-ci，HEAD及远端dev均为32e5f734，远端尚无R01分支；此前15个
 R01文件已经暂存，没有额外未暂存修改。本轮复用该分支，不重建或覆盖它。
-将长期流程写入AGENTS.md，并准备R01_PR_DESCRIPTION.md本地待审说明。
-允许制作本地草稿提交，但不代表R01验收完成；不push、不创建远端PR、不merge。
+将长期流程写入AGENTS.md，并准备R01_PR_DESCRIPTION.md待审说明。
+随后经用户明确授权，提交 d08de1133b709a0dc5fd1e643efd91bc9192853a 已推送并创建 Draft PR #2。
 完整L1数字仍来自上节明确记录的执行，本轮流程记录不冒充一次新的全量测试。
-eval模板仍未获单独修改授权，保持原样；历史文档恢复仍在本轮范围之外。
+首次交付未改 eval 模板；首轮审查已批准本节之后的最小修正。历史文档恢复仍不在范围内。
+
+## PR #2 首轮审查修正（2026-10-16）
+
+开始时分支 `codex/r01-baseline-ci`、HEAD `d08de1133b709a0dc5fd1e643efd91bc9192853a`，
+工作树/暂存区干净；`git ls-remote` 确认远端任务分支同 SHA，远端 dev 仍为起点 32e5f734。
+PR #2 保持 Draft。本轮不推送、不合并、不新建 PR、不修改 dev。
+
+### 修改与红灯证据
+
+- `evaluation/runner.py::_repo()` 唯一生产差异是在生成 conftest 的 import 块后增加 `\n`。
+  新增 `test_evaluation_runner.py::test_generated_fixture_conftest_passes_ruff`；未改变现有
+  10 场景、断言、通过门禁、Oracle、执行命令或预期。
+- `scripts/ci_baseline.py::snapshot()` 删除目录 rglob 补充逻辑，仅用 Git 跟踪清单。
+  `test_ci_baseline.py::test_snapshot_excludes_untracked_sensitive_files_without_deleting_them`
+  在临时 Git 仓库的 scripts、fixtures、workflows 分别放置未跟踪的模拟敏感文件，
+  断言不复制、不进入 manifest、原文件字节保留。没有删除用户文件。
+- 修复前实际执行：模板回归 **1 failed**（Ruff I001）；快照回归 **3 failed、13 deselected**
+  （三个模拟文件均被复制）。修复后联合固定评测、模板、CI 合同 **18 passed、0 failed、
+  0 skipped**，37.22s。固定评测仍要求 10/10，不是放宽成 6/10。
+
+失败回归精确命令（使用授权的本地解释器，关闭缓存）：
+
+```powershell
+.\.venv\Scripts\python.exe -B -m pytest -q src/Sprout/tests/test_ci_baseline.py -k snapshot -p no:cacheprovider --basetemp=.workbuddy/test-runs/r01-review-snapshot-red --tb=short
+.\.venv\Scripts\python.exe -B -m pytest -q src/Sprout/tests/test_evaluation_runner.py::test_generated_fixture_conftest_passes_ruff -p no:cacheprovider --basetemp=.workbuddy/test-runs/r01-review-template-red --tb=short
+```
+
+绿色定向回归使用前次隔离 venv，在测试专用 home、禁外网 bootstrap、临时 Git 配置下，
+以当前仓库 src 和 scripts 为 PYTHONPATH；实际 pytest 参数：
+
+```text
+-B -m pytest -q src/Sprout/tests/test_evaluation_runner.py::test_generated_fixture_conftest_passes_ruff src/Sprout/tests/test_evaluation_runner.py::test_fixed_suite_and_persisted_report src/Sprout/tests/test_ci_baseline.py -p no:cacheprovider --basetemp=.workbuddy/test-runs/r01-review-targeted-green --junitxml=.workbuddy/test-runs/r01-review-targeted-green.xml --tb=short -o faulthandler_timeout=60
+```
+
+### GitHub Actions 实际结果（修正前提交）
+
+[run 38883570451](https://github.com/siyuuuu1014-cell/sprout/actions/runs/38883570451)
+为 PR head d08de113 的合并检查，checkout SHA 是 `e6745159f98b9bb4f01360d0b967fbded23a7d56`。
+初查 Windows 为 in_progress，复查以下两个 job 均已 completed/failure；日志和报告上传成功。
+本轮修正未推送，其远端检查是 **not_run**，不能将旧 CI 红灯或本地绿灯算作新 CI 验收。
+
+| Job | 安装/收集/子集 | 完整离线 L1 |
+|---|---|---|
+| Ubuntu 24.04 / Python 3.12.15；116915807177 | lock124、install66；imports/ruff passed；2396 collected、0 errors、1 warning；示例18、R00 67 passed | 2336 passed、1 failed、1 skipped、58 not_run、2 warnings；164.85s |
+| Windows / Python 3.13.16；116915807399 | lock124、install68；imports/ruff passed；2396 collected、0 errors、1 warning；示例18、R00 67 passed | 2333 passed、5 failed、0 skipped、58 not_run、2 warnings；254.14s |
+
+已证实两平台共同失败为 `test_evaluation_runner.py::test_fixed_suite_and_persisted_report`，
+C01/C02/C03/R01 未完成验证、结果6/10。I001 在本地生成文件中已直接复现；远端摘要
+未上传其内部 verification.json，因此将共同失败完全归因于 I001 仍是推断，而非远端内部证据。
+
+Windows **另有四项真实失败**，不能与 Ubuntu 混同，也不能归因于原本地唯一失败：
+
+- `test_task_e2e.py:205`：`test_delete_approval_survives_restart_and_controls_commit[delete-approve]`
+  和 `[rename-approve]`，final.status 为 failed 而非 completed。
+- `test_task_e2e.py:318`：`test_requirement_output_controls_whether_the_change_lands[True]`。
+- `test_task_e2e.py:424`：`test_a_proposal_offers_only_the_agents_edits`；后二者同样最终状态失败。
+
+根因定位目前止于真实任务链路完成断言：`test_task_e2e.py::_repo/_runtime/_drive` 经
+Runtime 执行/审批/验证/应用后返回 failed。现有日志为 short traceback，artifact 配置只上传
+顶层 log/xml/json，不包含 pytest-temp 下任务内部失败证据。尚不能区分验证失败、Git 应用
+失败或环境差异，**不声称已定位底层根因或已修复**；未修改 Runtime、原断言或排除这些用例。
+需经批准补充这四个用例失败时的诊断证据并在 Windows runner 复验；这是剩余 CI 阻塞。
+本轮不擅自推送/重跑远端，不把 Python 小版本或平台差异直接当根因。
+
+Actions 还有 Node20 被平台强制改用 Node24 的警告，但 setup/checkout/upload 均成功，
+没有证据证明它造成测试失败；本轮不顺带升级 Action。
+
+### 修正后干净环境完整复验
+
+```powershell
+.\.venv\Scripts\python.exe -B scripts/ci_baseline.py --output .workbuddy/test-runs/r01-review-clean-windows-1 --python D:/dev/runtimes/conda/python.exe
+```
+
+完整日志、命令、退出码、SHA256 manifest 和 JUnit 留在该独立证据目录；当前源码修改
+通过工作树跟踪文件进入快照，summary 的 source_head 仍是修正前 HEAD，manifest 才是精确内容身份。
+实际结果：Windows Python3.13.9 / uv0.11.25；lock 124包、sync 新装68包，均 exit0；
+imports/ruff exit0；完整收集 **2400项、0 errors、1 warning**，4.25s；示例 **18 passed、
+0 failed、0 skipped**，0.13s；R00 **67 passed、0 failed、0 skipped**，0.20s。
+完整离线 L1 **2341 passed、0 failed、1 skipped、58 deselected/not_run、2 warnings**，
+257.20s，exit0。一个 skip 仍是本地 Windows 无法创建 symlink 的 authz 测试；未算通过。
+两条 warning 仍为 Starlette/AnyIO 和 lark protobuf 弃用 API。示例/R00/新增回归已包含
+在 L1 中，不重复累加；Windows CI 额外失败的四个用例本地通过，不能据此证明远端修复。
+Docker、Temporal、真实模型、外部数据库均 not_run，不继承历史额度。
+修正后工作树 `ruff check . --no-cache` 和 `git diff --check` 也已通过。
+
+公开 API/持久化数据/审批/R00 实现不变，uv.lock 不变。回滚只撤回本轮六文件补丁或本地
+修正提交，不撤回 R00、原 R01 交付或历史资料。PR 必须维持 Draft，修正后双平台远端复验
+及 Windows 四项失败根因仍未解决前，**R01 完整 DoD 未满足，不合并、不进入 R02**。

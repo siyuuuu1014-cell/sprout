@@ -28,15 +28,8 @@ def snapshot(destination: Path) -> None:
         .decode()
         .split("\0")
     )
-    paths.append("src/Sprout/tests/test_ci_baseline.py")
-    # Explicit R01 additions also work before a local commit; never copy arbitrary
-    # untracked files, ignored credentials, user databases or the original .venv.
-    for folder in ("scripts", "src/Sprout/tests/fixtures", ".github/workflows"):
-        paths.extend(
-            p.relative_to(ROOT).as_posix()
-            for p in (ROOT / folder).rglob("*")
-            if p.is_file() and "__pycache__" not in p.parts
-        )
+    # The index is the only source inventory. Working-tree edits to tracked
+    # files are tested, but arbitrary untracked/ignored files are never copied.
     manifest = {}
     for name in sorted(set(filter(None, paths))):
         source = ROOT / name

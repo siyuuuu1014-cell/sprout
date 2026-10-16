@@ -84,7 +84,7 @@ def _repo(directory: Path, case: EvalCase) -> Path:
         "pytest.ini": "[pytest]\naddopts=-p no:cacheprovider\n",
         "src/__init__.py": "",
         ".gitignore": "__pycache__/\n*.pyc\n.pytest_cache/\n",
-        "conftest.py": "import sys\nfrom pathlib import Path\n"
+        "conftest.py": "import sys\nfrom pathlib import Path\n\n"
         "sys.path.insert(0, str(Path(__file__).parent))\n",
         "tests/test_regression.py": "def test_untouched_regression():\n    assert 2 + 2 == 4\n",
         **(

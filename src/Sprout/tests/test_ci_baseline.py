@@ -1,14 +1,45 @@
 """R01 test infrastructure contracts; no real infrastructure is invoked."""
 
+import json
 import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from scripts import ci_baseline
 from scripts.ci_support.pytest_gates import gates_for
 
 pytest_plugins = ["pytester"]
+
+
+@pytest.mark.parametrize("directory", ["scripts", "src/Sprout/tests/fixtures", ".github/workflows"])
+def test_snapshot_excludes_untracked_sensitive_files_without_deleting_them(
+    tmp_path, monkeypatch, directory
+):
+    source = tmp_path / "source"
+    folder = source / directory
+    folder.mkdir(parents=True)
+    tracked = folder / "tracked.txt"
+    tracked.write_text("versioned fixture", encoding="utf-8")
+    sensitive = folder / "operator-local.json"
+    contents = b'{"key":"TEST-ONLY-NOT-A-REAL-SECRET"}'
+    sensitive.write_bytes(contents)
+    subprocess.run(["git", "init", "-q", str(source)], check=True, capture_output=True)
+    relative = tracked.relative_to(source).as_posix()
+    subprocess.run(["git", "add", "--", relative], cwd=source, check=True, capture_output=True)
+    destination = tmp_path / "evidence" / "checkout"
+    destination.mkdir(parents=True)
+    monkeypatch.setattr(ci_baseline, "ROOT", source)
+
+    ci_baseline.snapshot(destination)
+
+    assert (destination / relative).read_text(encoding="utf-8") == "versioned fixture"
+    assert not (destination / sensitive.relative_to(source)).exists()
+    manifest = json.loads((destination.parent / "source-manifest.json").read_text(encoding="utf-8"))
+    assert set(manifest) == {relative}
+    assert sensitive.read_bytes() == contents
 
 
 def _run_gate(pytester, monkeypatch, *arguments):
