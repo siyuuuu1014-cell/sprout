@@ -1,0 +1,32 @@
+# Isolated integration environment; never use the production Compose project.
+services:
+  database:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: temporal-validation-only
+      POSTGRES_DB: temporal
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal -d temporal"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  temporal:
+    image: temporalio/auto-setup:1.26.2
+    depends_on:
+      database:
+        condition: service_healthy
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: temporal
+      POSTGRES_PWD: temporal-validation-only
+      POSTGRES_SEEDS: database
+    ports:
+      - "127.0.0.1:17233:7233"
+
+volumes:
+  pgdata:

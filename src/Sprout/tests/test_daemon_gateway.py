@@ -37,7 +37,9 @@ def test_daemon_gateway_executes_task(tmp_path: Path) -> None:
         runtime = create_runtime(settings)
         workspace = await runtime.open_workspace(tmp_path)
         gateway = DaemonGateway(runtime)
-        task = await gateway.create_task(workspace.id, "explain this project")
+        task = await gateway.create_task(
+            workspace.id, "explain this project", execution_mode="read_only",
+        )
         response = await gateway.run_task(task.id)
         assert response.status in {"waiting_approval", "completed"}
         await runtime.stop()

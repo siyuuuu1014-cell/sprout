@@ -39,7 +39,7 @@ class GateChecks:
     """External signals the gate treats as blocking failures.
 
     ``None`` means "not measured yet" and never counts as a pass; only an
-    explicit failure blocks the candidate.
+    explicit successful measurements satisfy the verification gates.
     """
 
     tests_passed: bool | None = None
@@ -100,8 +100,12 @@ class HardGateEvaluator:
     @staticmethod
     def _external_failures(checks: GateChecks | None) -> list[str]:
         if checks is None:
-            return []
+            return ["key tests not measured", "regression not measured"]
         reasons: list[str] = []
+        if checks.tests_passed is None:
+            reasons.append("key tests not measured")
+        if checks.regression_free is None:
+            reasons.append("regression not measured")
         if checks.tests_passed is False:
             reasons.append("key tests failed")
         if checks.regression_free is False:

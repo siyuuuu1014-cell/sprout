@@ -50,7 +50,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "task_create",
         "description": "Create a project task in a workspace.",
-        "arguments": {"workspace_id": "str", "instruction": "str"},
+        "arguments": {"workspace_id": "str", "instruction": "str",
+                      "execution_mode": "str = 'code'"},
     },
     {
         "name": "task_execute",
@@ -206,8 +207,15 @@ def register_tools(server: Any, runtime: Runtime) -> None:
         name="task_create",
         description="Create a project task in a workspace.",
     )
-    async def task_create(workspace_id: str, instruction: str) -> str:
-        task = await runtime.create_task(workspace_id, instruction)
+    async def task_create(
+        workspace_id: str, instruction: str, execution_mode: str = "code",
+    ) -> str:
+        from Sprout.gateway.project_gateway import ProjectGateway
+
+        gateway = ProjectGateway(runtime, transport="mcp", default_user="mcp-client")
+        task = await gateway.create_task(
+            workspace_id, instruction, execution_mode=execution_mode,
+        )
         return task.id
 
     @server.tool(

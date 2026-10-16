@@ -39,6 +39,15 @@ class ProjectGateway:
     async def plan_task(self, task_id: str):
         return await self._runtime.plan_task(task_id)
 
+    async def verification_report(self, task_id: str):
+        return await self._runtime.get_verification_report(task_id)
+
+    async def task_submissions(self, task_id: str):
+        return await self._runtime.get_task_submissions(task_id)
+
+    async def task_execution_report(self, task_id: str):
+        return await self._runtime.get_task_execution_report(task_id)
+
     async def query_workspace_graph(
         self,
         workspace_id: str,
@@ -100,15 +109,21 @@ class ProjectGateway:
         instruction: str,
         *,
         user_id: str | None = None,
+        execution_mode: str = "code",
+        principal: Principal | None = None,
     ) -> Task:
         # Goes through strategy planning so plan steps drive the execution
         # graph; falls back to a plain task if planning is unavailable.
         return await self._runtime.create_task_planned(
             workspace_id,
             instruction,
-            actor=Principal(user_id=user_id or self._default_user),
+            actor=principal or Principal(user_id=user_id or self._default_user),
             source=self._transport,
+            execution_mode=execution_mode,
         )
+
+    async def confirm_task_mode(self, task_id: str, execution_mode: str) -> Task:
+        return await self._runtime.confirm_task_mode(task_id, execution_mode)
 
     async def execute(
         self,
@@ -116,6 +131,7 @@ class ProjectGateway:
         *,
         workspace_id: str,
         user_id: str | None = None,
+        execution_mode: str = "code",
     ) -> GatewayResponse:
         return await self._gateway.execute(
             GatewayRequest(
@@ -123,6 +139,7 @@ class ProjectGateway:
                 instruction=instruction,
                 caller=Principal(user_id=user_id or self._default_user),
                 workspace_id=workspace_id,
+                execution_mode=execution_mode,
             )
         )
 
@@ -143,9 +160,7 @@ class ProjectGateway:
         if task is not None:
             return task
         matches = [
-            item
-            for item in await self._runtime.list_tasks()
-            if str(item.id).startswith(prefix)
+            item for item in await self._runtime.list_tasks() if str(item.id).startswith(prefix)
         ]
         if len(matches) > 1:
             raise LookupError(f"Task prefix {prefix!r} matches {len(matches)} tasks")
@@ -188,7 +203,12 @@ class ProjectGateway:
         return await self._runtime.reject_change_proposal(proposal.id, reason=reason)
 
     async def apply_proposal(
-        self, proposal_id: str, *, allow_failing_tests: bool = False
+        self,
+        proposal_id: str,
+        *,
+        allow_failing_tests: bool = False,
+        force: bool = False,
+        override_reason: str = "",
     ) -> ApplyResult:
         proposal = await self._runtime.find_change_proposal(proposal_id)
         if proposal is None:
@@ -196,6 +216,9 @@ class ProjectGateway:
         return await self._runtime.apply_change_proposal(
             proposal.id,
             allow_failing_tests=allow_failing_tests,
+            force=force,
+            override_reason=override_reason,
+            decided_by=self._default_user,
         )
 
     async def rollback_proposal(self, proposal_id: str) -> ApplyResult:

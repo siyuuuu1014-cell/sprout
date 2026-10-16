@@ -17,11 +17,14 @@ class TaskStateMachine:
                 TaskStatus.READY,
                 TaskStatus.RUNNING,
                 TaskStatus.CANCELLED,
+                TaskStatus.WAITING_RESOURCE,
             }
         ),
         TaskStatus.DISCOVERING: frozenset({TaskStatus.PLANNING, TaskStatus.FAILED}),
         TaskStatus.PLANNING: frozenset({TaskStatus.READY, TaskStatus.FAILED}),
-        TaskStatus.READY: frozenset({TaskStatus.RUNNING, TaskStatus.CANCELLED}),
+        TaskStatus.READY: frozenset(
+            {TaskStatus.RUNNING, TaskStatus.CANCELLED, TaskStatus.WAITING_RESOURCE}
+        ),
         TaskStatus.RUNNING: frozenset(
             {
                 TaskStatus.WAITING_APPROVAL,
@@ -34,13 +37,13 @@ class TaskStateMachine:
                 TaskStatus.CANCELLED,
             }
         ),
-        TaskStatus.WAITING_APPROVAL: frozenset({TaskStatus.RUNNING, TaskStatus.CANCELLED}),
+        TaskStatus.WAITING_APPROVAL: frozenset(
+            {TaskStatus.RUNNING, TaskStatus.CANCELLED, TaskStatus.WAITING_RESOURCE}
+        ),
         TaskStatus.WAITING_RESOURCE: frozenset({TaskStatus.RUNNING, TaskStatus.CANCELLED}),
         TaskStatus.RETRYING: frozenset({TaskStatus.RUNNING, TaskStatus.FAILED}),
         TaskStatus.PAUSED: frozenset({TaskStatus.RUNNING, TaskStatus.CANCELLED}),
-        TaskStatus.EVALUATING: frozenset(
-            {TaskStatus.READY_TO_APPLY, TaskStatus.FAILED}
-        ),
+        TaskStatus.EVALUATING: frozenset({TaskStatus.READY_TO_APPLY, TaskStatus.FAILED}),
         TaskStatus.READY_TO_APPLY: frozenset({TaskStatus.APPLYING, TaskStatus.FAILED}),
         TaskStatus.APPLYING: frozenset(
             {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.ROLLED_BACK}
@@ -107,12 +110,8 @@ class NodeStateMachine:
 
 class ArtifactStateMachine:
     transitions: dict[ArtifactStatus, frozenset[ArtifactStatus]] = {
-        ArtifactStatus.DRAFT: frozenset(
-            {ArtifactStatus.CANDIDATE, ArtifactStatus.REJECTED}
-        ),
-        ArtifactStatus.CANDIDATE: frozenset(
-            {ArtifactStatus.VALIDATED, ArtifactStatus.REJECTED}
-        ),
+        ArtifactStatus.DRAFT: frozenset({ArtifactStatus.CANDIDATE, ArtifactStatus.REJECTED}),
+        ArtifactStatus.CANDIDATE: frozenset({ArtifactStatus.VALIDATED, ArtifactStatus.REJECTED}),
         ArtifactStatus.VALIDATED: frozenset(
             {ArtifactStatus.PENDING_APPROVAL, ArtifactStatus.PUBLISHED, ArtifactStatus.REJECTED}
         ),
@@ -120,9 +119,7 @@ class ArtifactStateMachine:
             {ArtifactStatus.PUBLISHED, ArtifactStatus.REJECTED}
         ),
         ArtifactStatus.PUBLISHED: frozenset({ArtifactStatus.MONITORING}),
-        ArtifactStatus.MONITORING: frozenset(
-            {ArtifactStatus.STABLE, ArtifactStatus.DEPRECATED}
-        ),
+        ArtifactStatus.MONITORING: frozenset({ArtifactStatus.STABLE, ArtifactStatus.DEPRECATED}),
         ArtifactStatus.STABLE: frozenset({ArtifactStatus.DEPRECATED}),
         ArtifactStatus.DEPRECATED: frozenset(),
         ArtifactStatus.REJECTED: frozenset(),
@@ -153,9 +150,7 @@ class ChangeProposalStateMachine:
                 ChangeProposalStatus.REJECTED,
             }
         ),
-        ChangeProposalStatus.APPLIED: frozenset(
-            {ChangeProposalStatus.ROLLED_BACK}
-        ),
+        ChangeProposalStatus.APPLIED: frozenset({ChangeProposalStatus.ROLLED_BACK}),
         ChangeProposalStatus.REJECTED: frozenset(),
         ChangeProposalStatus.ROLLED_BACK: frozenset(),
     }

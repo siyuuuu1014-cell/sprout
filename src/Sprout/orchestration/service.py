@@ -55,14 +55,35 @@ class SequentialOrchestrator:
         recorder: Any | None = None,
         budget: TaskBudget | None = None,
     ) -> TaskResult:
+        # A local scheduler must not bypass external activity ownership after
+        # a configuration change, even when the caller omits that node.
+        stored = await self._metadata.list_execution_nodes(graph.task_id)
+        if any(
+            node.metadata.get("execution_guard")
+            and node.status
+            not in {
+                NodeStatus.COMPLETED,
+                NodeStatus.SKIPPED,
+            }
+            for node in stored
+        ):
+            current = await self._metadata.get_task(graph.task_id)
+            if current is not None and TaskStateMachine.can_transition(
+                current.status,
+                TaskStatus.WAITING_RESOURCE,
+            ):
+                await self._metadata.update_task_status(graph.task_id, TaskStatus.WAITING_RESOURCE)
+            return TaskResult(
+                task_id=graph.task_id,
+                status=TaskStatus.WAITING_RESOURCE,
+                error="External activity ownership requires reconciliation; no local replay",
+            )
         nodes = await self._restore(graph)
         deadline = None
         if budget is not None and budget.max_duration_seconds > 0:
             deadline = time.monotonic() + budget.max_duration_seconds
 
-        await self._update_task_status(
-            graph.task_id, TaskStatus.RUNNING, recorder
-        )
+        await self._update_task_status(graph.task_id, TaskStatus.RUNNING, recorder)
         await self._record(recorder, "task.started", graph.task_id)
 
         statuses = {node.id: node.status for node in nodes}
@@ -99,14 +120,10 @@ class SequentialOrchestrator:
                     graph.task_id,
                     {"node_id": node.id, "type": node.type.value},
                 )
-                return TaskResult(
-                    task_id=graph.task_id, status=TaskStatus.WAITING_APPROVAL
-                )
+                return TaskResult(task_id=graph.task_id, status=TaskStatus.WAITING_APPROVAL)
 
             if outcome.status is NodeStatus.FAILED:
-                await self._update_task_status(
-                    graph.task_id, TaskStatus.FAILED, recorder
-                )
+                await self._update_task_status(graph.task_id, TaskStatus.FAILED, recorder)
                 await self._record(recorder, "task.failed", graph.task_id)
                 return TaskResult(
                     task_id=graph.task_id,
@@ -121,22 +138,14 @@ class SequentialOrchestrator:
                 and isinstance(outcome.output, dict)
                 else None
             )
-            # Stop looping in two cases, not one. ``passed`` means the change is
-            # green. ``not_verified``/``partially_verified`` means some commands
-            # were withheld: another AGENT round cannot change that, so
-            # retrying would burn the remaining budget to reach the same
-            # answer. Both go straight to approval, which is where the decision
-            # actually belongs.
-            #
-            # A withheld command that is *parked on a grant* does not reach
-            # here at all — that path returns WAITING above — so these two are
-            # the cases where no approval is pending and none is coming.
+            # Withheld checks cannot be repaired by rewriting code. Preserve
+            # their incomplete status for the shared apply gate, never green it.
             if evaluation_status in {"passed", "not_verified", "partially_verified"}:
                 index += 1
-                while (
-                    index < len(nodes)
-                    and nodes[index].type in {NodeType.AGENT, NodeType.EVALUATION}
-                ):
+                while index < len(nodes) and nodes[index].type in {
+                    NodeType.AGENT,
+                    NodeType.EVALUATION,
+                }:
                     skipped = nodes[index]
                     statuses[skipped.id] = NodeStatus.SKIPPED
                     await self._skip_node(skipped, graph.task_id, recorder)
@@ -144,9 +153,7 @@ class SequentialOrchestrator:
                 continue
             index += 1
 
-        await self._update_task_status(
-            graph.task_id, TaskStatus.COMPLETED, recorder
-        )
+        await self._update_task_status(graph.task_id, TaskStatus.COMPLETED, recorder)
         await self._record(recorder, "task.completed", graph.task_id)
         return TaskResult(task_id=graph.task_id, status=TaskStatus.COMPLETED)
 
@@ -159,9 +166,7 @@ class SequentialOrchestrator:
         budget: TaskBudget | None = None,
     ) -> TaskResult:
         """Continue a graph parked in WAITING_APPROVAL after a human decision."""
-        return await self.execute(
-            graph, handler=handler, recorder=recorder, budget=budget
-        )
+        return await self.execute(graph, handler=handler, recorder=recorder, budget=budget)
 
     # -- node execution ------------------------------------------------------
     async def _run_node(
@@ -175,9 +180,7 @@ class SequentialOrchestrator:
         current = node
         while True:
             NodeStateMachine.validate(current.status, NodeStatus.RUNNING)
-            running = replace(
-                current, status=NodeStatus.RUNNING, attempts=current.attempts + 1
-            )
+            running = replace(current, status=NodeStatus.RUNNING, attempts=current.attempts + 1)
             await self._metadata.save_execution_node(running)
             await self._record(
                 recorder,
@@ -192,6 +195,7 @@ class SequentialOrchestrator:
             try:
                 output = None
                 if handler is not None:
+
                     async def invoke(node: ExecutionNode = running) -> Any:
                         result = handler(node)
                         return await result if hasattr(result, "__await__") else result
@@ -256,8 +260,7 @@ class SequentialOrchestrator:
     async def _restore(self, graph: ExecutionGraph) -> tuple[ExecutionNode, ...]:
         """Overlay persisted node state onto a freshly compiled graph."""
         stored = {
-            node.id: node
-            for node in await self._metadata.list_execution_nodes(graph.task_id)
+            node.id: node for node in await self._metadata.list_execution_nodes(graph.task_id)
         }
         if not stored:
             return tuple(graph.nodes)
@@ -338,19 +341,13 @@ class SequentialOrchestrator:
             "task.status_changed",
             task_id,
             {
-                "previous": (
-                    current_task.status.value
-                    if current_task is not None
-                    else None
-                ),
+                "previous": (current_task.status.value if current_task is not None else None),
                 "target": target.value,
             },
         )
 
     @staticmethod
-    def _dependencies_completed(
-        node: ExecutionNode, statuses: dict[str, NodeStatus]
-    ) -> bool:
+    def _dependencies_completed(node: ExecutionNode, statuses: dict[str, NodeStatus]) -> bool:
         return all(
             statuses.get(dep) in {NodeStatus.COMPLETED, NodeStatus.SKIPPED}
             for dep in node.dependencies
@@ -365,6 +362,4 @@ class SequentialOrchestrator:
     ) -> None:
         if recorder is None:
             return
-        await recorder.record(
-            TrajectoryEvent(name=name, task_id=task_id, payload=payload or {})
-        )
+        await recorder.record(TrajectoryEvent(name=name, task_id=task_id, payload=payload or {}))

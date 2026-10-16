@@ -58,6 +58,17 @@ class EntityOwnership:
 
 #: The complete entity -> authority / derived registry.
 ENTITY_OWNERSHIP: tuple[EntityOwnership, ...] = (
+    *(
+        EntityOwnership(entity, "sqlite",
+                        f"sqlite:///{_PROJECT_ROOT / '{project_id}' / filename}", ("redis",))
+        for entity, filename in (
+            ("project_manifest", "project_manifest.db"),
+            ("project_structure", "project_structure.db"),
+            ("project_architecture", "project_architecture.db"),
+            ("project_database", "project_database.db"),
+            ("project_evolution", "project_evolution.db"),
+        )
+    ),
     EntityOwnership(
         "session",
         "sqlite",
@@ -84,6 +95,7 @@ ENTITY_OWNERSHIP: tuple[EntityOwnership, ...] = (
     ),
     EntityOwnership("message_task_link", "sqlite", _sqlite_dsn("sprout_conversation.db")),
     EntityOwnership("task", "sqlite", _sqlite_dsn("sprout_core.db"), ("neo4j",)),
+    EntityOwnership("task_submission", "sqlite", _sqlite_dsn("sprout_core.db")),
     EntityOwnership("approval", "sqlite", _sqlite_dsn("sprout_audit.db")),
     EntityOwnership("runtime_workspace", "sqlite", _sqlite_dsn("sprout_core.db"), ("neo4j",)),
     EntityOwnership("workspace", "sqlite", _sqlite_dsn("sprout_core.db"), ("neo4j",)),
@@ -148,6 +160,9 @@ class DatabaseDisposition:
 #: Disposition of every known on-disk database, including the legacy files the
 #: previous six-database layout left behind.
 STORAGE_DATABASES: tuple[DatabaseDisposition, ...] = (
+    *(DatabaseDisposition(f"project_{partition}.db", "active",
+                          f"user project {partition} snapshots", "keep")
+      for partition in ("manifest", "structure", "architecture", "database", "evolution")),
     DatabaseDisposition(
         "sprout_core.db",
         "active",

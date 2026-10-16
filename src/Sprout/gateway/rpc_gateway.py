@@ -6,6 +6,8 @@ from typing import Any
 
 from Sprout.gateway.daemon_gateway import DaemonGateway
 from Sprout.gateway.rpc_errors import RPCErrorCode
+from Sprout.gateway.task_actions import TaskActions
+from Sprout.gateway.task_queries import TaskQueries
 from Sprout.runtime.runtime import Runtime
 
 
@@ -16,13 +18,15 @@ class RPCGateway:
         self._runtime = runtime
         self._daemon = DaemonGateway(runtime)
 
-    async def handle(self, request: dict[str, Any]) -> dict[str, Any]:
+    async def handle(self, request: dict[str, Any], *, principal=None) -> dict[str, Any]:
         request_id = request.get("id")
         method = request.get("method")
         params = request.get("params") or {}
 
         try:
-            result = await self._dispatch(method, params)
+            result = await self._dispatch(method, params, principal=principal)
+        except PermissionError as exc:
+            return self._error(request_id, RPCErrorCode.FORBIDDEN, str(exc))
         except KeyError as exc:
             return self._error(request_id, RPCErrorCode.INVALID_PARAMS, f"Missing {exc}")
         except LookupError as exc:
@@ -33,7 +37,26 @@ class RPCGateway:
             return self._error(request_id, RPCErrorCode.INTERNAL_ERROR, str(exc))
         return {"id": request_id, "result": result}
 
-    async def _dispatch(self, method: str, params: dict[str, Any]):
+    async def _dispatch(self, method: str, params: dict[str, Any], *, principal=None):
+        if method == "task.retry_submission":
+            return await TaskActions(self._runtime).retry_submission(
+                params["task_id"], principal=principal, submission_id=params["submission_id"])
+        if method == "task.submit_persisted":
+            return await TaskActions(self._runtime).submit(params["task_id"], principal=principal)
+        if method == "task.sync":
+            return await TaskActions(self._runtime).sync(
+                params["task_id"], principal=principal,
+                submission_id=params.get("submission_id"),
+                wait_seconds=params.get("wait_seconds", 0),
+            )
+        if method == "task.report":
+            return await TaskQueries(self._runtime).report(params["task_id"], principal=principal)
+        if method == "task.observe":
+            return await TaskQueries(self._runtime).observe(
+                params["task_id"], principal=principal,
+                submission_id=params.get("submission_id"),
+                wait_seconds=params.get("wait_seconds", 0),
+            )
         if method == "workspace.open":
             workspace = await self._daemon.open_workspace(params["path"])
             return {"id": workspace.id, "kind": workspace.kind.value}
@@ -43,9 +66,16 @@ class RPCGateway:
                 for item in await self._daemon.list_workspaces()
             ]
         if method == "task.create":
+            if principal is not None and principal.authenticated:
+                task = await self._runtime.create_task_planned(
+                    params["workspace_id"], params["instruction"], actor=principal,
+                    source="rpc", execution_mode=params.get("execution_mode", "code"),
+                )
+                return {"id": task.id, "status": task.status.value}
             task = await self._daemon.create_task(
                 params["workspace_id"],
                 params["instruction"],
+                execution_mode=params.get("execution_mode", "code"),
             )
             return {"id": task.id, "status": task.status.value}
         if method == "task.run":

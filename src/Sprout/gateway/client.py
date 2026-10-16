@@ -17,13 +17,16 @@ class DaemonClient:
     async def open_workspace(self, path: str) -> dict[str, Any]:
         return await self._request("POST", "/api/project/workspaces", json={"path": path})
 
-    async def create_task(self, workspace_id: str, instruction: str) -> dict[str, Any]:
+    async def create_task(
+        self, workspace_id: str, instruction: str, *, execution_mode: str = "code",
+    ) -> dict[str, Any]:
         return await self._request(
             "POST",
             "/api/project/tasks",
             json={
                 "workspace_id": workspace_id,
                 "instruction": instruction,
+                "execution_mode": execution_mode,
             },
         )
 

@@ -47,6 +47,8 @@ class ModelSettings:
     fallback_api_key_env: str = ""
     timeout_seconds: float = 60.0
     temperature: float | None = None
+    thinking_mode: str | None = None
+    max_output_tokens: int | None = None
 
 
 @dataclass(slots=True)

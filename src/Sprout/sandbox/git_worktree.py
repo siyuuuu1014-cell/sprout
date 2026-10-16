@@ -99,6 +99,9 @@ class GitWorktreeSandbox:
             # A repository may point ``diff.external`` at a program of its
             # choosing; the diff is data here, never a command to run.
             "--no-ext-diff",
+            # Intent-to-add can stage deletions; include both index and worktree
+            # changes or a verified deletion disappears from the proposal.
+            "HEAD",
             # ``--`` ends the revision list; everything after it is a pathspec,
             # so the excludes below cannot be read as a revision name.
             "--",
@@ -127,23 +130,28 @@ class GitWorktreeSandbox:
             str(ref.root),
             "status",
             "--porcelain=v1",
+            "-z",
             "--untracked-files=all",
             "--",
             ".",
             *_SANDBOX_EXCLUDES,
         )
         paths: list[str] = []
-        for line in output.splitlines():
+        entries = iter(output.split("\0"))
+        for line in entries:
             if len(line) < 4:
                 continue
-            entry = line[3:].strip().strip('"')
+            entry = line[3:]
             if not entry:
                 continue
-            # Renames are reported as "old -> new"; the new name is the result.
-            if " -> " in entry:
-                entry = entry.split(" -> ", 1)[1].strip().strip('"')
             if entry not in paths:
                 paths.append(entry)
+            # In NUL porcelain, rename/copy has a second source-path record.
+            # Both rename paths must be staged when applying the proposal.
+            if "R" in line[:2] or "C" in line[:2]:
+                original = next(entries, "")
+                if original and original not in paths:
+                    paths.append(original)
         return tuple(paths)
 
     async def run_code(

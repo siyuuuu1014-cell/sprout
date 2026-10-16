@@ -30,12 +30,18 @@ async def run_sprout_node(node: dict[str, Any]) -> dict[str, Any]:
 class SproutExecutionWorkflow:
     @workflow.run
     async def run(self, graph: dict[str, Any]) -> dict[str, Any]:
+        # Scheduling changes must retain the old command sequence when replaying
+        # histories from repository baseline 7b377ac. Never remove this marker
+        # until those histories have aged out or a migration is verified.
+        resume_skips = workflow.patched("sprout-resume-skips-v1")
         results: list[dict[str, Any]] = []
         nodes = list(graph.get("nodes", []))
         index = 0
         while index < len(nodes):
             node = nodes[index]
-            if node.get("status") == "completed":
+            if node.get("status") == "completed" or (
+                resume_skips and node.get("status") == "skipped"
+            ):
                 results.append(
                     {
                         "node_id": node.get("id"),
@@ -43,6 +49,14 @@ class SproutExecutionWorkflow:
                         "skipped": True,
                     }
                 )
+                output = node.get("metadata", {}).get("output", {})
+                if (
+                    resume_skips
+                    and node.get("type") == "evaluation"
+                    and output.get("status") == "passed"
+                ):
+                    index = _skip_verify_loop(nodes, index + 1, results)
+                    continue
                 index += 1
                 continue
             try:
@@ -50,8 +64,7 @@ class SproutExecutionWorkflow:
                     run_sprout_node,
                     node,
                     start_to_close_timeout=timedelta(
-                        seconds=float(node.get("budget", {}).get("timeout_seconds", 0))
-                        or 3600
+                        seconds=float(node.get("budget", {}).get("timeout_seconds", 0)) or 3600
                     ),
                 )
             except Exception as exc:  # noqa: BLE001 - workflow must return a structured result
@@ -65,10 +78,18 @@ class SproutExecutionWorkflow:
                 )
                 return {"status": "failed", "nodes": results, "error": error}
             results.append(result)
+            if (
+                isinstance(result, dict)
+                and result.get("status") == "cancelled"
+                and workflow.patched("sprout-cancel-stop-v1")
+            ):
+                return {"status": "cancelled", "nodes": results}
             output = result.get("output") if isinstance(result, dict) else None
             if isinstance(output, dict) and output.get("waiting"):
                 return {
-                    "status": "waiting_approval",
+                    "status": "waiting_resource"
+                    if output.get("waiting_kind") == "resource"
+                    else "waiting_approval",
                     "node_id": result.get("node_id"),
                     "nodes": results,
                 }
@@ -119,9 +140,7 @@ async def run_growth_automation(workspace_id: str, trajectory_dir: str) -> dict[
     metadata = _activity_runtime.storage.metadata
     if metadata is None:
         raise RuntimeError("MetadataStore is not configured")
-    automation = GrowthAutomation(
-        metadata, workspace_id, trajectory_dir, runtime=_activity_runtime
-    )
+    automation = GrowthAutomation(metadata, workspace_id, trajectory_dir, runtime=_activity_runtime)
     return await automation.run_once()
 
 

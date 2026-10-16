@@ -106,6 +106,11 @@ def test_every_known_database_has_a_verdict() -> None:
 def test_on_disk_set_is_fully_classified() -> None:
     # Every file the old layout may leave behind plus the five new authorities.
     on_disk = {
+        "project_manifest.db",
+        "project_structure.db",
+        "project_architecture.db",
+        "project_database.db",
+        "project_evolution.db",
         "sprout_core.db",
         "sprout_conversation.db",
         "sprout_knowledge.db",
@@ -131,7 +136,8 @@ def test_on_disk_set_is_fully_classified() -> None:
 
 
 def test_consolidation_targets_six_active_stores() -> None:
-    active = [d.filename for d in STORAGE_DATABASES if d.status == "active"]
+    active = [d.filename for d in STORAGE_DATABASES
+              if d.status == "active" and d.filename.startswith("sprout_")]
     assert active == [
         "sprout_core.db",
         "sprout_conversation.db",

@@ -123,6 +123,7 @@ _DEFAULT_EXCLUDES = (
     ".claude",
     ".pytest_tmp",
     ".pytest-tmp",
+    ".workbuddy",
 )
 
 _KIND_PRIORITY = {
@@ -320,7 +321,10 @@ class WorkspaceScanner:
             hints.add("openapi")
         if (root / "schema.graphql").is_file() or (root / "graphql").is_dir():
             hints.add("graphql")
-        if (root / "proto").is_dir() or any(root.rglob("*.proto")):
+        if (root / "proto").is_dir() or any(
+            path.is_file() and not WorkspaceScanner._excluded(path, root)
+            for path in root.rglob("*.proto")
+        ):
             hints.add("protobuf")
         if (root / "prisma" / "schema.prisma").is_file():
             hints.add("prisma")
@@ -357,7 +361,7 @@ class WorkspaceScanner:
             data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
             scripts = data.get("project", {}).get("scripts", {})
             return list(scripts)
-        except (OSError, tomllib.TOMLDecodeError):
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError):
             return []
 
     @staticmethod
@@ -422,10 +426,11 @@ class WorkspaceScanner:
     def _excluded(path: Path, root: Path) -> bool:
         try:
             relative = path.relative_to(root)
+            path.resolve().relative_to(root.resolve())
         except ValueError:
             return True
         parts = relative.parts
-        return any(part in _DEFAULT_EXCLUDES for part in parts)
+        return any(part.casefold() in _DEFAULT_EXCLUDES for part in parts)
 
     @staticmethod
     def _relevance_score(path: Path, instruction: str) -> int:
@@ -448,8 +453,9 @@ class WorkspaceScanner:
         if not path.is_file():
             return {}
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (OSError, UnicodeError, json.JSONDecodeError):
             return {}
 
 

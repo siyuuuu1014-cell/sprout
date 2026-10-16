@@ -43,6 +43,7 @@ def workspace_list(
 def task_create(
     workspace_id: Annotated[str, typer.Argument()],
     instruction: Annotated[str, typer.Argument()],
+    mode: Annotated[str, typer.Option("--mode", help="code or read_only.")] = "code",
     url: Annotated[str, typer.Option("--url")] = "http://127.0.0.1:8000",
     token: Annotated[str | None, typer.Option("--token")] = None,
 ) -> None:
@@ -51,7 +52,8 @@ def task_create(
         _run(
             _client(url, token).call(
                 "task.create",
-                {"workspace_id": workspace_id, "instruction": instruction},
+                {"workspace_id": workspace_id, "instruction": instruction,
+                 "execution_mode": mode},
             )
         )
     )

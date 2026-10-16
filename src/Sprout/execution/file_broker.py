@@ -24,6 +24,7 @@ from Sprout.workspace.models import ResourceKind, ResourceRef
 
 if TYPE_CHECKING:
     from Sprout.events import EventBus
+    from Sprout.security.approval import ApprovalManager
 
 
 class FileBroker:
@@ -35,10 +36,12 @@ class FileBroker:
         *,
         classify_overrides: Mapping[str, str] | None = None,
         events: EventBus | None = None,
+        approvals: ApprovalManager | None = None,
     ) -> None:
         self._policy = policy
         self._classify_overrides = dict(classify_overrides or {})
         self._events = events
+        self._approvals = approvals
 
     def _classify(self, target: Path, sandbox: SandboxRef) -> ResourceKind:
         return classify(
@@ -55,6 +58,7 @@ class FileBroker:
         *,
         task_id: str = "",
         scope: DelegationScope | None = None,
+        newline: str | None = None,
     ) -> FileResult:
         target = self._safe_target(sandbox, relative_path)
         if target is None:
@@ -81,7 +85,8 @@ class FileBroker:
                 resource_kind=kind.value,
             )
 
-        await asyncio.to_thread(self._write, target, content)
+        await asyncio.to_thread(self._write, target, content,
+                                **({"newline": newline} if newline is not None else {}))
         return FileResult(path=str(relative_path), wrote=True, resource_kind=kind.value)
 
     async def read_text(
@@ -146,7 +151,36 @@ class FileBroker:
         *,
         task_id: str = "",
         scope: DelegationScope | None = None,
+        source: str = "interactive",
+        requested_by: str = "system",
     ) -> FileResult:
+        result = await self.authorize_delete(
+            sandbox,
+            relative_path,
+            task_id=task_id,
+            scope=scope,
+            source=source,
+            requested_by=requested_by,
+        )
+        if not result.wrote:
+            return result
+        target = self._safe_target(sandbox, relative_path)
+        if target is None:
+            return FileResult(path=str(relative_path), wrote=False, reason="Path escapes sandbox")
+        await asyncio.to_thread(self._delete, target)
+        return result
+
+    async def authorize_delete(
+        self,
+        sandbox: SandboxRef,
+        relative_path: str | Path,
+        *,
+        task_id: str = "",
+        scope: DelegationScope | None = None,
+        source: str = "interactive",
+        requested_by: str = "system",
+    ) -> FileResult:
+        """Preflight deletion without changing files; grants remain path/task scoped."""
         target = self._safe_target(sandbox, relative_path)
         if target is None:
             return FileResult(path=str(relative_path), wrote=False, reason="Path escapes sandbox")
@@ -163,14 +197,42 @@ class FileBroker:
         )
         decision = self._policy.decide(request)
         await emit_policy_decision(self._events, request, decision)
-        if decision.decision is not AccessDecision.REQUIRE_APPROVAL:
+        if decision.decision is AccessDecision.REQUIRE_APPROVAL and self._approvals is not None:
+            args = {"path": target.as_posix(), "sandbox_id": sandbox.id}
+            if self._approvals.asks_a_human(source):
+                if await self._approvals.is_approved(
+                    "file_delete",
+                    args,
+                    task_id=task_id,
+                    source=source,
+                    requested_by=requested_by,
+                    resource_scope=sandbox.id,
+                ):
+                    return FileResult(path=str(relative_path), wrote=True, resource_kind=kind.value)
+                record = await self._approvals.find_pending("file_delete", args, task_id=task_id)
+                if record is None:
+                    record = await self._approvals.request(
+                        "file_delete",
+                        args,
+                        task_id=task_id,
+                        source=source,
+                        requested_by=requested_by,
+                        resource_scope=sandbox.id,
+                        single_use=False,
+                    )
+                return FileResult(
+                    path=str(relative_path),
+                    wrote=False,
+                    reason=decision.reason,
+                    approval_id=record.id,
+                )
+        if decision.decision is not AccessDecision.ALLOW:
             return FileResult(
                 path=str(relative_path),
                 wrote=False,
                 reason=decision.reason,
                 resource_kind=kind.value,
             )
-        await asyncio.to_thread(self._delete, target)
         return FileResult(path=str(relative_path), wrote=True, resource_kind=kind.value)
 
     @staticmethod
@@ -187,9 +249,9 @@ class FileBroker:
         return target
 
     @staticmethod
-    def _write(path: Path, content: str) -> None:
+    def _write(path: Path, content: str, *, newline: str | None = None) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
+        path.write_text(content, encoding="utf-8", newline=newline)
 
     @staticmethod
     def _read(path: Path) -> str:

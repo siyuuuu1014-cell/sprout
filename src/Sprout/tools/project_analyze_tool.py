@@ -5,16 +5,14 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any
 
 from Sprout.task.models import Task
 from Sprout.tools.result import ToolResult
 from Sprout.tools.spec import ToolSpec
-from Sprout.workspace.graph import WorkspaceGraphBuilder
-from Sprout.workspace.intelligence import WorkspaceIntelligence
-from Sprout.workspace.knowledge import ProjectKnowledgeBuilder
+from Sprout.workspace.intelligence import WorkspaceAnalysis, WorkspaceIntelligence
 from Sprout.workspace.models import Workspace
 from Sprout.workspace.scanner import WorkspaceScanner
 
@@ -22,11 +20,12 @@ from Sprout.workspace.scanner import WorkspaceScanner
 class ProjectAnalyzeTool:
     """Analyze a project workspace with safe built-in and optional system probes."""
 
-    def __init__(self, *, intelligence: WorkspaceIntelligence | None = None) -> None:
+    def __init__(
+        self, *, intelligence: WorkspaceIntelligence | None = None,
+        analyze: Callable[[Path, str], Awaitable[WorkspaceAnalysis]] | None = None,
+    ) -> None:
         self._intelligence = intelligence
-        self._scanner = WorkspaceScanner()
-        self._graph_builder = WorkspaceGraphBuilder()
-        self._knowledge_builder = ProjectKnowledgeBuilder()
+        self._analyze = analyze
         self.spec = ToolSpec(
             name="project_analyze",
             description=(
@@ -79,24 +78,17 @@ class ProjectAnalyzeTool:
             source="tool",
         )
 
-        if self._intelligence is not None:
-            analysis = await self._intelligence.analyze(workspace, task)
-            manifest = analysis.manifest
-            read_plan = analysis.read_plan
-            graph = analysis.graph
-            knowledge = analysis.knowledge
+        if self._analyze is not None:
+            analysis = await self._analyze(root, instruction)
         else:
-            manifest = self._scanner.scan(workspace)
-            workspace = Workspace(
-                id=workspace.id,
-                root=workspace.root,
-                kind=workspace.kind,
-                revision=workspace.revision,
-                manifest=manifest,
+            analysis = await (self._intelligence or WorkspaceIntelligence()).analyze(
+                workspace, task,
             )
-            read_plan = self._scanner.build_read_plan(workspace, task)
-            graph = self._graph_builder.build(workspace, read_plan)
-            knowledge = self._knowledge_builder.build(workspace, manifest)
+        workspace = analysis.workspace
+        manifest = analysis.manifest
+        read_plan = analysis.read_plan
+        graph = analysis.graph
+        knowledge = analysis.knowledge
         payload: dict[str, Any] = {
             "workspace_id": workspace.id,
             "root": root.as_posix(),
@@ -118,6 +110,7 @@ class ProjectAnalyzeTool:
                     "statement": item.statement,
                     "confidence": item.confidence,
                     "evidence_ids": list(item.evidence_ids),
+                    "details": dict(item.details),
                 }
                 for item in knowledge.items
             ],

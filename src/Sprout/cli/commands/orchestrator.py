@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from pathlib import Path
 from typing import Annotated
 
 import typer
@@ -11,6 +13,26 @@ from Sprout.cli.i18n import L as _L
 from Sprout.orchestration.terminal.temporal import TemporalConfig
 
 app = typer.Typer(help="Run orchestration workers and services.", no_args_is_help=True)
+
+
+@app.command("task-worker")
+def task_worker(
+    config: Annotated[Path, typer.Option("--config", exists=True, dir_okay=False)],
+    host: Annotated[str, typer.Option("--host")],
+    namespace: Annotated[str, typer.Option("--namespace")],
+    task_queue: Annotated[str, typer.Option("--task-queue")],
+) -> None:
+    """Serve ordinary persisted tasks only; Ctrl+C leaves workflow state intact."""
+    from Sprout.config.loader import load_settings
+    from Sprout.orchestration.worker import run_task_worker
+
+    route = TemporalConfig(host=host, namespace=namespace, task_queue=task_queue)
+    try:
+        asyncio.run(run_task_worker(route, settings=load_settings(config), on_ready=lambda:
+            typer.echo(json.dumps({"event": "task_worker_ready", "host": host,
+                                   "namespace": namespace, "task_queue": task_queue}))))
+    except KeyboardInterrupt:
+        typer.echo("Task worker stopped; persisted workflow and execution ownership retained.")
 
 
 @app.command("worker")

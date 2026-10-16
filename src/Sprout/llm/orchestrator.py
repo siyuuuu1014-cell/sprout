@@ -8,7 +8,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from Sprout.llm.base import ModelProvider
+from Sprout.llm.base import ModelBudgetExhausted, ModelProvider
 from Sprout.llm.client import invoke_model
 from Sprout.llm.messages import LLMMessage, LLMResponse, LLMStreamEvent
 from Sprout.llm.usage import get_usage_recorder
@@ -66,6 +66,7 @@ class ModelOrchestrator:
     """
 
     name = "model-orchestrator"
+    dispatches_model_calls = True
 
     def __init__(
         self,
@@ -101,6 +102,8 @@ class ModelOrchestrator:
                 started = time.monotonic()
                 try:
                     return await invoke_model(provider, messages, tools=tools)
+                except ModelBudgetExhausted:
+                    raise
                 except Exception as exc:  # noqa: BLE001 - retry/fallback boundary
                     retryable = self._policy.should_retry(exc)
                     self.metrics.append(

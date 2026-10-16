@@ -22,8 +22,12 @@ class DaemonGateway:
     async def list_workspaces(self):
         return await self._project.list_workspaces()
 
-    async def create_task(self, workspace_id: str, instruction: str):
-        return await self._project.create_task(workspace_id, instruction)
+    async def create_task(
+        self, workspace_id: str, instruction: str, *, execution_mode: str = "code",
+    ):
+        return await self._project.create_task(
+            workspace_id, instruction, execution_mode=execution_mode,
+        )
 
     async def run_task(self, task_id: str):
         return await self._project.run_task(task_id)

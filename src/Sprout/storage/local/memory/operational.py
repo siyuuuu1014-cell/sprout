@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import replace
+from datetime import UTC, datetime
 
 from Sprout.security.approval import ApprovalRecord, ApprovalStatus
 from Sprout.session.models import Session, Turn
+from Sprout.storage.contracts.commit_request import decision_matches, validate_request
 from Sprout.storage.contracts.operational import Task
 
 
@@ -15,6 +18,71 @@ class MemoryOperationalStore:
         self.turns: list[Turn] = []
         self.approvals: dict[str, ApprovalRecord] = {}
         self.tasks: dict[str, Task] = {}
+        self.commit_requests: dict[str, dict] = {}
+        self.commit_dispatches: dict[str, dict] = {}
+
+    async def get_commit_dispatch(self, request_id):
+        return deepcopy(self.commit_dispatches.get(request_id))
+
+    async def ensure_commit_dispatch(self, record):
+        from Sprout.storage.contracts.commit_request import validate_dispatch
+
+        validate_dispatch(record)
+        current = self.commit_dispatches.get(record["request_id"])
+        if current is None:
+            request = self.commit_requests.get(record["request_id"])
+            if (request is None or request["state"] != "approved"
+                    or request["dispatch_state"] != "waiting_schedule"
+                    or request["fingerprint"] != record["request_fingerprint"]
+                    or request["decision"]["approved"] is not True
+                    or request["decision"]["by"] != request["creator"]):
+                raise ValueError("Approved request required")
+            current = {**deepcopy(record), "state": "pending", "run_id": None}
+            self.commit_dispatches[record["request_id"]] = current
+        if any(current[key] != value for key, value in record.items()):
+            raise ValueError("Immutable dispatch binding required")
+        return deepcopy(current)
+
+    async def mark_commit_dispatch(self, request_id, state, run_id=None):
+        from Sprout.storage.contracts.commit_request import validate_dispatch_state
+
+        validate_dispatch_state(state, run_id)
+        record = self.commit_dispatches.get(request_id)
+        if record is None:
+            return False
+        if record["state"] in {"pending", "uncertain"}:
+            record.update(state=state, run_id=run_id)
+            self.commit_requests[request_id]["dispatch_state"] = state
+        return record["state"] == state and record["run_id"] == run_id
+
+    async def save_commit_request(self, record):
+        validate_request(record)
+        current = self.commit_requests.get(record["id"])
+        if current is not None and (current.get("supersedes") != record.get("supersedes")
+                or any(current[key] != record[key] for key in
+                ("id", "task_id", "proposal_id", "creator", "review", "fingerprint"))):
+            raise ValueError("Commit request ID already bound to different content")
+        if current is None:
+            self.commit_requests[record["id"]] = {**deepcopy(record), "state": "pending",
+                                                "decision": None, "dispatch_state": None}
+        return deepcopy(self.commit_requests[record["id"]])
+
+    async def get_commit_request(self, request_id):
+        return deepcopy(self.commit_requests.get(request_id))
+
+    async def decide_commit_request(self, request_id, *, creator, expected_fingerprint,
+                                    approved, reason):
+        if type(approved) is not bool or not isinstance(reason, str) or len(reason) > 1024:
+            raise ValueError("Explicit bounded decision required")
+        record = self.commit_requests.get(request_id)
+        now = datetime.now(UTC)
+        if (record is None or record["state"] != "pending" or not decision_matches(record,
+                creator=creator, expected_fingerprint=expected_fingerprint, now=now)):
+            return False
+        record.update(state="approved" if approved else "rejected",
+            decision={"approved": approved, "by": creator, "at": now.isoformat(), "reason": reason},
+            dispatch_state="waiting_schedule" if approved else None)
+        return True
 
     # Sessions and turns
     async def get_session(self, session_id: str) -> Session | None:
@@ -46,6 +114,15 @@ class MemoryOperationalStore:
         if current is None or current.status is not expected:
             return False
         self.approvals[record.id] = replace(record)
+        return True
+
+    async def consume_approval_exact(self, record: ApprovalRecord, used_at) -> bool:
+        current = self.approvals.get(record.id)
+        if (current != record or record.status is not ApprovalStatus.APPROVED
+                or record.single_use is not True or record.used_at is not None
+                or record.expires_at is None or record.expires_at <= used_at):
+            return False
+        self.approvals[record.id] = replace(record, status=ApprovalStatus.CONSUMED, used_at=used_at)
         return True
 
     async def get_approval(self, approval_id: str) -> ApprovalRecord | None:

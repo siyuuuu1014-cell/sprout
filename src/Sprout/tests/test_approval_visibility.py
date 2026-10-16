@@ -17,8 +17,8 @@ from __future__ import annotations
 
 from Sprout.cli.commands.chat import (
     _approval_action_lines,
-    _print_approval_record,
     _format_tool_arguments,
+    _print_approval_record,
 )
 from Sprout.security.approval import ApprovalManager, ApprovalPolicy
 from Sprout.storage.local.memory import MemoryOperationalStore
@@ -440,6 +440,7 @@ def test_chained_approvals_print_one_session_separator(monkeypatch) -> None:
 
 def test_the_approval_block_keeps_borders_aligned_with_cjk(capsys) -> None:
     from datetime import UTC, datetime
+
     from Sprout.security.approval import ApprovalRecord
 
     record = ApprovalRecord(
@@ -455,7 +456,9 @@ def test_the_approval_block_keeps_borders_aligned_with_cjk(capsys) -> None:
 
     _print_approval_record(
         record,
-        [{"name": "cli_tool_run", "arguments": {"command": "sprout", "args": ["skills", "--help"]}}],
+        [{"name": "cli_tool_run", "arguments": {
+            "command": "sprout", "args": ["skills", "--help"],
+        }}],
     )
 
     printed = capsys.readouterr().out

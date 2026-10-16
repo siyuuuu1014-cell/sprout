@@ -11,6 +11,17 @@
 
 <br />
 
+### 项目任务的显式类型
+
+`sprout project task-create <workspace_id> "<需求>" --mode code` 默认创建编码任务。
+编码要求已有 Git 仓库，并在普通应用和验证完成前通过冻结的输入/输出验收用例及可执行最小 Demo。
+Sprout 不会自动初始化 Git。只读分析使用 `--mode read_only`，不提供写入工具，也允许非 Git 项目。
+HTTP/RPC/SDK 创建任务使用相同的 `execution_mode` 字段。
+
+缺少类型的历史任务会在执行和恢复时被阻止。未执行且无提案的任务可通过
+`sprout project task-confirm-mode <task_id> --mode code|read_only` 确认；已有执行记录或提案的任务须重新创建。
+人工强制应用仍是独立入口，必须记录豁免原因，不代表验证完成。
+
 <div align="center">
   <img src="assets/seam_sprout.svg" alt="SEAM Sprout logo" width="200" />
 </div>
@@ -31,10 +42,14 @@ SEAM Sprout 是每一个计算机项目的一段“基因”。它可以接入�
 ## 产品亮点
 
 - **精准项目分析**：行动前先理解仓库结构、代码上下文、会话、记忆和知识。
+  Python 分析支持 SQLAlchemy Core 表/列、明确的本文件声明式 ORM 模型及 FastAPI 路由声明，保留结构化源码证据。
+  明确的跨文件 FastAPI router 包含关系会生成独立的源码组合路径及前缀证据链，SQL CREATE TABLE 保留列和约束原文。
+  结果不代表实时数据库或部署 URL；跨文件 ORM 继承、动态工厂、注解类型映射、SQL 方言语义及版本相关的挂载后修改仍未解析。
 - **代码生成**：把意图变成具体代码修改，而不是只给文字建议。
 - **隔离环境运行**：在 git worktree 沙箱中运行生成代码，通过受控 broker 应用变更。
 - **代码校验**：对每次修改进行测试和检查，避免直接写入错误代码。
 - **代码集成**：把验证通过的变更集成回项目，并保留完整过程记录。
+- **有序关闭**：先停止并等待本地任务消费器退出，再完成后台写入、outbox 刷新和数据库关闭；服务退出不等于取消业务任务。
 - **自动成长**：从已完成的工作中沉淀经验，形成可审核的后续改进提案。
 
 ## 商业场景
@@ -250,7 +265,7 @@ uv run sprout stop serve          # 停止 Web 控制台
 
 任务编排、队列、定时任务、成长自动化、Web 任务和 Gateway 工作都可以运行在 Temporal 上。
 
-Temporal 是 Sprout 的必需编排服务，不能回退到本地编排。使用仓库内的
+通过 TEMPORAL_HOST 显式启用 Temporal；未启用时使用离线本地编排。启用后提交失败不能回退本地，任务保留等待调度/结果待确认状态，可恢复服务后重试。使用仓库内的
 Compose 启动本地 Temporal 及其专用 Postgres：
 
 ```bash
@@ -267,6 +282,10 @@ sprout orchestrator worker
 
 `doctor` 会报告服务端可达性、服务端版本、命名空间是否存在，以及配置的
 任务队列上正在轮询的 worker 数量。
+
+`sprout project task-submissions <task_id>` 查询持久化提交记录，`sprout project task-run <task_id>` 重试原任务。链路、审批续跑和幂等边界见 [Temporal-Submission-Recovery-Guide.md](Temporal-Submission-Recovery-Guide.md)。
+
+活动节点采用持久化占用：未知副作用不自动重跑、不因超时抢占，也不提供强制重跑入口。`sprout project task-executions <task_id>` 仅读取占用与结果状态；有可信完成记录才可安全继续。范围与人工核对边界见 [Node-Execution-Recovery-Guide.md](Node-Execution-Recovery-Guide.md)。
 
 ### MCP
 
@@ -356,6 +375,17 @@ uv run ruff check .
 | JasonXuanxuan | [@JasonXuanxuan](https://github.com/JasonXuanxuan) |
 | rest8945 | [@rest8945](https://github.com/rest8945) |
 | siyuuuu1014-cell | [@siyuuuu1014-cell](https://github.com/siyuuuu1014-cell) |
+
+## 任务验收报告
+
+固定链路评测：`uv run sprout project eval`；单个 Python 闭环 demo：
+`uv run sprout project eval --case C02 --json`。只运行专用夹具与脚本模型，
+模拟审批不会作用于真实项目；每次新建证据目录，不自动安装依赖。
+用法与范围见 [Offline-Evaluation-Guide.md](Offline-Evaluation-Guide.md)。
+
+使用 `sprout project task-verification <task_id> --json` 读取已有验收证据；Web 提供只读 `GET /api/project/tasks/{task_id}/verification`。查询不会重新运行代码。报告包含版本、是否验证完成、阻断原因、失败分类、命令、工作目录、退出码和输出。报告由原有 EVALUATION / 变更提案证据计算，不增加存储权威。
+
+测试失败、策略拒绝、等待审批、runner 错误、超时、跳过和缺失结果分别记录；强制应用豁免不等于验证完成。pytest 包含跳过用例时保守阻止通过。日志分类不是隔离评测或防恶意代码的安全保证；固定任务评测和提交恢复仍需后续实现。
 
 ## License
 

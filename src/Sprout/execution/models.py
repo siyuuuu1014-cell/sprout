@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -34,6 +34,8 @@ class ProcessResult:
     #: can park on this and retry once the grant exists, rather than treating
     #: "not yet allowed" as "refused".
     approval_id: str | None = None
+    #: Broker evidence only: None means legacy/unknown, never proof of no effects.
+    started: bool | None = None
 
     @property
     def needs_approval(self) -> bool:
@@ -56,6 +58,43 @@ class TestResult:
     def failed(self) -> bool:
         """Ran and did not pass. Unverified is explicitly not a failure."""
         return self.executed and not self.passed
+
+
+@dataclass(frozen=True, slots=True)
+class VerificationCheck:
+    """Read projection of a check, never a second verification authority."""
+
+    name: str
+    outcome: str
+    executed: bool
+    passed: bool
+    command: tuple[str, ...] = ()
+    cwd: str = ""
+    exit_code: int | None = None
+    duration_ms: float = 0.0
+    output: str = ""
+    approval_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class VerificationReport:
+    """Versioned, JSON-safe evidence report derived from existing records."""
+
+    status: str
+    verified: bool
+    blocker: str
+    failure_codes: tuple[str, ...] = ()
+    checks: tuple[VerificationCheck, ...] = ()
+    overridden: bool = False
+    version: int = 1
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "version": self.version, "status": self.status, "verified": self.verified,
+            "blocker": self.blocker, "failure_codes": list(self.failure_codes),
+            "checks": [{**asdict(item), "command": list(item.command)} for item in self.checks],
+            "overridden": self.overridden,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +147,7 @@ class FileResult:
     resource_kind: str = ""
     #: File body returned by a read; empty for write/delete results.
     content: str = ""
+    approval_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

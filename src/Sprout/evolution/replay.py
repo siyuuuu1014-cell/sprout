@@ -89,11 +89,16 @@ class ReplayEvaluator:
 
     @staticmethod
     def checks(trajectory: Trajectory) -> GateChecks:
-        """Turn replay-time test and regression signals into hard-gate inputs."""
+        """Trajectory signals may show failures, never prove independent success.
+
+        Started/passed event names are not an independent measurement bound to
+        the candidate snapshot. Positive evidence must come from the trusted
+        isolated-runner handoff, not this proposal collection heuristic.
+        """
         names = {event.name for event in trajectory.events}
         tests_passed: bool | None = None
-        if any(name.startswith("test.") for name in names):
-            tests_passed = not bool(names & {"test.failed", "evaluation.failed"})
+        if names & {"test.failed", "evaluation.failed"}:
+            tests_passed = False
         regression_free: bool | None = None
         if names & {"regression.detected", "rollback.failed"}:
             regression_free = False

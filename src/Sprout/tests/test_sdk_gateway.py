@@ -42,6 +42,7 @@ def test_sdk_gateway_executes_task(tmp_path: Path) -> None:
             "explain this project",
             workspace_id=workspace.id,
             caller_id="embedding-app",
+            execution_mode="read_only",
             delegation_scope=DelegationScope(allowed_actions=frozenset({"file.read"})),
         )
         assert response.status in {"waiting_approval", "completed"}

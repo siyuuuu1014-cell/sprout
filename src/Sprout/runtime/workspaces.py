@@ -7,6 +7,9 @@ bounded read plan a task is allowed to touch.
 
 from __future__ import annotations
 
+import asyncio
+import logging
+from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
 
@@ -37,11 +40,9 @@ class WorkspaceService:
         self._scanner = scanner or WorkspaceScanner()
         self._intelligence = WorkspaceIntelligence(
             scanner=self._scanner,
-            knowledge_store=storage.knowledge,
-            vector_store=storage.vectors,
             skills_dir=skills_dir,
-            graph_store=storage.graph,
         )
+        self._analysis_locks: dict[str, asyncio.Lock] = {}
         self._analysis_cache = WorkspaceAnalysisCache(
             cache_store=storage.cache,
         )
@@ -63,6 +64,10 @@ class WorkspaceService:
         path = Path(root).resolve()
         if not path.exists():
             raise FileNotFoundError(f"Workspace path does not exist: {path}")
+        if workspace_id is None:
+            for existing in await self.list():
+                if existing.root.resolve() == path:
+                    return existing
         workspace = Workspace(
             id=workspace_id or str(uuid4()),
             root=path,
@@ -123,6 +128,15 @@ class WorkspaceService:
         workspace_id: str,
         *,
         task_id: str | None = None,
+        instruction: str = "understand project",
+    ) -> WorkspaceAnalysis:
+        lock = self._analysis_locks.setdefault(workspace_id, asyncio.Lock())
+        async with lock:
+            return await self._analyze(workspace_id, task_id=task_id, instruction=instruction)
+
+    async def _analyze(
+        self, workspace_id: str, *, task_id: str | None = None,
+        instruction: str = "understand project",
     ) -> WorkspaceAnalysis:
         """Build manifest, read plan, graph, and project knowledge together."""
         workspace = await self.get(workspace_id)
@@ -136,20 +150,39 @@ class WorkspaceService:
                 raise LookupError(f"Task not found: {task_id}")
         task = task or Task(
             workspace_id=workspace.id,
-            instruction="understand project",
+            instruction=instruction,
             source="workspace",
         )
 
-        previous = await self._analysis_cache.get(workspace.id)
+        if self._storage.projects is None:
+            raise RuntimeError("ProjectAnalysisStore is not configured")
+        # Only the durable project authority selects a cache version.
+        expected_snapshot_id = await self._storage.projects.current_snapshot_id(workspace.id)
+        previous = await self._analysis_cache.get(
+            workspace.id, expected_snapshot_id=expected_snapshot_id,
+        )
+        if previous is None:
+            previous = await self._storage.projects.load_analysis(workspace.id)
         analysis = await self._intelligence.analyze(
-            workspace,
+            replace(workspace, manifest=self._scanner.scan(workspace)),
             task,
             previous=previous,
         )
+        await self._storage.projects.save_analysis(
+            analysis, expected_snapshot_id=expected_snapshot_id,
+        )
         self._analysis_cache.put(workspace.id, analysis)
-        await self._analysis_cache.persist(workspace.id, analysis)
-        await self._metadata.save_workspace(analysis.workspace)
+        try:
+            await self._analysis_cache.persist(workspace.id, analysis)
+        except Exception:  # noqa: BLE001 - a cache cannot reject an authority write
+            logging.getLogger(__name__).warning("Project cache mirror failed", exc_info=True)
         return analysis
+
+    async def analyze_path(
+        self, root: Path, instruction: str = "analyze project",
+    ) -> WorkspaceAnalysis:
+        workspace = await self.open(root)
+        return await self.analyze(workspace.id, instruction=instruction)
 
     async def invalidate_workspace(self, workspace_id: str | None = None) -> None:
         """Drop cached workspace analyses for one workspace or all workspaces."""

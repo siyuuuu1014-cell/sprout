@@ -43,6 +43,8 @@ TOOL_DENIED = "tool.denied"
 APPROVAL_REQUESTED = "approval.requested"
 APPROVAL_DECIDED = "approval.decided"
 APPROVAL_EXPIRED = "approval.expired"
+VERIFICATION_OVERRIDDEN = "verification.overridden"
+TASK_MODE_CONFIRMED = "task.mode_confirmed"
 
 # Authorization flow
 AUTH_ROLES_DISCARDED = "auth.roles_discarded"
@@ -100,6 +102,8 @@ EVENT_DEFINITIONS: tuple[EventDefinition, ...] = (
     EventDefinition(APPROVAL_REQUESTED, "approvals", "audit"),
     EventDefinition(APPROVAL_DECIDED, "approvals", "audit"),
     EventDefinition(APPROVAL_EXPIRED, "approvals", "audit"),
+    EventDefinition(VERIFICATION_OVERRIDDEN, "approvals", "audit"),
+    EventDefinition(TASK_MODE_CONFIRMED, "tasks", "audit"),
     EventDefinition(AUTH_ROLES_DISCARDED, "authorization", "audit"),
     EventDefinition(AUTH_SELF_ATTESTATION_IGNORED, "authorization", "audit"),
     EventDefinition(AUTH_SCOPE_EXPIRED, "authorization", "audit"),
@@ -163,6 +167,8 @@ def event_names(*, bus_only: bool = False) -> tuple[str, ...]:
 
 
 __all__ = [
+    "TASK_MODE_CONFIRMED",
+    "VERIFICATION_OVERRIDDEN",
     "AGENT_COMPLETED",
     "AGENT_FAILED",
     "AGENT_STARTED",

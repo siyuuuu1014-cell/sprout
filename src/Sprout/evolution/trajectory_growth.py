@@ -122,9 +122,7 @@ class StablePathExtractor:
                 seen.append(node_type)
         return tuple(dict.fromkeys(seen))
 
-    def _signal(
-        self, path: tuple[str, ...], members: Sequence[Trajectory]
-    ) -> GrowthSignal:
+    def _signal(self, path: tuple[str, ...], members: Sequence[Trajectory]) -> GrowthSignal:
         count = len(members)
         evidence = tuple(
             EvidenceRef(source_type="trajectory_event", source_id=event.id)
@@ -226,9 +224,7 @@ class TrajectoryGrowthService:
         # trajectory under evaluation, so a signal carrying one foreign
         # reference scores zero on that check regardless of how many of its
         # own references are present.
-        grounded = tuple(
-            ref for ref in signal.evidence if ref.source_id in in_trajectory
-        )
+        grounded = tuple(ref for ref in signal.evidence if ref.source_id in in_trajectory)
         if not grounded:
             grounded = tuple(
                 EvidenceRef(source_type="trajectory_event", source_id=event.id)
@@ -258,11 +254,14 @@ class TrajectoryGrowthService:
             return []
         # Hard gates run before persistence and cannot be offset by utility.
         checks = self._replay.checks(trajectory)
-        if not self._evaluator.evaluate(candidate, checks).passed:
+        evaluation = self._evaluator.evaluate(candidate, checks)
+        if not evaluation.passed and not evaluation.pending:
             return []
         if candidate.artifact is not None:
             artifact = await self._reconcile(candidate.artifact)
             candidate = replace(candidate, artifact=artifact)
+            if artifact.metadata.get("publication_guard", {}).get("owner"):
+                return [candidate]
             await self._metadata.save_artifact(artifact)
             await self._emit(
                 EVOLUTION_PROPOSAL,
@@ -292,11 +291,11 @@ class TrajectoryGrowthService:
             return artifact
         # list_artifacts(name) is ordered by version DESC; prefer a decided row
         # so re-collection can never displace a human decision, then the newest.
-        decided = [
-            item for item in existing if item.status in _DECIDED_STATUSES
-        ]
+        decided = [item for item in existing if item.status in _DECIDED_STATUSES]
         chosen = decided[0] if decided else existing[0]
-        if chosen.status in _DECIDED_STATUSES:
+        if chosen.status in _DECIDED_STATUSES or chosen.metadata.get("publication_guard", {}).get(
+            "owner"
+        ):
             return chosen
         # Pending row: refresh its content and evidence, keep identity and status.
         return replace(
@@ -307,9 +306,7 @@ class TrajectoryGrowthService:
         )
 
     @staticmethod
-    def _origin_for(
-        signal: GrowthSignal, trajectories: Sequence[Trajectory]
-    ) -> Trajectory | None:
+    def _origin_for(signal: GrowthSignal, trajectories: Sequence[Trajectory]) -> Trajectory | None:
         """The trajectory a batch signal was drawn from, for gating context.
 
         Replay evaluates one candidate against one trajectory, so a signal

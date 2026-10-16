@@ -1,0 +1,13 @@
+# DeepSeek configuration. The API key stays in .env, never in this file.
+# Explicitly select this file with --config .\sprout.toml.
+# Use non-thinking mode until reasoning-content round-trip support is implemented.
+
+[model]
+provider = "openai_compatible"
+model = "deepseek-flash"
+base_url = "https://api.deepseek.com"
+api_key_env = "DEEPSEEK_API_KEY"
+timeout_seconds = 120.0
+thinking_mode = "disabled"
+# Conservative per-request limit for the initial connectivity test, not a money cap.
+max_output_tokens = 256

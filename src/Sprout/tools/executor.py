@@ -26,12 +26,14 @@ from Sprout.events import (
     Event,
     EventBus,
 )
-from Sprout.security.access import AccessDecision
+from Sprout.security.access import AccessDecision, ActionRequest, ActionType
 from Sprout.security.approval import ApprovalManager
+from Sprout.security.layered_policy import LayeredPolicyEngine
 from Sprout.security.policy import Decision, SecurityPolicy
-from Sprout.tools.context_keys import CONTEXT_KEY, CONTEXT_TOOLS
+from Sprout.security.protocol import PolicyEngineProtocol
+from Sprout.tools.context_keys import CONTEXT_KEY, CONTEXT_TOOLS, NodeToolInvocationContext
 from Sprout.tools.registry import ToolRegistry
-from Sprout.tools.result import ToolResult
+from Sprout.tools.result import ToolExecutionUnconfirmed, ToolResult
 
 if TYPE_CHECKING:
     from Sprout.security.audit import SecurityAuditLog
@@ -63,6 +65,9 @@ class ToolExecutor:
     #: Node-scoped tools consulted before ``tools``. ``None`` means "no node
     #: scope", which is the interactive path.
     scoped: Mapping[str, Any] | None = None
+    #: Strict model contexts cannot dispatch outside their explicit tool set.
+    scoped_only: bool = False
+    policy_engine: PolicyEngineProtocol = field(default_factory=LayeredPolicyEngine)
 
     async def execute(
         self,
@@ -82,6 +87,13 @@ class ToolExecutor:
         except LookupError as exc:
             return ToolResult.failure(str(exc))
 
+        bound = getattr(tool, "invocation_context", None)
+        if isinstance(bound, NodeToolInvocationContext):
+            if not self.scoped_only:
+                return ToolResult.denied("Bound node tools require strict node-local dispatch")
+            task_id, source = bound.task_id, bound.source
+            requested_by, resource_scope = bound.requested_by, bound.resource_scope
+
         decision = self.policy.decide_for_spec(tool.spec)
 
         # A read-only command is granted without asking. This runs *after* the
@@ -100,9 +112,28 @@ class ToolExecutor:
                 matched_rules=(*decision.matched_rules, "readonly:cli_tool_run"),
             )
 
+        policy_arguments = {**arguments, "tool_name": tool.spec.name}
+        command = arguments.get("command")
+        argv = arguments.get("args")
+        if isinstance(command, str) and isinstance(argv, list | tuple):
+            policy_arguments["command"] = [command, *argv]
+        boundary = self.policy_engine.decide(
+            ActionRequest(
+                task_id=task_id,
+                action=ActionType.TOOL_INVOKE,
+                arguments=policy_arguments,
+            )
+        )
+        decision = replace(
+            decision,
+            decision=LayeredPolicyEngine._intersect(decision.decision, boundary.decision),
+            reason="; ".join(filter(None, (boundary.reason, decision.reason))),
+            matched_rules=(*boundary.matched_rules, *decision.matched_rules),
+        )
+
         await self._audit(name, task_id, source, decision.decision.value, decision.reason)
 
-        if decision.decision is AccessDecision.DENY:
+        if decision.decision not in {AccessDecision.ALLOW, AccessDecision.REQUIRE_APPROVAL}:
             await self._publish(TOOL_DENIED, {"tool": name, "reason": "policy"})
             return ToolResult.denied(f"Tool {name} is denied by the security policy")
 
@@ -160,6 +191,10 @@ class ToolExecutor:
                 approval_granted=approval_granted,
             )
             result = await tool.invoke(contextual)
+        except ToolExecutionUnconfirmed:
+            await self._publish(TOOL_EXECUTED, {"tool": name, "ok": False,
+                                                "execution_unconfirmed": True})
+            raise
         except Exception as exc:  # noqa: BLE001 - tool errors must not break the loop
             await self._publish(TOOL_EXECUTED, {"tool": name, "ok": False})
             return ToolResult.failure(f"{type(exc).__name__}: {exc}")
@@ -230,18 +265,23 @@ class ToolExecutor:
         }
 
     def _resolve(self, name: str) -> Any:
-        """Node-scoped tool if the current node has one, else the registry."""
+        """Resolve the overlay, rejecting registry fallback for strict contexts."""
         if self.scoped is not None and name in self.scoped:
             return self.scoped[name]
+        if self.scoped_only:
+            raise KeyError(name)
         return self.tools.get(name)
 
-    def with_scoped_tools(self, tools: Mapping[str, Any]) -> ToolExecutor:
-        """A copy dispatching to ``tools`` first, for one node's run.
+    def with_scoped_tools(
+        self, tools: Mapping[str, Any], *, strict: bool = False,
+    ) -> ToolExecutor:
+        """A copy dispatching to ``tools`` for one node's run.
 
         A copy rather than a mutation: concurrent nodes must not see each
-        other's tool set.
+        other's tool set. ``strict`` makes the overlay an allowlist; even an
+        empty overlay then blocks process-wide tools.
         """
-        clone = replace(self, scoped=dict(tools))
+        clone = replace(self, scoped=dict(tools), scoped_only=strict)
         return clone
 
     async def _audit(

@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from typing import TYPE_CHECKING
 
-from Sprout.security.access import AccessDecision, ActionRequest, PolicyDecision
+from Sprout.security.access import AccessDecision, ActionRequest, ActionType, PolicyDecision
 from Sprout.security.engine import PolicyEngine
 from Sprout.security.policy import SecurityPolicy
 
@@ -314,6 +314,11 @@ class LayeredPolicyEngine:
         now graded through the lookup the runtime wires to the tool registry,
         and an unresolvable name is denied instead of waved through.
         """
+        # Node-scoped tools live in a per-run overlay, not the global registry.
+        # Their ToolExecutor grades the spec it actually resolved; asking the
+        # global lookup here would reject legitimate scoped tools.
+        if request.action is ActionType.TOOL_INVOKE:
+            return None
         if self._risk is None or self._tool_risk_lookup is None:
             return None
         tool = request.arguments.get("tool_name")

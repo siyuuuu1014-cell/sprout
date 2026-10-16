@@ -64,6 +64,11 @@ class PolicyEngine:
                 "scope:denied",
             )
 
+        if request.action is ActionType.TOOL_INVOKE:
+            # ToolExecutor adds the resolved server-side ToolSpec risk gate.
+            # Concrete I/O still receives its own broker matrix decision.
+            return _decision(AccessDecision.ALLOW, "", "matrix:tool.invoke")
+
         if request.resource is None:
             if request.action in {ActionType.PROCESS_RUN, ActionType.NETWORK_GET}:
                 return _decision(AccessDecision.ALLOW, "", "matrix:no-resource")

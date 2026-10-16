@@ -42,6 +42,7 @@ def test_delegation_gateway_uses_scope(tmp_path: Path) -> None:
             "explain this project",
             workspace_id=workspace.id,
             caller_id="external-agent",
+            execution_mode="read_only",
             scope=DelegationScope(allowed_actions=frozenset({"file.read"})),
         )
         assert response.status in {"waiting_approval", "completed"}

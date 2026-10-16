@@ -5,12 +5,16 @@ from __future__ import annotations
 import subprocess
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from Sprout.execution.apply import ApplyBroker
 from Sprout.execution.change import ChangeProposalBuilder
 from Sprout.execution.models import (
+    ApplyResult,
+    ChangeProposal,
     ChangeProposalStatus,
 )
 from Sprout.execution.models import (
@@ -18,6 +22,7 @@ from Sprout.execution.models import (
 )
 from Sprout.runtime.changes import ChangeProposalService
 from Sprout.sandbox.git_worktree import GitWorktreeSandbox
+from Sprout.security.access import AccessDecision, PolicyDecision
 from Sprout.security.approval import ApprovalManager
 from Sprout.security.engine import PolicyEngine
 from Sprout.storage.bundle import StorageBundle
@@ -92,7 +97,14 @@ async def test_apply_commits_and_rollback_reverts(tmp_path: Path) -> None:
         approved = await service.approve(proposal.id, decided_by="test")
         assert approved.status is ChangeProposalStatus.APPROVED
 
-        applied = await service.apply(proposal.id)
+        # This legacy fixture has only a generic check, not requirement cases.
+        # Ordinary apply must refuse; commit/rollback exercise an audited override.
+        blocked = await service.apply(proposal.id)
+        assert not blocked.applied and "legacy proposal" in blocked.reason
+        applied = await service.apply(
+            proposal.id, force=True, override_reason="Legacy commit/rollback integration fixture",
+            decided_by="test",
+        )
         assert applied.applied is True, applied.reason
         assert (repo / "tracked.txt").read_text(encoding="utf-8") == "two\n"
         assert (repo / "new.py").read_text(encoding="utf-8") == "print('hi')\n"
@@ -109,3 +121,57 @@ async def test_apply_commits_and_rollback_reverts(tmp_path: Path) -> None:
         storage.metadata.close()
     finally:
         await sandbox.remove(ref)
+
+
+async def test_failed_revert_never_attempts_reset_or_reports_success(tmp_path):
+    broker = ApplyBroker(PolicyEngine())
+    proposal = ChangeProposal(task_id="fixture", metadata={
+        "applied_commit": "b" * 40, "base_commit": "a" * 40})
+    broker.evaluate = AsyncMock(return_value=ApplyResult(proposal.id, applied=True))
+    broker._git = AsyncMock(return_value=(1, "", "revert conflict"))
+    workspace = Workspace(id="fixture", root=tmp_path)
+    result = await broker.rollback(proposal, workspace)
+    assert not result.applied and "manual reconciliation" in result.reason
+    broker._git.assert_awaited_once_with(workspace, "revert", "--no-edit", "b" * 40)
+
+
+async def test_failed_real_revert_preserves_user_changes_and_proposal_state(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", "Test User")
+    _git(repo, "config", "user.email", "test@example.com")
+    tracked = repo / "tracked.txt"
+    tracked.write_text("baseline\n", encoding="utf-8")
+    _git(repo, "add", "tracked.txt")
+    _git(repo, "commit", "-qm", "baseline")
+    base = _git(repo, "rev-parse", "HEAD").strip()
+    tracked.write_text("applied feature\n", encoding="utf-8")
+    _git(repo, "add", "tracked.txt")
+    _git(repo, "commit", "-qm", "fixture applied")
+    applied = _git(repo, "rev-parse", "HEAD").strip()
+    tracked.write_text("operator uncommitted work\n", encoding="utf-8")
+    notes = repo / "notes.txt"
+    notes.write_text("operator untracked notes\n", encoding="utf-8")
+    before_index = _git(repo, "diff", "--cached")
+    workspace = Workspace(id="fixture", root=repo, kind=WorkspaceKind.GIT_REPOSITORY)
+    proposal = ChangeProposal(task_id="fixture-task", status=ChangeProposalStatus.APPLIED,
+                              metadata={"base_commit": base, "applied_commit": applied})
+    storage = _storage(tmp_path)
+    try:
+        await storage.metadata.save_workspace(workspace)
+        await storage.metadata.save_task(Task(id=proposal.task_id, workspace_id=workspace.id))
+        await storage.metadata.save_change_proposal(proposal)
+        policy = SimpleNamespace(decide=lambda request: PolicyDecision(
+            AccessDecision.ALLOW, "explicit test-owned rollback fixture"))
+        service = ChangeProposalService(storage.metadata, storage.operational, ApplyBroker(policy))
+        result = await service.rollback(proposal.id)
+        assert not result.applied and "manual reconciliation" in result.reason
+        assert tracked.read_text() == "operator uncommitted work\n"
+        assert notes.read_text() == "operator untracked notes\n"
+        assert _git(repo, "rev-parse", "HEAD").strip() == applied
+        assert _git(repo, "diff", "--cached") == before_index
+        saved = await storage.metadata.get_change_proposal(proposal.id)
+        assert saved.status is ChangeProposalStatus.APPLIED
+    finally:
+        storage.metadata.close()

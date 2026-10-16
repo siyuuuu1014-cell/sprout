@@ -9,9 +9,11 @@ from typing import Annotated
 import typer
 
 from Sprout.cli import ui
+from Sprout.cli.commands.task_lifecycle import app as task_lifecycle_app
 from Sprout.cli.diff import render_diff
 
 app = typer.Typer(help="Project Agent Runtime operations.", no_args_is_help=True)
+app.add_typer(task_lifecycle_app, name="task")
 
 
 def _gateway(config: str | None):
@@ -27,21 +29,49 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+@app.command("eval")
+def evaluate(
+    output: Annotated[
+        str | None, typer.Option("--output", help="Parent for a new evidence directory.")
+    ] = None,
+    case: Annotated[
+        list[str] | None, typer.Option("--case", help="Fixed case id; repeat to select.")
+    ] = None,
+    as_json: Annotated[
+        bool, typer.Option("--json", help="Print the full evaluation report.")
+    ] = False,
+) -> None:
+    """Run offline fixture evals; creates temporary repos and simulates their approvals only."""
+    from pathlib import Path
+
+    from Sprout.cli.i18n import L
+    from Sprout.evaluation.runner import run_suite
+
+    try:
+        report = _run(run_suite(Path(output) if output else None, case_ids=tuple(case or ())))
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from None
+    if as_json:
+        typer.echo(json.dumps(report, ensure_ascii=False))
+    else:
+        ui.banner(L("本地固定任务评测", "Offline fixed-task evaluation"))
+        typer.echo(ui.key_value("scenarios", f"{report['scenario_passed']}/{report['total']}"))
+        typer.echo(ui.key_value("evidence", report["evidence_dir"]))
+    if report["scenario_passed"] != report["total"]:
+        raise typer.Exit(code=1)
+
+
 async def _resolve_proposal(gateway, prefix: str):
     try:
         return await gateway.find_proposal(prefix)
     except LookupError:
-        raise typer.BadParameter(
-            f"No change proposal matches id prefix {prefix!r}"
-        ) from None
+        raise typer.BadParameter(f"No change proposal matches id prefix {prefix!r}") from None
 
 
 @app.command("workspace")
 def workspace(
     path: Annotated[str, typer.Argument(help="Workspace path.")],
-    config: Annotated[
-        str | None, typer.Option("--config", help="Path to sprout.toml.")
-    ] = None,
+    config: Annotated[str | None, typer.Option("--config", help="Path to sprout.toml.")] = None,
 ) -> None:
     """Open and register a local or Git workspace."""
     gateway = _gateway(config)
@@ -56,9 +86,7 @@ def workspace(
 @app.command("analyze")
 def analyze(
     workspace_id: Annotated[str, typer.Argument(help="Workspace id.")],
-    config: Annotated[
-        str | None, typer.Option("--config", help="Path to sprout.toml.")
-    ] = None,
+    config: Annotated[str | None, typer.Option("--config", help="Path to sprout.toml.")] = None,
     as_json: Annotated[
         bool,
         typer.Option("--json", help="Print the analysis as machine-readable JSON."),
@@ -107,17 +135,13 @@ def graph(
     workspace_id: Annotated[str, typer.Argument(help="Workspace id.")],
     name: Annotated[
         str,
-        typer.Option(
-            "--name", help="Node name, qualified name, file path, or id to inspect."
-        ),
+        typer.Option("--name", help="Node name, qualified name, file path, or id to inspect."),
     ] = "",
     relation: Annotated[
         str | None,
         typer.Option("--relation", help="Filter edges by relation."),
     ] = None,
-    config: Annotated[
-        str | None, typer.Option("--config", help="Path to sprout.toml.")
-    ] = None,
+    config: Annotated[str | None, typer.Option("--config", help="Path to sprout.toml.")] = None,
     as_json: Annotated[
         bool,
         typer.Option("--json", help="Print the query result as JSON."),
@@ -192,9 +216,7 @@ def _edge_lines(nodes, edges, *, limit: int = 20) -> list[str]:
 
 @app.command("workspaces")
 def workspaces(
-    config: Annotated[
-        str | None, typer.Option("--config", help="Path to sprout.toml.")
-    ] = None,
+    config: Annotated[str | None, typer.Option("--config", help="Path to sprout.toml.")] = None,
     as_json: Annotated[
         bool,
         typer.Option("--json", help="Print the workspace list as machine-readable JSON."),
@@ -238,9 +260,7 @@ def symbols(
         str,
         typer.Option("--query", help="Case-insensitive filter on name or qualified name."),
     ] = "",
-    config: Annotated[
-        str | None, typer.Option("--config", help="Path to sprout.toml.")
-    ] = None,
+    config: Annotated[str | None, typer.Option("--config", help="Path to sprout.toml.")] = None,
     as_json: Annotated[
         bool,
         typer.Option("--json", help="Print the symbols as machine-readable JSON."),
@@ -253,9 +273,7 @@ def symbols(
         nodes = await gateway.query_workspace_symbols(workspace_id, kind=kind, query=query)
         if as_json:
             typer.echo(
-                json.dumps(
-                    [_node_payload(node) for node in nodes], indent=2, ensure_ascii=False
-                )
+                json.dumps([_node_payload(node) for node in nodes], indent=2, ensure_ascii=False)
             )
             return
         ui.banner("Workspace Symbols", subtitle=workspace_id)
@@ -272,17 +290,13 @@ def dependencies(
     workspace_id: Annotated[str, typer.Argument(help="Workspace id.")],
     path: Annotated[
         str,
-        typer.Argument(
-            help="File path: workspace-relative, or the absolute resource path."
-        ),
+        typer.Argument(help="File path: workspace-relative, or the absolute resource path."),
     ],
     direction: Annotated[
         str,
         typer.Option("--direction", help="out (imports), in (imported by), or both."),
     ] = "out",
-    config: Annotated[
-        str | None, typer.Option("--config", help="Path to sprout.toml.")
-    ] = None,
+    config: Annotated[str | None, typer.Option("--config", help="Path to sprout.toml.")] = None,
     as_json: Annotated[
         bool,
         typer.Option("--json", help="Print the dependency edges as JSON."),
@@ -292,9 +306,7 @@ def dependencies(
     gateway = _gateway(config)
 
     async def run() -> None:
-        result = await gateway.query_workspace_dependencies(
-            workspace_id, path, direction=direction
-        )
+        result = await gateway.query_workspace_dependencies(workspace_id, path, direction=direction)
         if as_json:
             payload = {
                 "path": path,
@@ -322,16 +334,12 @@ def subgraph(
             help="Node id, name, qualified name, or file path to start from.",
         ),
     ],
-    depth: Annotated[
-        int, typer.Option("--depth", help="How many hops to walk.")
-    ] = 2,
+    depth: Annotated[int, typer.Option("--depth", help="How many hops to walk.")] = 2,
     relation: Annotated[
         str | None,
         typer.Option("--relation", help="Restrict the walk to one relation."),
     ] = None,
-    config: Annotated[
-        str | None, typer.Option("--config", help="Path to sprout.toml.")
-    ] = None,
+    config: Annotated[str | None, typer.Option("--config", help="Path to sprout.toml.")] = None,
     as_json: Annotated[
         bool,
         typer.Option("--json", help="Print the subgraph as machine-readable JSON."),
@@ -371,11 +379,12 @@ def knowledge(
     ] = "",
     kind: Annotated[
         str | None,
-        typer.Option("--kind", help="fact or inference."),
+        typer.Option(
+            "--kind",
+            help="Kind: fact, interface_endpoint, interface_mounted_endpoint, database_table.",
+        ),
     ] = None,
-    config: Annotated[
-        str | None, typer.Option("--config", help="Path to sprout.toml.")
-    ] = None,
+    config: Annotated[str | None, typer.Option("--config", help="Path to sprout.toml.")] = None,
     as_json: Annotated[
         bool,
         typer.Option("--json", help="Print the query result as JSON."),
@@ -400,6 +409,7 @@ def knowledge(
                             "statement": item.statement,
                             "confidence": item.confidence,
                             "evidence_ids": list(item.evidence_ids),
+                            "details": dict(item.details),
                         }
                         for item in items
                     ],
@@ -420,9 +430,7 @@ def knowledge(
 @app.command("readplan")
 def readplan(
     task_id: Annotated[str, typer.Argument(help="Task id.")],
-    config: Annotated[
-        str | None, typer.Option("--config", help="Path to sprout.toml.")
-    ] = None,
+    config: Annotated[str | None, typer.Option("--config", help="Path to sprout.toml.")] = None,
     as_json: Annotated[
         bool,
         typer.Option("--json", help="Print the read plan as machine-readable JSON."),
@@ -462,16 +470,31 @@ def readplan(
 def task_create(
     workspace_id: Annotated[str, typer.Argument(help="Workspace id.")],
     instruction: Annotated[str, typer.Argument(help="Task instruction.")],
-    config: Annotated[
-        str | None, typer.Option("--config", help="Path to sprout.toml.")
-    ] = None,
+    mode: Annotated[str, typer.Option("--mode", help="code or read_only.")] = "code",
+    config: Annotated[str | None, typer.Option("--config", help="Path to sprout.toml.")] = None,
 ) -> None:
     """Create a project task."""
     gateway = _gateway(config)
 
     async def run() -> None:
-        task = await gateway.create_task(workspace_id, instruction)
+        task = await gateway.create_task(workspace_id, instruction, execution_mode=mode)
         typer.echo(task.id)
+
+    _run(run())
+
+
+@app.command("task-confirm-mode")
+def task_confirm_mode(
+    task_id: Annotated[str, typer.Argument(help="Historical task id.")],
+    mode: Annotated[str, typer.Option("--mode", help="code or read_only.")],
+    config: Annotated[str | None, typer.Option("--config")] = None,
+) -> None:
+    """Confirm the mode of an untouched historical task."""
+    gateway = _gateway(config)
+
+    async def run() -> None:
+        task = await gateway.confirm_task_mode(task_id, mode)
+        typer.echo(f"{task.id}: {task.execution_mode.value}")
 
     _run(run())
 
@@ -479,9 +502,7 @@ def task_create(
 @app.command("task-run")
 def task_run(
     task_id: Annotated[str, typer.Argument(help="Task id.")],
-    config: Annotated[
-        str | None, typer.Option("--config", help="Path to sprout.toml.")
-    ] = None,
+    config: Annotated[str | None, typer.Option("--config", help="Path to sprout.toml.")] = None,
 ) -> None:
     """Run a project task through the execution graph."""
     gateway = _gateway(config)
@@ -499,9 +520,7 @@ def task_cancel(
     reason: Annotated[
         str | None, typer.Option("--reason", help="Why it is being cancelled.")
     ] = None,
-    config: Annotated[
-        str | None, typer.Option("--config", help="Path to sprout.toml.")
-    ] = None,
+    config: Annotated[str | None, typer.Option("--config", help="Path to sprout.toml.")] = None,
 ) -> None:
     """Cancel a task that is parked waiting on a human, or still running.
 
@@ -525,12 +544,75 @@ def task_cancel(
     _run(run())
 
 
+@app.command("task-verification")
+def task_verification(
+    task_id: Annotated[str, typer.Argument(help="Task id; reads evidence without running checks.")],
+    config: Annotated[str | None, typer.Option("--config", help="Path to sprout.toml.")] = None,
+    as_json: Annotated[bool, typer.Option("--json", help="Print structured evidence.")] = False,
+) -> None:
+    """Inspect verification status, failure categories and command evidence."""
+    from Sprout.cli.i18n import L
+
+    gateway = _gateway(config)
+
+    async def run() -> None:
+        try:
+            report = await gateway.verification_report(task_id)
+        except LookupError as exc:
+            raise typer.BadParameter(str(exc)) from None
+        if as_json:
+            typer.echo(json.dumps(report, ensure_ascii=False))
+            return
+        ui.banner(L("验收报告", "Verification report"), subtitle=task_id)
+        typer.echo(ui.key_value("status", report["status"]))
+        typer.echo(ui.key_value("verified", report["verified"]))
+        typer.echo(ui.key_value("blocker", report["blocker"] or "-"))
+        for check in report["checks"]:
+            typer.echo(ui.key_value(check["outcome"], check["name"]))
+
+    _run(run())
+
+
+@app.command("task-submissions")
+def task_submissions(
+    task_id: Annotated[str, typer.Argument(help="Task id.")],
+    config: Annotated[str | None, typer.Option("--config")] = None,
+) -> None:
+    """Inspect persisted Temporal submission records without remote calls."""
+    gateway = _gateway(config)
+
+    async def run() -> None:
+        try:
+            records = await gateway.task_submissions(task_id)
+        except LookupError as exc:
+            raise typer.BadParameter(str(exc)) from None
+        typer.echo(json.dumps(records, ensure_ascii=False))
+
+    _run(run())
+
+
+@app.command("task-executions")
+def task_executions(
+    task_id: Annotated[str, typer.Argument(help="Task id.")],
+    config: Annotated[str | None, typer.Option("--config")] = None,
+) -> None:
+    """Inspect durable node ownership; never force or replay execution."""
+    gateway = _gateway(config)
+
+    async def run() -> None:
+        try:
+            report = await gateway.task_execution_report(task_id)
+        except LookupError as exc:
+            raise typer.BadParameter(str(exc)) from None
+        typer.echo(json.dumps(report, ensure_ascii=False))
+
+    _run(run())
+
+
 @app.command("changes")
 def changes(
     task_id: Annotated[str, typer.Argument(help="Task id.")],
-    config: Annotated[
-        str | None, typer.Option("--config", help="Path to sprout.toml.")
-    ] = None,
+    config: Annotated[str | None, typer.Option("--config", help="Path to sprout.toml.")] = None,
 ) -> None:
     """List change proposals for a task."""
     gateway = _gateway(config)
@@ -559,11 +641,17 @@ def apply(
             help="Land the change even when its verification commands failed.",
         ),
     ] = False,
-    config: Annotated[
-        str | None, typer.Option("--config", help="Path to sprout.toml.")
-    ] = None,
+    force: Annotated[
+        bool, typer.Option("--force", help="Apply without verified checks; requires a reason.")
+    ] = False,
+    override_reason: Annotated[
+        str, typer.Option("--override-reason", help="Recorded reason for a forced apply.")
+    ] = "",
+    config: Annotated[str | None, typer.Option("--config", help="Path to sprout.toml.")] = None,
 ) -> None:
-    """Apply an already approved change proposal."""
+    """Apply a verified, approved proposal, or explicitly record a forced apply."""
+    if (force or allow_failing_tests) and not override_reason.strip():
+        raise typer.BadParameter("--force requires --override-reason")
     gateway = _gateway(config)
 
     async def run() -> None:
@@ -571,6 +659,8 @@ def apply(
         result = await gateway.apply_proposal(
             proposal.id,
             allow_failing_tests=allow_failing_tests,
+            force=force,
+            override_reason=override_reason,
         )
         typer.echo(f"applied={result.applied}  {result.reason}")
 
@@ -580,9 +670,7 @@ def apply(
 @app.command("show")
 def show(
     proposal_id: Annotated[str, typer.Argument(help="Proposal id or prefix.")],
-    config: Annotated[
-        str | None, typer.Option("--config", help="Path to sprout.toml.")
-    ] = None,
+    config: Annotated[str | None, typer.Option("--config", help="Path to sprout.toml.")] = None,
 ) -> None:
     """Show proposal details and diff."""
     gateway = _gateway(config)
@@ -604,9 +692,7 @@ def show(
 def approve(
     proposal_id: Annotated[str, typer.Argument(help="Proposal id or prefix.")],
     by: Annotated[str, typer.Option("--by", help="Approver identity.")] = "cli",
-    config: Annotated[
-        str | None, typer.Option("--config", help="Path to sprout.toml.")
-    ] = None,
+    config: Annotated[str | None, typer.Option("--config", help="Path to sprout.toml.")] = None,
 ) -> None:
     """Approve a pending change proposal and resume the task's APPLY node."""
     gateway = _gateway(config)
@@ -623,9 +709,7 @@ def approve(
 def reject(
     proposal_id: Annotated[str, typer.Argument(help="Proposal id or prefix.")],
     reason: Annotated[str, typer.Option("--reason", help="Rejection reason.")] = "",
-    config: Annotated[
-        str | None, typer.Option("--config", help="Path to sprout.toml.")
-    ] = None,
+    config: Annotated[str | None, typer.Option("--config", help="Path to sprout.toml.")] = None,
 ) -> None:
     """Reject a pending change proposal."""
     gateway = _gateway(config)
@@ -642,9 +726,7 @@ def reject(
 def rollback(
     proposal_id: Annotated[str, typer.Argument(help="Proposal id or prefix.")],
     by: Annotated[str, typer.Option("--by", help="Approver identity.")] = "cli",
-    config: Annotated[
-        str | None, typer.Option("--config", help="Path to sprout.toml.")
-    ] = None,
+    config: Annotated[str | None, typer.Option("--config", help="Path to sprout.toml.")] = None,
 ) -> None:
     """Roll back an applied change proposal."""
     gateway = _gateway(config)

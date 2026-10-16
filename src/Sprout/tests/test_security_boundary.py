@@ -138,7 +138,7 @@ def _candidate(**overrides) -> GrowthCandidate:
 
 
 def test_clean_candidate_passes_the_hard_gate() -> None:
-    assert HardGateEvaluator().evaluate(_candidate()).passed
+    assert HardGateEvaluator().evaluate(_candidate(), GateChecks(True, True)).passed
 
 
 def test_permission_expansion_is_blocked() -> None:
@@ -186,5 +186,5 @@ def test_failed_tests_and_regressions_block_the_candidate() -> None:
     assert not HardGateEvaluator().evaluate(
         _candidate(), GateChecks(regression_free=False)
     ).passed
-    # Unmeasured signals never block on their own.
-    assert HardGateEvaluator().evaluate(_candidate(), GateChecks()).passed
+    # Unmeasured signals cannot satisfy the verification gates.
+    assert not HardGateEvaluator().evaluate(_candidate(), GateChecks()).passed

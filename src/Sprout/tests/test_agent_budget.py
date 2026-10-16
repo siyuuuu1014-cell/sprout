@@ -8,6 +8,7 @@ from Sprout.agent.base import ModelAgent
 from Sprout.agent.executor import ActionExecutor
 from Sprout.agent.loop import AgentLoop
 from Sprout.context.context import AgentContext
+from Sprout.llm.base import ModelBudgetExhausted
 from Sprout.llm.messages import LLMResponse, LLMStreamEvent, ToolCall, Usage
 from Sprout.message.models import Message
 from Sprout.session.models import Session
@@ -53,6 +54,28 @@ def _context_with_tools(metadata: dict, tools: dict) -> AgentContext:
     )
 
 
+async def test_budget_exhaustion_after_tool_is_not_a_completed_summary():
+    class BudgetModel:
+        name = "budget-fixture"
+        calls = 0
+
+        async def chat(self, messages, *, tools=()):
+            self.calls += 1
+            if self.calls > 1:
+                raise ModelBudgetExhausted("authorized count exhausted")
+            return LLMResponse(tool_calls=(ToolCall(
+                id="read", name="echo_tool", arguments={"text": "read complete"}),))
+
+    model = BudgetModel()
+    tools = ToolRegistry()
+    tools.register(EchoTool())
+    loop = AgentLoop(model=model, executor=ActionExecutor(tools=ToolExecutor(tools=tools)))
+    with pytest.raises(ModelBudgetExhausted):
+        await loop.run(Message("go"), _context_with_tools({},
+            {"echo_tool": tools.get("echo_tool")}))
+    assert model.calls == 2
+
+
 @pytest.mark.asyncio
 async def test_loop_respects_model_call_budget() -> None:
     tool_call = LLMResponse(
@@ -70,7 +93,9 @@ async def test_loop_respects_model_call_budget() -> None:
 
     result = await loop.run(
         Message("go"),
-        _context({"task_budget": {"max_model_calls": 1}}),
+        _context_with_tools(
+            {"task_budget": {"max_model_calls": 1}}, {"echo_tool": tools.get("echo_tool")},
+        ),
     )
 
     assert result.metadata["model_calls"] == 1
@@ -133,7 +158,7 @@ async def test_loop_caps_tool_calls() -> None:
 
     result = await loop.run(
         Message("go"),
-        _context({"task_budget": {"max_tool_calls": 2}}),
+        _context_with_tools({"task_budget": {"max_tool_calls": 2}}, {"echo_tool": tool}),
     )
 
     assert result.content == "done"

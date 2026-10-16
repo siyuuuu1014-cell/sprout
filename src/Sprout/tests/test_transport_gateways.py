@@ -39,14 +39,17 @@ def test_transport_gateways_execute_task(tmp_path: Path) -> None:
 
         cli_response = await CLIGateway(runtime).execute(
             "explain this project",
+            execution_mode="read_only",
             workspace_id=workspace.id,
         )
         web_response = await WebGateway(runtime).execute(
             "explain this project",
+            execution_mode="read_only",
             workspace_id=workspace.id,
         )
         mcp_response = await MCPGateway(runtime).execute(
             "explain this project",
+            execution_mode="read_only",
             workspace_id=workspace.id,
         )
 

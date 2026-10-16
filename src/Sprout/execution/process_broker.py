@@ -24,7 +24,9 @@ from typing import TYPE_CHECKING, Any
 
 from Sprout.execution.models import ProcessResult
 from Sprout.execution.policy_emit import emit_policy_decision
+from Sprout.execution.proc import OutputLimitExceeded, capture_bounded
 from Sprout.execution.proc import terminate as _terminate
+from Sprout.gateway.identity import Principal
 from Sprout.security.access import AccessDecision, ActionRequest, ActionType
 from Sprout.security.commands import CommandRegistry
 from Sprout.security.engine import PolicyEngine
@@ -82,6 +84,8 @@ class ProcessBroker:
         cwd: str | Path | None = None,
         env: Mapping[str, str] | None = None,
         timeout_seconds: float | None = None,
+        max_output_bytes: int | None = None,
+        preflight_only: bool = False,
         known_command: bool = False,
         task_id: str = "",
         session_id: str = "",
@@ -91,9 +95,14 @@ class ProcessBroker:
         command_origin: str = "caller",
         source: str = "interactive",
         requested_by: str = "system",
+        actor: Principal | None = None,
         resource_scope: str = "",
         upstream_approval_granted: bool = False,
     ) -> ProcessResult:
+        if max_output_bytes is not None and (
+            type(max_output_bytes) is not int or not 0 < max_output_bytes <= 8 * 1024 * 1024
+        ):
+            raise ValueError("Capture limit must be between 1 byte and 8 MiB")
         command_tuple = tuple(str(part) for part in command)
         cwd_path = Path(cwd or workspace.root)
         resource = ResourceRef(
@@ -107,6 +116,7 @@ class ProcessBroker:
         tags = self._commands.tag(command_tuple)
         request = ActionRequest(
             task_id=task_id,
+            actor=actor if actor is not None else Principal(user_id="system"),
             action=ActionType.PROCESS_RUN,
             resource=resource,
             arguments={
@@ -140,6 +150,9 @@ class ProcessBroker:
                 return blocked
             # An existing grant covers it: fall through and run.
 
+        if preflight_only:
+            return ProcessResult(command=command_tuple, allowed=True, allowlisted=allowlisted,
+                                 started=False)
         started = time.perf_counter()
         process_env = self._secrets.child_env(
             base_env=os.environ,
@@ -157,10 +170,11 @@ class ProcessBroker:
                 stderr=asyncio.subprocess.PIPE,
             )
             stdout, stderr = await asyncio.wait_for(
-                process.communicate(),
+                process.communicate() if max_output_bytes is None
+                else capture_bounded(process, max_output_bytes),
                 timeout=timeout_seconds or self._default_timeout,
             )
-        except TimeoutError:
+        except (TimeoutError, OutputLimitExceeded) as exc:
             if process is not None:
                 await _terminate(process)
             return ProcessResult(
@@ -168,9 +182,14 @@ class ProcessBroker:
                 exit_code=None,
                 duration_ms=(time.perf_counter() - started) * 1000,
                 allowed=True,
-                error="Process timed out",
+                error="Process output limit exceeded" if isinstance(exc, OutputLimitExceeded)
+                else "Process timed out",
                 allowlisted=allowlisted,
             )
+        except asyncio.CancelledError:
+            if process is not None:
+                await _terminate(process)
+            raise
         except OSError as exc:
             return ProcessResult(
                 command=command_tuple,
@@ -196,6 +215,7 @@ class ProcessBroker:
             allowed=True,
             allowlisted=allowlisted,
             redactions=stdout_result.count + stderr_result.count,
+            started=True,
         )
 
     async def _withheld(
@@ -231,6 +251,7 @@ class ProcessBroker:
             allowed=False,
             error=decision.reason,
             allowlisted=allowlisted,
+            started=False,
         )
         if decision.decision is not AccessDecision.REQUIRE_APPROVAL:
             return withheld

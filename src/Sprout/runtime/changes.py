@@ -10,8 +10,10 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import replace
+from datetime import UTC, datetime
 
-from Sprout.events import EventBus
+from Sprout.events import Event, EventBus
+from Sprout.events.catalog import VERIFICATION_OVERRIDDEN
 from Sprout.execution.apply import ApplyBroker
 from Sprout.execution.models import (
     ApplyResult,
@@ -19,6 +21,8 @@ from Sprout.execution.models import (
     ChangeProposalStatus,
     TestResult,
 )
+from Sprout.execution.replay_boundary import isolated_replay_task
+from Sprout.execution.verification import proposal_verification_blocker
 from Sprout.runtime.state import ChangeProposalStateMachine
 from Sprout.security.approval import ApprovalManager
 from Sprout.storage.contracts.metadata import MetadataStore
@@ -51,6 +55,7 @@ class ChangeProposalService:
         approvals: ApprovalManager | None = None,
     ) -> None:
         self._metadata = metadata
+        self._events = events
         self._apply_broker = apply_broker
         self._approvals = approvals or ApprovalManager(operational, events=events)
 
@@ -126,26 +131,34 @@ class ChangeProposalService:
         )
 
     async def apply(
-        self, proposal_id: str, *, allow_failing_tests: bool = False
+        self, proposal_id: str, *, allow_failing_tests: bool = False,
+        force: bool = False, override_reason: str = "", decided_by: str = "cli",
     ) -> ApplyResult:
         proposal = await self._require(proposal_id)
+        task = await self._metadata.get_task(proposal.task_id)
+        if task is None:
+            raise LookupError("Proposal task not found")
+        if isolated_replay_task(task):
+            return ApplyResult(proposal_id=proposal.id, applied=False,
+                               reason="Isolated apply adapter not ready; no host fallback")
         if proposal.status is not ChangeProposalStatus.APPROVED:
             raise ValueError(
                 f"Proposal {proposal.id} must be approved before apply, "
                 f"current={proposal.status.value}"
             )
-        failing = blocking_test_failures(proposal.test_results)
-        if failing and not allow_failing_tests:
-            # Approving a change used to be enough to land it even when the
-            # verification the task itself ran had failed. The failure is now
-            # reported instead of being discovered after the fact.
+        blocker = proposal_verification_blocker(proposal)
+        forced = force or allow_failing_tests
+        if forced and not override_reason.strip():
+            return ApplyResult(
+                proposal_id=proposal.id, applied=False,
+                reason="Forced apply requires a non-empty override reason",
+            )
+        if blocker and not forced:
             return ApplyResult(
                 proposal_id=proposal.id,
                 applied=False,
                 reason=(
-                    "Verification failed for "
-                    + ", ".join(failing)
-                    + "; re-apply with allow_failing_tests to land it anyway"
+                    blocker + "; run the checks or use --force with --override-reason"
                 ),
             )
         ChangeProposalStateMachine.validate(
@@ -153,6 +166,23 @@ class ChangeProposalService:
             ChangeProposalStatus.APPLIED,
         )
         workspace = await self._task_workspace(proposal.task_id)
+        if forced:
+            # Persist the decision before workspace I/O, so a crash cannot
+            # leave an applied override without its human rationale.
+            proposal = replace(proposal, metadata={
+                **proposal.metadata,
+                "verification_override": {
+                    "reason": override_reason.strip(), "decided_by": decided_by,
+                    "occurred_at": datetime.now(UTC).isoformat(),
+                    "blocker": blocker, "verified": False,
+                },
+            })
+            await self._save(proposal)
+            if self._events is not None:
+                await self._events.publish(Event(VERIFICATION_OVERRIDDEN, {
+                    "proposal_id": proposal.id, "task_id": proposal.task_id,
+                    **proposal.metadata["verification_override"],
+                }))
         result = await self._apply_broker.apply(
             proposal, workspace, scope=await self._task_scope(proposal.task_id)
         )
@@ -173,6 +203,12 @@ class ChangeProposalService:
 
     async def rollback(self, proposal_id: str) -> ApplyResult:
         proposal = await self._require(proposal_id)
+        task = await self._metadata.get_task(proposal.task_id)
+        if task is None:
+            raise LookupError("Proposal task not found")
+        if isolated_replay_task(task):
+            return ApplyResult(proposal_id=proposal.id, applied=False,
+                               reason="Isolated rollback adapter not ready; no host fallback")
         if proposal.status is not ChangeProposalStatus.APPLIED:
             raise ValueError(
                 f"Proposal {proposal.id} must be applied before rollback, "

@@ -40,6 +40,7 @@ def test_gateway_manager_routes_transport(tmp_path: Path) -> None:
         response = await manager.execute(
             "mcp",
             "explain this project",
+            execution_mode="read_only",
             workspace_id=workspace.id,
         )
         assert response.status in {"waiting_approval", "completed"}

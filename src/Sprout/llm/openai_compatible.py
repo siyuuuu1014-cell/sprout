@@ -37,17 +37,27 @@ class OpenAICompatibleProvider:
         name: str = "openai_compatible",
         timeout_seconds: float = 60.0,
         temperature: float | None = None,
+        thinking_mode: str | None = None,
+        max_output_tokens: int | None = None,
     ) -> None:
+        if thinking_mode not in {None, "disabled"}:
+            raise ValueError(
+                "Only disabled thinking mode is supported; reasoning round-trip is absent")
+        if max_output_tokens is not None and (
+            type(max_output_tokens) is not int or max_output_tokens <= 0
+        ):
+            raise ValueError("max_output_tokens must be a positive integer")
         self.name = name
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.timeout_seconds = timeout_seconds
         self.temperature = temperature
+        self.thinking_mode = thinking_mode
+        self.max_output_tokens = max_output_tokens
 
-    async def chat(
-        self, messages: Sequence[LLMMessage], *, tools: Sequence[ToolSpec] = ()
-    ) -> LLMResponse:
+    def _request_payload(self, messages, tools, *, stream=False):
+        """One wire format for normal, text-stream and tool-stream calls."""
         if not self.api_key:
             raise ModelAuthError(
                 f"Provider {self.name!r} has no API key; set it via an environment variable "
@@ -61,7 +71,18 @@ class OpenAICompatibleProvider:
             payload["temperature"] = self.temperature
         if tools:
             payload["tools"] = [self._encode_tool(spec) for spec in tools]
+        if stream:
+            payload["stream"] = True
+        if self.thinking_mode is not None:
+            payload["thinking"] = {"type": self.thinking_mode}
+        if self.max_output_tokens is not None:
+            payload["max_tokens"] = self.max_output_tokens
+        return payload
 
+    async def chat(
+        self, messages: Sequence[LLMMessage], *, tools: Sequence[ToolSpec] = ()
+    ) -> LLMResponse:
+        payload = self._request_payload(messages, tools)
         url = f"{self.base_url}/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -81,20 +102,7 @@ class OpenAICompatibleProvider:
         self, messages: Sequence[LLMMessage], *, tools: Sequence[ToolSpec] = ()
     ):
         """Stream completion text deltas from a chat-completions endpoint."""
-        if not self.api_key:
-            raise ModelAuthError(
-                f"Provider {self.name!r} has no API key; set it via an environment variable "
-                "(see Sprout.security.secrets.resolve_api_key)"
-            )
-        payload: dict[str, Any] = {
-            "model": self.model,
-            "messages": [self._encode_message(m) for m in messages],
-            "stream": True,
-        }
-        if self.temperature is not None:
-            payload["temperature"] = self.temperature
-        if tools:
-            payload["tools"] = [self._encode_tool(spec) for spec in tools]
+        payload = self._request_payload(messages, tools, stream=True)
 
         url = f"{self.base_url}/chat/completions"
         headers = {
@@ -131,20 +139,7 @@ class OpenAICompatibleProvider:
         self, messages: Sequence[LLMMessage], *, tools: Sequence[ToolSpec] = ()
     ):
         """Stream structured events, including accumulated tool-call deltas."""
-        if not self.api_key:
-            raise ModelAuthError(
-                f"Provider {self.name!r} has no API key; set it via an environment variable "
-                "(see Sprout.security.secrets.resolve_api_key)"
-            )
-        payload: dict[str, Any] = {
-            "model": self.model,
-            "messages": [self._encode_message(m) for m in messages],
-            "stream": True,
-        }
-        if self.temperature is not None:
-            payload["temperature"] = self.temperature
-        if tools:
-            payload["tools"] = [self._encode_tool(spec) for spec in tools]
+        payload = self._request_payload(messages, tools, stream=True)
 
         url = f"{self.base_url}/chat/completions"
         headers = {

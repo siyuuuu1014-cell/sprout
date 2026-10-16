@@ -12,7 +12,13 @@ from typing import Any
 
 from Sprout.gateway.identity import Principal
 from Sprout.message.models import Message
-from Sprout.task.models import DelegationScope, Task, TaskBudget
+from Sprout.task.models import (
+    DelegationScope,
+    Task,
+    TaskBudget,
+    TaskExecutionMode,
+    execution_metadata,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +30,7 @@ class GatewayRequest:
     delegation_scope: DelegationScope = field(default_factory=DelegationScope)
     budget: TaskBudget = field(default_factory=TaskBudget)
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    execution_mode: str = TaskExecutionMode.CODE
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,7 +52,7 @@ class TaskAdapter:
             source=request.transport,
             delegation_scope=request.delegation_scope,
             budget=request.budget,
-            metadata=request.metadata,
+            metadata=execution_metadata(request.metadata, request.execution_mode),
         )
 
     def from_message(
@@ -64,4 +71,5 @@ class TaskAdapter:
             workspace_id=workspace_id,
             delegation_scope=delegation_scope or DelegationScope(),
             metadata=dict(message.metadata),
+            execution_mode=message.metadata.get("execution_mode", TaskExecutionMode.CODE),
         )

@@ -58,6 +58,7 @@ def test_task_intent_submits_async(tmp_path: Path) -> None:
     )
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "main.py").write_text("def main(): pass\n", encoding="utf-8")
+    (tmp_path / ".git").mkdir()
 
     async def run() -> None:
         runtime = create_runtime(settings)

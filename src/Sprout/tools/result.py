@@ -6,6 +6,10 @@ from dataclasses import dataclass
 from typing import Any
 
 
+class ToolExecutionUnconfirmed(RuntimeError):
+    """Stop the agent loop: effects must be settled by the owning node guard."""
+
+
 @dataclass(frozen=True, slots=True)
 class ToolResult:
     ok: bool

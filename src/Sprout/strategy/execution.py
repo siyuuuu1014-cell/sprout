@@ -69,6 +69,7 @@ class ExecutionPlanner:
             ),
             metadata={
                 "mode": plan.mode.value,
+                "require_acceptance_tests": True,
                 "strategy": plan.to_dict(),
                 "test_files": list(plan.test_files),
                 "risks": list(plan.risks),

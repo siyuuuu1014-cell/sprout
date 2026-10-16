@@ -300,6 +300,7 @@ class WeChatDialogGateway:
             response = await self._gateway.execute(
                 GatewayRequest(
                     transport="wechat_dialog",
+                    execution_mode="read_only",
                     instruction=event.content,
                     caller=Principal(user_id=event.userid),
                     workspace_id=self._resolve_workspace(event),
@@ -359,6 +360,7 @@ class WeChatDialogGateway:
         return await self._gateway.execute(
             GatewayRequest(
                 transport="wechat_dialog",
+                execution_mode="read_only",
                 instruction=query,
                 caller=Principal(user_id=userid),
                 workspace_id=workspace_id or self._default_workspace_id,

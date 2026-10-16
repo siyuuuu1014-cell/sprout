@@ -5,6 +5,7 @@ from Sprout.task.models import (
     Phase,
     Task,
     TaskBudget,
+    TaskExecutionMode,
     TaskResult,
     TaskStatus,
 )
@@ -14,6 +15,7 @@ __all__ = [
     "Phase",
     "Task",
     "TaskBudget",
+    "TaskExecutionMode",
     "TaskResult",
     "TaskStatus",
 ]

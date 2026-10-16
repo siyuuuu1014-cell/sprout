@@ -215,6 +215,21 @@ class TaskBudget:
     max_cost_usd: float = 0.0
 
 
+class TaskExecutionMode(StrEnum):
+    CODE = "code"
+    READ_ONLY = "read_only"
+    UNCONFIRMED = "unconfirmed"
+
+
+def execution_metadata(metadata: Mapping[str, Any], mode: str) -> dict[str, Any]:
+    """Normalize explicit intent; callers cannot weaken coding acceptance."""
+    selected = TaskExecutionMode(mode)
+    if selected == TaskExecutionMode.UNCONFIRMED:
+        raise ValueError("Select code or read_only for a new task")
+    return {**metadata, "execution_mode": selected.value,
+            "require_acceptance_tests": selected == TaskExecutionMode.CODE}
+
+
 @dataclass(frozen=True, slots=True)
 class Task:
     id: str = field(default_factory=lambda: str(uuid4()))
@@ -234,6 +249,13 @@ class Task:
     )
     metadata: Mapping[str, Any] = field(default_factory=dict)
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+    @property
+    def execution_mode(self) -> TaskExecutionMode:
+        try:
+            return TaskExecutionMode(self.metadata.get("execution_mode", "unconfirmed"))
+        except (ValueError, TypeError):
+            return TaskExecutionMode.UNCONFIRMED
 
 
 @dataclass(frozen=True, slots=True)

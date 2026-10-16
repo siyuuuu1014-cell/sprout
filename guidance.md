@@ -260,8 +260,18 @@ blobstore and leave a `content_blob_uri` → publish `message.persisted` (messag
 ids + seqs) → `message.sent`. Bus events land in Sprout runtime evidence/audit
 lanes, fail-open where they are derived observations.
 
-**Project task — `Runtime.execute`**: compile the 6-node graph
-`READ → SANDBOX → AGENT / EVALUATION → APPROVAL → APPLY`; the
+Project task admission is explicit: `execution_mode=code` is the coding default,
+requires user-initialized Git and mandatory acceptance/demo verification;
+`read_only` compiles only READ and a tool-restricted analysis AGENT. Historical
+tasks missing a valid mode cannot execute, resume, or run scheduler activities.
+Only untouched CREATED tasks may be confirmed with `project task-confirm-mode`;
+recreate tasks that already have execution evidence. Never infer write permission
+from instruction keywords. Read-scoped Feishu/WeChat callbacks use `read_only`.
+Agent tool dispatch must enforce the context's tool allowlist, including an
+empty list: model-authored tool names cannot fall back to the global registry.
+
+**Project task — `Runtime.execute`**: compile the execution graph
+`READ → SANDBOX → PLAN → TEST_DESIGN → AGENT / EVALUATION → APPROVAL → APPLY`; the
 Temporal runs the compiled graph with deterministic node ordering and durable
 retries. APPROVAL returns `waiting=True` and suspends the task;
 `resume_task` restores node state via `_restore`, so an approval decision never
@@ -553,6 +563,15 @@ composer+budget+estimator+snapshot trio. Re-run it after any
 
 ## 16. Sandbox Lifecycle Closure Rules
 
+Runtime shutdown also owns its local queue consumer: stop and join the worker,
+including a worker manually started before Runtime.start(), then drain background
+writes, flush the outbox, and close stores. The queue loop needs an explicit stop
+request in addition to cancellation, because an execution adapter can consume
+CancelledError. Do not dequeue the next task after shutdown is requested. Local
+consumer shutdown does not cancel durable Temporal workflows or rewrite business
+task statuses; explicit task cancellation remains a separate operation. Keep store
+cleanup in finally paths even when a worker fails; do not silently hide that failure.
+
 Project tasks create Git worktrees under `<workspace.root.parent>/.sprout-*`.
 Those worktrees are execution artifacts, not repository source. Every sandbox
 must be removed at a deterministic terminal point, with a startup reaper as
@@ -626,6 +645,39 @@ Rules:
   `sprout_knowledge.db`.
 - New graph or analyzer logic belongs under `src/Sprout/workspace/` and must
   not import CLI, MCP, or web entry points.
+- Skill ontology ingestion uses `skills.loader.iter_skill_artifacts`, not a
+  separate frontmatter parser or filesystem discovery path. Quarantine stays
+  excluded; descriptive ingestion never grants trust or execution permission.
+  Skill and skill-fact identity includes the artifact location, so same-name
+  installations cannot overwrite each other. Required-tool nodes are shared,
+  and every dependency edge cites its declaring artifact.
+- Analysis fingerprints include external skill artifact digests before checking
+  reuse, including supporting assets through the shared digest scheme. Editing,
+  adding, removing, or changing the configured skill tree must invalidate the
+  corresponding analysis even if project sources did not change.
+- Python contract extraction is AST-only and never imports or evaluates project
+  code. The supported subset is explicit top-level SQLAlchemy Core Table/Column
+  declarations, local DeclarativeBase / plain declarative_base() models, and
+  FastAPI/APIRouter route decorators with literal names/paths. Core and ORM share
+  the column syntax parser in python_database.py; python_ast.py owns common AST
+  helpers. Structured fact details retain source locations, expressions,
+  unknown fields and unresolved elements through project authority persistence.
+  These are source declarations, not live schema or mounted/deployed endpoint
+  claims; cross-file ORM bases and inheritance, annotation configuration maps,
+  custom factories, DDL dialects, dynamic router composition, schemas and callers
+  still require additional analyzers. ORM records distinguish local declared
+  elements from the unresolved inherited schema and never set complete=true.
+- PythonRouteComposer resolves explicit local module imports/re-exports and
+  top-level include_router prefixes without executing source. Keep original
+  interface_endpoint facts; composed paths are separate interface_mounted_endpoint
+  facts with declaring source and include-chain evidence. Cyclic/ambiguous imports,
+  conditional mutations, dynamic targets and prefixes remain unresolved. FastAPI
+  versions differ on later router additions: invalidate ancestor compositions
+  after an included router changes, rather than guessing snapshot/live behavior.
+  Resolved paths describe only an order-independent source subset, never deployed
+  URLs, proxy/root_path configuration, custom factories or full runtime schemas.
+- Project analysis tools delegate to WorkspaceIntelligence or WorkspaceService,
+  including their standalone fallback; do not assemble a second partial pipeline.
 
 ## 19. Database Architecture Rules: Sprout Layer + User Project Layer
 
@@ -892,6 +944,12 @@ Redis is derived and ephemeral:
   `project:{id}:ws:progress:{run_id}`).
 - Redis failures degrade realtime behavior only. They must not become authority
   write failures.
+- Project analysis cache entries use `project:{id}:analysis:{snapshot_id}` with a
+  bounded TTL, never a mutable latest pointer. Readers first ask the project
+  authority for its active snapshot id, validate cached identity/content, and
+  fall back to the authority on misses or cache failures. Legacy runtime-prefixed
+  project mirrors are not read. Invalidation removes locally known mirrors;
+  foreign-process mirrors expire via TTL, without scanning or deleting authority data.
 
 Milvus is derived semantic search:
 
@@ -1252,4 +1310,31 @@ sources = ["catalog", "well-known"]
 - `test_skills_runtime_wiring.py` boots a real `Runtime`, so a change that
   registers tools or loads skills wrongly is caught without a CLI run.
 - The crawler is tested through an injected `fetch=`, never the network.
+
+## Fixed offline evaluation
+
+`evaluation/` is an opt-in harness over public Runtime APIs, assembled through
+the normal factory. `sprout project eval` runs ten first-party fixtures; `--case
+C02` runs the Python closed-loop sample. Never import test helpers into the
+installed harness, evaluate arbitrary user projects, weaken gates to make a
+fixture green, or use scenario-pass counts as model-solving scores. Fixtures,
+scripted responses and independent oracle expectations are versioned together.
+All databases, repos and evidence live under a newly created run directory.
+Simulated approvals bind only to fixture tasks. Existing Runtime events remain
+the authority observations; eval JSON is derived evidence, not a new store lane.
+Temporal environment opt-in is rejected and prerequisites are checked without
+installation. Keep this write/execution surface out of MCP. Real-model/remote
+evaluations require a separate explicit run and are not measured by this baseline.
+
+# SQL source declaration inventory
+
+Workspace SQL analysis is non-executing and restricted to classified SOURCE `.sql`
+files inside the workspace. `SqlContractAnalyzer` records explicit CREATE TABLE
+names, qualifiers, column declaration expressions, table constraint expressions,
+and source locations. These are source declarations, not validated dialect syntax
+or the current database schema. Dialect and migration state remain unresolved;
+`complete` must remain false. Unsupported DDL and malformed quoting produce
+analysis warnings. SQL declarations use the existing versioned project fact stores
+and scanner fingerprint; do not introduce a second authority or execute migrations
+to discover structure. Common evidence identity lives in `source_contracts.py`.
 

@@ -9,6 +9,7 @@ from typing import Any
 from Sprout.security.approval import ApprovalRecord, ApprovalStatus
 from Sprout.session.models import Session, Turn
 from Sprout.storage.contracts.operational import Task
+from Sprout.storage.local.sqlite.commit_request import SCHEMA as COMMIT_REQUEST_SCHEMA
 from Sprout.storage.local.sqlite.driver import SqliteDatabase, SqlitePragmas
 from Sprout.storage.local.sqlite.turns import (
     SESSIONS_SCHEMA,
@@ -98,6 +99,37 @@ class SqliteOperationalStore:
         migrate_sessions_columns(db)
         migrate_turns_message_columns(db)
         self._migrate_approvals()
+        db.executescript(COMMIT_REQUEST_SCHEMA)
+
+    async def save_commit_request(self, record):
+        from Sprout.storage.local.sqlite.commit_request import save_request
+
+        return await save_request(self._db, record)
+
+    async def get_commit_request(self, request_id):
+        from Sprout.storage.local.sqlite.commit_request import get_request
+
+        return await get_request(self._db, request_id)
+
+    async def decide_commit_request(self, request_id, **decision):
+        from Sprout.storage.local.sqlite.commit_request import decide_request
+
+        return await decide_request(self._db, request_id, **decision)
+
+    async def get_commit_dispatch(self, request_id):
+        from Sprout.storage.local.sqlite.commit_request import get_dispatch
+
+        return await get_dispatch(self._db, request_id)
+
+    async def ensure_commit_dispatch(self, record):
+        from Sprout.storage.local.sqlite.commit_request import ensure_dispatch
+
+        return await ensure_dispatch(self._db, record)
+
+    async def mark_commit_dispatch(self, request_id, state, run_id=None):
+        from Sprout.storage.local.sqlite.commit_request import mark_dispatch
+
+        return await mark_dispatch(self._db, request_id, state, run_id)
 
     def _migrate_approvals(self) -> None:
         """Add scoping columns to approval databases created before task binding."""
@@ -230,6 +262,33 @@ class SqliteOperationalStore:
                 expected.value,
             ),
         )
+        return changed == 1
+
+    async def consume_approval_exact(self, record: ApprovalRecord, used_at: datetime) -> bool:
+        """Consume only the full inspected snapshot, atomically across connections."""
+        from dataclasses import asdict
+
+        if (record.status is not ApprovalStatus.APPROVED or record.single_use is not True
+                or record.used_at is not None or record.expires_at is None
+                or record.expires_at <= used_at):
+            return False
+        values = asdict(record)
+        # Fixed persisted inventory; never interpolate caller-controlled identifiers.
+        columns = ("id", "tool", "arguments_fingerprint", "status", "requested_by",
+                   "decided_by", "reason", "created_at", "decided_at", "task_id",
+                   "single_use", "expires_at", "used_at", "resource_scope", "action_hash",
+                   "action_summary", "source", "session_id", "approval_class")
+        def encode(value):
+            if isinstance(value, datetime):
+                return value.isoformat()
+            if isinstance(value, ApprovalStatus):
+                return value.value
+            return int(value) if isinstance(value, bool) else value
+
+        changed = await self._db.execute(
+            "UPDATE approvals SET status='consumed',used_at=? WHERE "
+            + " AND ".join(column + " IS ?" for column in columns),
+            (used_at.isoformat(), *(encode(values[column]) for column in columns)))
         return changed == 1
 
     async def get_approval(self, approval_id: str) -> ApprovalRecord | None:

@@ -1,6 +1,4 @@
-"""Generate acceptance criteria for database, API, and code changes."""
-
-from __future__ import annotations
+"""Generate verification criteria from target-project command evidence."""
 
 from Sprout.strategy.models import (
     ImpactReport,
@@ -8,59 +6,27 @@ from Sprout.strategy.models import (
     VerificationKind,
     VerificationPlan,
 )
+from Sprout.strategy.project_profile import ProjectProfile
 
 
 class VerificationPlanner:
-    def build(self, impact: ImpactReport) -> VerificationPlan:
-        criteria: list[VerificationCriterion] = []
-        if impact.databases:
-            criteria.extend(
-                (
-                    VerificationCriterion(
-                        VerificationKind.DATABASE,
-                        "schema",
-                        "pytest -q -k database",
-                        "schema and migration checks pass",
-                    ),
-                    VerificationCriterion(
-                        VerificationKind.DATABASE,
-                        "round_trip",
-                        "pytest -q -k migration",
-                        "write/read round-trip remains compatible",
-                    ),
-                )
-            )
-        if impact.interfaces:
-            criteria.extend(
-                (
-                    VerificationCriterion(
-                        VerificationKind.API,
-                        "contract",
-                        "pytest -q -k api",
-                        "route/tool schema and response contract pass",
-                    ),
-                    VerificationCriterion(
-                        VerificationKind.API,
-                        "authorization",
-                        "pytest -q -k approval",
-                        "approval and scope boundaries remain enforced",
-                    ),
-                )
-            )
-        criteria.extend(
-            (
-                VerificationCriterion(
-                    VerificationKind.CODE,
-                    "regression",
-                    "pytest -q",
-                    "focused and regression tests pass",
-                ),
-                VerificationCriterion(
-                    VerificationKind.CODE,
-                    "lint",
-                    "ruff check src",
-                    "lint passes",
-                ),
-            )
-        )
+    def build(self, impact: ImpactReport, *, profile: ProjectProfile | None = None
+              ) -> VerificationPlan:
+        profile = profile or ProjectProfile()
+        criteria = []
+        for command in profile.test_commands:
+            criteria.append(VerificationCriterion(
+                VerificationKind.CODE, "regression", command,
+                "focused and regression tests pass"))
+            if impact.interfaces:
+                criteria.append(VerificationCriterion(
+                    VerificationKind.API, "project_suite", command,
+                    "project suite passes; requirement-specific API cases are still required"))
+            if impact.databases:
+                criteria.append(VerificationCriterion(
+                    VerificationKind.DATABASE, "project_suite", command,
+                    "project suite passes; requirement-specific database cases are still required"))
+        for command in profile.lint_commands:
+            criteria.append(VerificationCriterion(VerificationKind.CODE, "lint", command,
+                                                  "configured project lint passes"))
         return VerificationPlan(criteria=tuple(criteria))
