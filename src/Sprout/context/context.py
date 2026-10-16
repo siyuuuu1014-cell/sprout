@@ -81,9 +81,8 @@ class AgentContext:
         return "\n".join(lines)
 
     def skill_instructions(self) -> str:
-        """Eager mode: concatenate enabled skill instructions for prompt assembly."""
+        """Eager mode: concatenate eligible skill instructions for prompt assembly."""
         return "\n\n".join(
             f"# Skill: {skill.name} (v{skill.version})\n{skill.instructions}"
-            for skill in self.skills.values()
-            if skill.enabled
+            for skill in self.visible_skills()
         )
