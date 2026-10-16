@@ -33,7 +33,7 @@ def to_jsonable(value: Any) -> Any:
         return {"__datetime__": value.isoformat()}
     if isinstance(value, Enum):
         return {"__enum__": _qualname(type(value)), "value": value.value}
-    if isinstance(value, tuple):
+    if isinstance(value, tuple | list):
         return [to_jsonable(item) for item in value]
     if isinstance(value, Mapping):
         return {str(key): to_jsonable(item) for key, item in value.items()}

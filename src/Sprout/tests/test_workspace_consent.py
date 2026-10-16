@@ -49,6 +49,21 @@ CODING_REQUEST_TYPO = "你能帮我在整个项目的根目录下写一一个冒
 ORDINARY_CHAT = "use the tool"
 
 
+@pytest.mark.asyncio
+async def test_non_git_coding_requires_operator_initialization(tmp_path) -> None:
+    root = tmp_path / "plain-project"
+    root.mkdir()
+    runtime = _runtime(tmp_path)
+    try:
+        workspace = await runtime.open_workspace(root)
+        with pytest.raises(ValueError, match="Initialize Git yourself"):
+            await runtime.create_task_planned(workspace.id, CODING_REQUEST)
+        assert not (root / ".git").exists()
+        assert not await runtime.storage.metadata.list_tasks()
+    finally:
+        await runtime.stop()
+
+
 def _runtime(tmp_path: Path):
     """A runtime backed by real sqlite stores.
 

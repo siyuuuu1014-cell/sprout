@@ -262,7 +262,10 @@ class ApprovalManager:
         if not isinstance(command, str) or not command.strip():
             return ""
         raw_args = arguments.get("args") or []
-        argv = [command, *(str(item) for item in raw_args)] if isinstance(raw_args, list) else [command]
+        argv = (
+            [command, *(str(item) for item in raw_args)]
+            if isinstance(raw_args, list) else [command]
+        )
         return str(self._commands.class_key(argv))
 
     def mode_for(self, source: str | TaskSource | None) -> ApprovalMode:

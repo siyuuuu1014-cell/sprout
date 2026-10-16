@@ -204,6 +204,8 @@ async def test_evaluation_runs_test_and_build_commands_in_the_sandbox(tmp_path) 
     # R3: build commands are executed, not just carried in node metadata.
     assert output["build_commands"] == ["python -m build"]
     assert output["status"] == "passed"
+    assert output["verification_report"]["verified"] is True
+    assert output["verification_report"]["checks"][0]["cwd"] == str(sandbox_root)
     assert [item["name"] for item in output["test_results"]] == [
         "test: pytest -q",
         "build: python -m build",

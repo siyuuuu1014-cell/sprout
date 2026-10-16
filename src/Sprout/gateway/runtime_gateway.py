@@ -8,11 +8,13 @@ from __future__ import annotations
 
 from Sprout.events import AUTH_ROLES_DISCARDED, Event
 from Sprout.gateway.identity import discarded_roles
+from Sprout.gateway.task_actions import TaskActions
 from Sprout.gateway.task_adapter import (
     GatewayRequest,
     GatewayResponse,
     TaskAdapter,
 )
+from Sprout.gateway.task_queries import TaskQueries
 from Sprout.message.models import Message
 from Sprout.runtime.runtime import Runtime
 
@@ -30,6 +32,8 @@ class RuntimeGateway:
         self._runtime = runtime
         self._transport = transport
         self._adapter = adapter or TaskAdapter()
+        self.queries = TaskQueries(runtime)
+        self.actions = TaskActions(runtime)
 
     async def execute(self, request: GatewayRequest) -> GatewayResponse:
         task = self._adapter.to_task(request)

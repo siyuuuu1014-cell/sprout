@@ -142,7 +142,8 @@ def _listen_for_evolution_intent(
 
     The sweep is fire-and-forget because the intent is handled on the online
     turn path -- the user gets an acknowledgement immediately while collection
-    proceeds in the background. It stops at VALIDATED: publishing a skill
+    proceeds in the background. Without measurements it stays CANDIDATE:
+    unknown tests/regressions cannot validate a proposal. Publishing a skill
     changes what every later turn is told, so it stays a human ``approve``.
     """
     from Sprout.events import INTENT_EVOLUTION_REQUESTED

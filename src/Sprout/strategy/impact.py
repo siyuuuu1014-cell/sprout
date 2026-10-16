@@ -38,8 +38,9 @@ class ImpactAnalyzer:
         "build",
         ".tox",
         "site-packages",
+        ".workbuddy",
     }
-    _test_pattern = re.compile(r"(^tests?/|^test_|_test\.|/tests?/|\\tests?\\)", re.I)
+    _test_pattern = re.compile(r"(^tests?/|(^|/)test_|[._]test\.|/tests?/|\\tests?\\)", re.I)
     _api_pattern = re.compile(r"(api|route|endpoint|gateway|server|controller|tool)", re.I)
     _db_pattern = re.compile(r"(database|storage|sqlite|migration|schema|model)", re.I)
 
@@ -197,7 +198,7 @@ class ImpactAnalyzer:
         for path in root.rglob("*"):
             if not path.is_file():
                 continue
-            if self._ignored.intersection(path.parts):
+            if self._ignored.intersection(path.relative_to(root).parts):
                 continue
             if self._in_cache_dir(path, root):
                 continue
@@ -232,7 +233,6 @@ class ImpactAnalyzer:
         return (
             path.suffix.casefold() in {".py", ".js", ".jsx", ".ts", ".tsx", ".sql"}
             and path.parts
-            and path.parts[0] in {"src", "web", "app", "lib", "tests"}
         )
 
     @staticmethod

@@ -137,7 +137,8 @@ def test_workspace_intelligence_builds_graph_and_knowledge(tmp_path: Path) -> No
         assert vector_results
 
         unchanged = await intelligence.analyze(workspace, task, previous=analysis)
-        assert unchanged is analysis
+        assert unchanged.graph == analysis.graph
+        assert unchanged.fingerprint == analysis.fingerprint
 
         changed_path = root / "src" / "package" / "b.py"
         changed_path.write_text(
@@ -242,16 +243,20 @@ def test_collect_resources_includes_source_files(tmp_path: Path) -> None:
     assert ResourceKind.SOURCE in {ref.kind for ref in plan.resources}
 
 
-def test_workspace_analysis_cache_round_trip() -> None:
-    cache = WorkspaceAnalysisCache()
-    analysis = object()
+def test_workspace_analysis_cache_round_trip(tmp_path) -> None:
+    from Sprout.workspace.invalidation import snapshot_id
 
-    cache.put("workspace-1", analysis)
+    cache = WorkspaceAnalysisCache()
 
     async def run() -> None:
-        assert await cache.get("workspace-1") is analysis
+        analysis = await WorkspaceIntelligence().analyze(
+            Workspace(id="workspace-1", root=_project(tmp_path)), Task(instruction="analyze"),
+        )
+        cache.put("workspace-1", analysis)
+        version = snapshot_id(analysis)
+        assert await cache.get("workspace-1", expected_snapshot_id=version) is analysis
         cache.invalidate("workspace-1")
-        assert await cache.get("workspace-1") is None
+        assert await cache.get("workspace-1", expected_snapshot_id=version) is None
 
     asyncio.run(run())
 
@@ -714,6 +719,7 @@ def test_analysis_serialization_round_trip(tmp_path: Path) -> None:
 
 def test_analysis_cache_hot_lane_round_trip(tmp_path: Path) -> None:
     from Sprout.storage.local.memory import MemoryCacheStore
+    from Sprout.workspace.invalidation import snapshot_id
 
     root = _project(tmp_path)
     intelligence = WorkspaceIntelligence(
@@ -736,7 +742,7 @@ def test_analysis_cache_hot_lane_round_trip(tmp_path: Path) -> None:
         analysis = await intelligence.analyze(workspace, task)
         cache = WorkspaceAnalysisCache(cache_store=MemoryCacheStore())
         await cache.persist("workspace-1", analysis)
-        restored = await cache.get("workspace-1")
+        restored = await cache.get("workspace-1", expected_snapshot_id=snapshot_id(analysis))
         assert restored is not None
         assert {node.id for node in restored.graph.nodes} == {
             node.id for node in analysis.graph.nodes
@@ -745,6 +751,6 @@ def test_analysis_cache_hot_lane_round_trip(tmp_path: Path) -> None:
             item.statement for item in analysis.knowledge.items
         ]
         await cache.forget("workspace-1")
-        assert await cache.get("workspace-1") is None
+        assert await cache.get("workspace-1", expected_snapshot_id=snapshot_id(analysis)) is None
 
     asyncio.run(run())

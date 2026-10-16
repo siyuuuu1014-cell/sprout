@@ -11,6 +11,21 @@
 
 <br />
 
+### Explicit project task modes
+
+`sprout project task-create <workspace_id> "<instruction>" --mode code` is the
+default coding entry. It requires an existing Git repository and frozen
+input/output acceptance tests plus an executable minimal demo before normal
+application and verified completion. Sprout never initializes Git automatically.
+Use `--mode read_only` for analysis without write tools, including non-Git projects.
+HTTP/RPC/SDK task inputs use the matching `execution_mode` field.
+
+Historical tasks without a mode are blocked on execution and resume. Only an
+untouched task can be confirmed with
+`sprout project task-confirm-mode <task_id> --mode code|read_only`; tasks with
+execution records or proposals must be recreated. Force application remains a
+separate operator action requiring an exemption reason, not verified completion.
+
 <div align="center">
   <img src="assets/seam_sprout.svg" alt="SEAM Sprout logo" width="200" />
 </div>
@@ -31,10 +46,19 @@ It is designed to help every project improve, repair itself, and grow automatica
 ## Product Highlights
 
 - **Precise project analysis**: reads repository structure, code context, sessions, memory, and knowledge before acting.
+  Python analysis additionally records SQLAlchemy Core tables/columns, explicit
+  local declarative ORM models, and FastAPI route declarations with structured
+  source evidence. Explicit cross-file FastAPI router inclusion produces separate
+  source-composed paths with prefix chains; SQL CREATE TABLE inventory retains
+  column/constraint expressions. These are not live schemas or deployed URLs.
+  Dynamic factories, cross-file ORM inheritance, annotation type maps, SQL dialect
+  semantics, and version-dependent late router changes remain unresolved.
 - **Code generation**: turns intent into concrete changes instead of only answering questions.
 - **Isolated execution**: runs generated code in a git-worktree sandbox and applies changes through controlled brokers.
 - **Code verification**: tests and checks every change before integration.
 - **Code integration**: applies verified changes back to the project and records the full trace.
+- **Orderly shutdown**: joins the local task consumer before flushing background
+  writes/outbox and closing stores; shutting down the consumer is not task cancellation.
 - **Automatic growth**: learns from completed work and creates reviewable proposals for future improvement.
 
 ## Commercial Use Cases
@@ -322,6 +346,10 @@ selection is stored in `~/.sprout/settings.json` and reused by the next session.
 Task orchestration, queues, schedules, evolution automation, web jobs, and
 gateway work can run on Temporal.
 
+Temporal is explicitly enabled through `TEMPORAL_HOST`; otherwise execution stays local/offline. Once enabled, submission failures never fall back to local execution. Tasks remain waiting for scheduling/result confirmation and may be retried after recovery. Inspect persisted records with `sprout project task-submissions <task_id>` and retry with `sprout project task-run <task_id>`. See [the submission recovery guide](Temporal-Submission-Recovery-Guide.md) for approval rounds and idempotency limits.
+
+Worker activities use durable, non-expiring node ownership. Unknown side effects are not automatically replayed; no force-replay endpoint is provided. Read ownership and result evidence with `sprout project task-executions <task_id>`. See [the node recovery guide](Node-Execution-Recovery-Guide.md) for reconciliation limitations and the distinction from tool-level exactly-once execution.
+
 Start a local Temporal server with the bundled Compose stack:
 
 ```bash
@@ -429,6 +457,16 @@ Thanks to everyone who has contributed to SEAM Sprout:
 | JasonXuanxuan | [@JasonXuanxuan](https://github.com/JasonXuanxuan) |
 | rest8945 | [@rest8945](https://github.com/rest8945) |
 | siyuuuu1014-cell | [@siyuuuu1014-cell](https://github.com/siyuuuu1014-cell) |
+
+## Task verification reports
+
+Run `uv run sprout project eval` for ten offline fixtures, or
+`uv run sprout project eval --case C02 --json` for the Python closed-loop demo.
+The scripted provider and simulated decisions operate on new fixture repos only;
+no paid model or automatic dependency installation. Scenario passes are distinct
+from verified code completions. See [the evaluation guide](Offline-Evaluation-Guide.md).
+
+Read existing evidence with `sprout project task-verification <task_id> --json` or `GET /api/project/tasks/{task_id}/verification`. Neither endpoint executes code. Versioned reports derive from existing evaluation/proposal evidence and share the application/completion gate; they are not a separate storage authority. Failures distinguish checks, policy denials, approvals, runner errors, timeouts, skipped tests and missing results. Forced application remains unverified. Pytest skips conservatively veto a pass; log classification does not replace isolated, trusted evaluation.
 
 ## License
 

@@ -17,6 +17,7 @@ class NodeType(StrEnum):
     READ = "read"
     ANALYZE = "analyze"
     PLAN = "plan"
+    TEST_DESIGN = "test_design"
     AGENT = "agent"
     TOOL = "tool"
     MCP = "mcp"
@@ -74,3 +75,4 @@ class ExecutionGraph:
     nodes: tuple[ExecutionNode, ...] = ()
     entry_node_ids: tuple[str, ...] = ()
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    dispatch_key: str = "initial"

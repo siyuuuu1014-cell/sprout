@@ -162,13 +162,12 @@ class ApplyBroker:
         *,
         scope: DelegationScope | None = None,
     ) -> ApplyResult:
-        """Reverse an applied proposal using ``git apply -R``."""
+        """Revert a recorded commit, or reverse a legacy patch without hard reset."""
         result = await self.evaluate(proposal, workspace, scope=scope)
         if not result.applied:
             return result
 
         applied_commit = str(proposal.metadata.get("applied_commit", ""))
-        base_commit = str(proposal.metadata.get("base_commit", ""))
         if applied_commit:
             code, stdout, stderr = await self._git(
                 workspace, "revert", "--no-edit", applied_commit
@@ -180,21 +179,11 @@ class ApplyBroker:
                     reason="reverted committed change",
                     applied_commit=applied_commit,
                 )
-            if base_commit:
-                code, _, stderr = await self._git(
-                    workspace, "reset", "--hard", base_commit
-                )
-                if code == 0:
-                    return ApplyResult(
-                        proposal_id=proposal.id,
-                        applied=True,
-                        reason="reset to pre-apply commit",
-                        base_commit=base_commit,
-                    )
             return ApplyResult(
                 proposal_id=proposal.id,
                 applied=False,
-                reason=(stderr.strip() or f"git revert {applied_commit[:8]} failed"),
+                reason=(stderr.strip() or f"git revert {applied_commit[:8]} failed")
+                       + "; repository retained for manual reconciliation; no hard reset",
             )
 
         patch = "\n".join(item.diff_text for item in proposal.diffs if item.diff_text)

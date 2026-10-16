@@ -184,8 +184,8 @@ def test_sandbox_apply_patch_tool_deletes_a_file(tmp_path: Path) -> None:
         )
     )
 
-    assert result.ok is True
-    assert not (tmp_path / "gone.py").exists()
+    assert result.ok is False
+    assert (tmp_path / "gone.py").exists()
 
 
 def test_sandbox_apply_patch_tool_renames_a_file(tmp_path: Path) -> None:
@@ -205,9 +205,9 @@ def test_sandbox_apply_patch_tool_renames_a_file(tmp_path: Path) -> None:
         )
     )
 
-    assert result.ok is True
-    assert not (tmp_path / "old.py").exists()
-    assert (tmp_path / "new.py").read_text(encoding="utf-8") == "print('hi')\n"
+    assert result.ok is False
+    assert (tmp_path / "old.py").exists()
+    assert not (tmp_path / "new.py").exists()
 
 
 def test_sandbox_apply_patch_tool_rejects_binary_patches(tmp_path: Path) -> None:

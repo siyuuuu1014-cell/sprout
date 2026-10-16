@@ -166,6 +166,7 @@ class FeishuWebSocketGateway:
             response = await self._gateway.execute(
                 GatewayRequest(
                     transport="feishu",
+                    execution_mode="read_only",
                     instruction=text,
                     caller=Principal(
                         user_id=self._sender_open_id(sender) or "feishu-user",

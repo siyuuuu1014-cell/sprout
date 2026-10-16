@@ -131,6 +131,7 @@ def create_runtime(
     tool_executor = ToolExecutor(
         tools=tools,
         policy=security.tool_policy,
+        policy_engine=security.policy_engine,
         approvals=security.approvals,
         events=runtime.events,
         audit=security.audit,
@@ -224,6 +225,8 @@ def _build_provider(
         name=provider_name,
         timeout_seconds=settings.timeout_seconds,
         temperature=settings.temperature,
+        thinking_mode=settings.thinking_mode,
+        max_output_tokens=settings.max_output_tokens,
     )
 
 

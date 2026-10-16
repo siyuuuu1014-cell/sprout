@@ -35,7 +35,7 @@ def _sandbox_relative(root: Path, path: Path) -> str:
         return path.as_posix()
 
 
-def _iter_sandbox_files(root: Path, include: str) -> list[tuple[str, Path]]:
+def _iter_sandbox_files(root: Path, include: str, path_guard=None) -> list[tuple[str, Path]]:
     """Walk the sandbox root without following symlinks or entering ``.git``."""
     found: list[tuple[str, Path]] = []
     root_resolved = root.resolve()
@@ -44,12 +44,16 @@ def _iter_sandbox_files(root: Path, include: str) -> list[tuple[str, Path]]:
             name
             for name in dirnames
             if name != ".git" and not os.path.islink(os.path.join(dirpath, name))
+            and (path_guard is None or path_guard(
+                Path(dirpath, name).relative_to(root_resolved).as_posix()))
         ]
         for name in filenames:
             full = Path(os.path.join(dirpath, name))
             if os.path.islink(full):
                 continue
             relative = full.relative_to(root_resolved).as_posix()
+            if path_guard is not None and not path_guard(relative):
+                continue
             if include != "*" and not fnmatch.fnmatch(relative, include):
                 continue
             found.append((relative, full))
@@ -308,11 +312,15 @@ class SandboxApplyPatchTool:
         *,
         scope: DelegationScope | None = None,
         task_id: str = "",
+        source: str = "interactive",
+        requested_by: str = "system",
     ) -> None:
         self._sandbox = sandbox
         self._broker = broker
         self._scope = scope
         self._task_id = task_id
+        self._source = source
+        self._requested_by = requested_by
         self.spec = ToolSpec(
             name="sandbox_apply_patch",
             description=(
@@ -351,6 +359,22 @@ class SandboxApplyPatchTool:
         except PatchError as exc:
             return ToolResult.failure(f"Invalid patch: {exc}")
 
+        # Ask before any patch I/O so a denied delete/rename cannot leave
+        # earlier edits or a copied rename target behind.
+        for file_patch in file_patches:
+            delete_path = file_patch.rename_from or (
+                file_patch.path if file_patch.is_delete else None
+            )
+            if delete_path is None:
+                continue
+            grant = await self._broker.authorize_delete(
+                self._sandbox, delete_path, task_id=self._task_id, scope=self._scope,
+                source=self._source, requested_by=self._requested_by,
+            )
+            if grant.approval_id:
+                return ToolResult.needs_approval(grant.approval_id)
+            if not grant.wrote:
+                return ToolResult.failure(grant.reason or "Deletion was denied")
         touched: list[str] = []
         for file_patch in file_patches:
             path = file_patch.path.strip()
@@ -403,6 +427,7 @@ class SandboxApplyPatchTool:
                     rename_from,
                     task_id=self._task_id,
                     scope=self._scope,
+                    source=self._source, requested_by=self._requested_by,
                 )
                 if not deleted.wrote:
                     return ToolResult.failure(
@@ -424,6 +449,7 @@ class SandboxApplyPatchTool:
                     path,
                     task_id=self._task_id,
                     scope=self._scope,
+                    source=self._source, requested_by=self._requested_by,
                 )
                 if not deleted.wrote:
                     return ToolResult.failure(
@@ -485,8 +511,9 @@ class SandboxApplyPatchTool:
 class SandboxListTool:
     """List text-visible files inside the sandbox worktree."""
 
-    def __init__(self, sandbox: SandboxRef) -> None:
+    def __init__(self, sandbox: SandboxRef, *, path_guard=None) -> None:
         self._sandbox = sandbox
+        self._path_guard = path_guard
         self.spec = ToolSpec(
             name="sandbox_list_files",
             description=(
@@ -518,7 +545,7 @@ class SandboxListTool:
         max_entries = _bounded_int(
             arguments.get("max_entries"), default=200, minimum=1, maximum=500
         )
-        files = _iter_sandbox_files(self._sandbox.root, include)
+        files = _iter_sandbox_files(self._sandbox.root, include, self._path_guard)
         if not files:
             return ToolResult.success("(no files matched)")
         paths = [relative for relative, _ in files[:_MAX_LIST_ENTRIES][:max_entries]]
@@ -531,8 +558,9 @@ class SandboxListTool:
 class SandboxSearchTool:
     """Search text files inside the sandbox worktree."""
 
-    def __init__(self, sandbox: SandboxRef) -> None:
+    def __init__(self, sandbox: SandboxRef, *, path_guard=None) -> None:
         self._sandbox = sandbox
+        self._path_guard = path_guard
         self.spec = ToolSpec(
             name="sandbox_search",
             description=(
@@ -585,7 +613,7 @@ class SandboxSearchTool:
 
         matches: list[str] = []
         truncated = False
-        for relative, full in _iter_sandbox_files(self._sandbox.root, include):
+        for relative, full in _iter_sandbox_files(self._sandbox.root, include, self._path_guard):
             try:
                 size = full.stat().st_size
             except OSError:
@@ -621,8 +649,9 @@ class SandboxGitTool:
 
     _OPERATIONS = {"status", "diff", "log"}
 
-    def __init__(self, sandbox: SandboxRef) -> None:
+    def __init__(self, sandbox: SandboxRef, *, allow_host_git: bool = True) -> None:
         self._sandbox = sandbox
+        self._allow_host_git = allow_host_git
         self.spec = ToolSpec(
             name="sandbox_git_inspect",
             description=(
@@ -648,6 +677,8 @@ class SandboxGitTool:
         )
 
     async def invoke(self, arguments: Mapping[str, Any]) -> ToolResult:
+        if not self._allow_host_git:
+            return ToolResult.failure("Isolated Git inspector not ready; no host fallback")
         operation = arguments.get("operation")
         if operation not in self._OPERATIONS:
             return ToolResult.failure(

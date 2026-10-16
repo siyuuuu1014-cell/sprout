@@ -86,6 +86,17 @@ def test_growth_signal_rejects_out_of_range_scores() -> None:
 # -- helpers -------------------------------------------------------------------
 
 
+async def _save_growth_fixture(store, artifact):
+    """Trusted test runner handoff; fixture outputs are not real measurement evidence."""
+    from Sprout.evolution.hard_gate import GateChecks
+
+    await store.save_artifact(artifact)
+    if artifact.status in {ArtifactStatus.VALIDATED, ArtifactStatus.PENDING_APPROVAL}:
+        await CandidateManager(store).record_validation(
+            artifact.id, GateChecks(True, True), source_run_ids=("fixture-test-run",)
+        )
+
+
 def _signal(
     signal_type: str = "repeated_failure",
     title: str = "Repeated ValueError failures",
@@ -130,9 +141,7 @@ def _trajectory(*names: str, status: TrajectoryStatus = TrajectoryStatus.COMPLET
         task_id="task-1",
         workspace_id="ws-1",
         status=status,
-        events=tuple(
-            TrajectoryEvent(name=name, task_id="task-1") for name in names
-        ),
+        events=tuple(TrajectoryEvent(name=name, task_id="task-1") for name in names),
     )
 
 
@@ -211,17 +220,17 @@ def test_signal_extractor_builds_evidence_backed_signal() -> None:
 
 
 @pytest.mark.asyncio
-async def test_evaluate_all_validates_then_approve_publishes_skill(tmp_path) -> None:
+async def test_prevalidated_artifact_approve_publishes_skill(tmp_path) -> None:
     metadata = open_metadata_store(str(tmp_path / "runtime.db"))
     skills = SkillRegistry()
     repository = SkillRepository(tmp_path / "skills")
     manager = CandidateManager(metadata, skills=skills, skill_repository=repository)
 
-    artifact = _artifact()
-    await metadata.save_artifact(artifact)
+    artifact = _artifact(status=ArtifactStatus.VALIDATED)
+    await _save_growth_fixture(metadata, artifact)
 
     changes = await manager.evaluate_all()
-    assert changes == {artifact.id: ArtifactStatus.VALIDATED.value}
+    assert changes == {}
 
     published = await manager.approve(artifact.id, decided_by="alice")
     assert published.status is ArtifactStatus.PUBLISHED
@@ -244,7 +253,7 @@ async def test_unsafe_candidate_is_rejected_by_the_hard_gate(tmp_path) -> None:
             "which keeps the loop fast."
         ),
     )
-    await metadata.save_artifact(artifact)
+    await _save_growth_fixture(metadata, artifact)
 
     changes = await manager.evaluate_all()
     assert changes == {artifact.id: ArtifactStatus.REJECTED.value}
@@ -260,7 +269,7 @@ async def test_evaluate_all_leaves_published_artifacts_alone(tmp_path) -> None:
     manager = CandidateManager(metadata)
 
     artifact = _artifact(status=ArtifactStatus.PUBLISHED)
-    await metadata.save_artifact(artifact)
+    await _save_growth_fixture(metadata, artifact)
 
     assert await manager.evaluate_all() == {}
     metadata.close()
@@ -272,7 +281,7 @@ async def test_reject_records_the_reason(tmp_path) -> None:
     manager = CandidateManager(metadata)
 
     artifact = _artifact()
-    await metadata.save_artifact(artifact)
+    await _save_growth_fixture(metadata, artifact)
     await manager.evaluate_all()
 
     rejected = await manager.reject(artifact.id, reason="not worth a skill")
@@ -287,7 +296,7 @@ async def test_artifact_lifecycle_walks_stable_before_deprecation(tmp_path) -> N
     manager = CandidateManager(metadata)
 
     artifact = _artifact(status=ArtifactStatus.PUBLISHED)
-    await metadata.save_artifact(artifact)
+    await _save_growth_fixture(metadata, artifact)
 
     monitoring = await manager.mark_monitoring(artifact.id)
     assert monitoring.status is ArtifactStatus.MONITORING
@@ -328,7 +337,7 @@ async def test_unified_service_collects_and_persists_candidates(tmp_path) -> Non
 
     # The collected candidate then flows through the same approval path.
     changes = await service.evaluate_all()
-    assert changes[candidate.artifact.id] == ArtifactStatus.VALIDATED.value
+    assert changes[candidate.artifact.id] == ArtifactStatus.CANDIDATE.value
     metadata.close()
 
 
@@ -340,9 +349,7 @@ async def test_unified_service_skips_ineligible_trajectories(tmp_path) -> None:
     for name in ("node.completed", "approval.rejected"):
         await recorder.record(TrajectoryEvent(name=name, task_id="task-1"))
 
-    candidates = await UnifiedGrowthService(metadata).collect_trajectories(
-        "ws-1", trajectory_dir
-    )
+    candidates = await UnifiedGrowthService(metadata).collect_trajectories("ws-1", trajectory_dir)
 
     assert candidates == []
     assert await metadata.list_artifacts() == []
@@ -387,7 +394,7 @@ async def test_attach_evolution_publishes_into_the_live_registry(tmp_path) -> No
     assert service is not None
 
     artifact = _artifact(status=ArtifactStatus.VALIDATED)
-    await metadata.save_artifact(artifact)
+    await _save_growth_fixture(metadata, artifact)
 
     published = await service.approve(artifact.id, decided_by="tester")
     assert published.status is ArtifactStatus.PUBLISHED
@@ -412,7 +419,7 @@ async def test_attach_evolution_publishes_knowledge_artifacts(tmp_path) -> None:
         kind=ArtifactKind.PROJECT_KNOWLEDGE,
         status=ArtifactStatus.VALIDATED,
     )
-    await metadata.save_artifact(artifact)
+    await _save_growth_fixture(metadata, artifact)
 
     published = await service.approve(artifact.id, decided_by="tester")
     assert published.status is ArtifactStatus.PUBLISHED
@@ -454,7 +461,7 @@ async def test_publishing_emits_growth_events(tmp_path) -> None:
     service = attach_evolution(runtime, settings)
     assert service is not None
     artifact = _artifact(status=ArtifactStatus.VALIDATED)
-    await metadata.save_artifact(artifact)
+    await _save_growth_fixture(metadata, artifact)
 
     await service.approve(artifact.id, decided_by="tester")
     assert SKILL_PUBLISHED in seen
@@ -522,14 +529,10 @@ def test_stable_path_needs_repetition() -> None:
     path = ("read", "sandbox", "plan", "agent", "evaluation", "approval", "apply")
 
     assert StablePathExtractor().extract([_run(*path, task_id="a")]) == []
-    assert StablePathExtractor().extract(
-        [_run(*path, task_id="a"), _run(*path, task_id="b")]
-    ) == []
-    assert len(
-        StablePathExtractor().extract(
-            [_run(*path, task_id=n) for n in ("a", "b", "c")]
-        )
-    ) == 1
+    assert StablePathExtractor().extract([_run(*path, task_id="a"), _run(*path, task_id="b")]) == []
+    assert (
+        len(StablePathExtractor().extract([_run(*path, task_id=n) for n in ("a", "b", "c")])) == 1
+    )
 
 
 def test_stable_path_ignores_failed_runs() -> None:
@@ -537,8 +540,7 @@ def test_stable_path_ignores_failed_runs() -> None:
     path = ("read", "sandbox", "plan", "agent", "apply")
     healthy = [_run(*path, task_id=n) for n in ("a", "b", "c")]
     broken = [
-        _trajectory("node.started", "task.failed", status=TrajectoryStatus.FAILED)
-        for _ in range(5)
+        _trajectory("node.started", "task.failed", status=TrajectoryStatus.FAILED) for _ in range(5)
     ]
 
     assert len(StablePathExtractor().extract(healthy + broken)) == 1
@@ -564,9 +566,7 @@ def test_stable_path_deduplicates_revisits() -> None:
     A live trajectory showed ``evaluation`` and ``approval`` twice each
     because granting a decision resumes the graph.
     """
-    retried = _run(
-        "read", "agent", "evaluation", "evaluation", "approval", "approval", "apply"
-    )
+    retried = _run("read", "agent", "evaluation", "evaluation", "approval", "approval", "apply")
 
     assert StablePathExtractor._node_path(retried) == (
         "read",
@@ -580,9 +580,7 @@ def test_stable_path_deduplicates_revisits() -> None:
 def test_stable_path_signal_routes_to_a_workflow_artifact() -> None:
     """The signal must land on a kind `growth_router` already understands."""
     path = ("read", "sandbox", "plan", "agent", "evaluation", "approval", "apply")
-    signal = StablePathExtractor().extract(
-        [_run(*path, task_id=n) for n in ("a", "b", "c")]
-    )[0]
+    signal = StablePathExtractor().extract([_run(*path, task_id=n) for n in ("a", "b", "c")])[0]
 
     assert signal.type == "behavior_pattern"
     assert GrowthRouter().route(signal).artifact_kind is ArtifactKind.WORKFLOW
@@ -615,22 +613,23 @@ async def test_approve_publishes_a_workflow_too(tmp_path) -> None:
     """
     metadata = open_metadata_store(str(tmp_path / "runtime.db"))
     skills = SkillRegistry()
-    manager = CandidateManager(metadata, skills=skills)
+    manager = CandidateManager(
+        metadata, skills=skills, skill_repository=SkillRepository(tmp_path / "skills")
+    )
 
     artifact = _artifact(
         name="stable-path",
         kind=ArtifactKind.WORKFLOW,
         content="Tasks here run read -> plan -> agent -> evaluation -> apply.",
+        status=ArtifactStatus.VALIDATED,
     )
-    await metadata.save_artifact(artifact)
+    await _save_growth_fixture(metadata, artifact)
     await manager.evaluate_all()
 
     published = await manager.approve(artifact.id, decided_by="alice")
 
     assert published.status is ArtifactStatus.PUBLISHED
-    assert skills.contains("stable-path"), (
-        "a published workflow must be readable by the agent"
-    )
+    assert skills.contains("stable-path"), "a published workflow must be readable by the agent"
     skill = skills.get("stable-path")
     assert "read -> plan -> agent" in skill.instructions
 
@@ -650,10 +649,12 @@ async def test_published_skill_is_actually_injectable(tmp_path) -> None:
 
     metadata = open_metadata_store(str(tmp_path / "runtime.db"))
     skills = SkillRegistry()
-    manager = CandidateManager(metadata, skills=skills)
+    manager = CandidateManager(
+        metadata, skills=skills, skill_repository=SkillRepository(tmp_path / "skills")
+    )
 
-    artifact = _artifact(name="stable-path")
-    await metadata.save_artifact(artifact)
+    artifact = _artifact(name="stable-path", status=ArtifactStatus.VALIDATED)
+    await _save_growth_fixture(metadata, artifact)
     await manager.evaluate_all()
     await manager.approve(artifact.id, decided_by="alice")
 
@@ -670,17 +671,17 @@ async def test_published_skill_is_actually_injectable(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_publishing_without_a_registry_is_not_an_error(tmp_path) -> None:
-    """The registry is optional; publishing must still record the artifact."""
+async def test_publishing_without_a_registry_is_blocked(tmp_path) -> None:
+    """A publisher without its consumer cannot claim successful publication."""
     metadata = open_metadata_store(str(tmp_path / "runtime.db"))
     manager = CandidateManager(metadata)
-    artifact = _artifact(kind=ArtifactKind.WORKFLOW)
-    await metadata.save_artifact(artifact)
+    artifact = _artifact(kind=ArtifactKind.WORKFLOW, status=ArtifactStatus.VALIDATED)
+    await _save_growth_fixture(metadata, artifact)
     await manager.evaluate_all()
 
-    published = await manager.approve(artifact.id, decided_by="alice")
-
-    assert published.status is ArtifactStatus.PUBLISHED
+    with pytest.raises(ValueError, match="registry"):
+        await manager.approve(artifact.id, decided_by="alice")
+    assert (await metadata.get_artifact(artifact.id)).status is ArtifactStatus.VALIDATED
 
 
 @pytest.mark.asyncio
@@ -701,9 +702,7 @@ async def test_growth_automation_wires_the_runtime_registry(tmp_path) -> None:
         storage=SimpleNamespace(knowledge=None),
     )
 
-    automation = GrowthAutomation(
-        metadata, "ws-1", tmp_path, runtime=runtime
-    )
+    automation = GrowthAutomation(metadata, "ws-1", tmp_path, runtime=runtime)
 
     assert automation._manager._skills is skills
 
@@ -806,9 +805,7 @@ async def test_recollection_does_not_resurrect_a_rejected_candidate(tmp_path) ->
     service = UnifiedGrowthService(metadata)
     first = await service.collect_trajectories("ws-1", trajectory_dir)
     artifact_id = first[0].artifact.id
-    rejected = replace(
-        first[0].artifact, status=ArtifactStatus.REJECTED
-    )
+    rejected = replace(first[0].artifact, status=ArtifactStatus.REJECTED)
     await metadata.save_artifact(rejected)
 
     await service.collect_trajectories("ws-1", trajectory_dir)
@@ -862,7 +859,7 @@ async def test_evolution_intent_runs_a_sweep(tmp_path) -> None:
 
     stored = await metadata.list_artifacts()
     assert stored, "the evolution intent produced no candidate"
-    assert all(a.status is ArtifactStatus.VALIDATED for a in stored), (
+    assert all(a.status is ArtifactStatus.CANDIDATE for a in stored), (
         f"candidates were not evaluated: {[a.status.value for a in stored]}"
     )
     metadata.close()
@@ -887,7 +884,7 @@ async def test_evolution_intent_without_workspace_does_nothing(tmp_path) -> None
 
 @pytest.mark.asyncio
 async def test_evolution_intent_never_auto_publishes(tmp_path) -> None:
-    """Collection stops at VALIDATED: publishing stays a human decision."""
+    """Without measurements collection stays candidate; no auto publication."""
     from Sprout.events import INTENT_EVOLUTION_REQUESTED
     from Sprout.evolution import attach_evolution
 
@@ -908,7 +905,7 @@ async def test_evolution_intent_never_auto_publishes(tmp_path) -> None:
 
     stored = await metadata.list_artifacts()
     assert stored, "expected a candidate to collect"
-    assert all(a.status is ArtifactStatus.VALIDATED for a in stored)
+    assert all(a.status is ArtifactStatus.CANDIDATE for a in stored)
     assert not any(a.status is ArtifactStatus.PUBLISHED for a in stored)
     assert not any(s.trust == "trusted" for s in runtime.skills.list().values())
     metadata.close()

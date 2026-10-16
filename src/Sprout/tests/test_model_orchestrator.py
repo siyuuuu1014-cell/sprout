@@ -6,6 +6,7 @@ import asyncio
 
 import pytest
 
+from Sprout.llm.base import ModelBudgetExhausted
 from Sprout.llm.messages import LLMMessage, LLMResponse
 from Sprout.llm.orchestrator import ModelOrchestrationError, ModelOrchestrator
 
@@ -27,6 +28,15 @@ class _Provider:
 
 class _NonRetryableError(Exception):
     pass
+
+
+def test_budget_exhaustion_does_not_retry_or_fall_back():
+    primary = _Provider([ModelBudgetExhausted("limit")])
+    backup = _Provider([LLMResponse(content="must not run")])
+    with pytest.raises(ModelBudgetExhausted):
+        asyncio.run(ModelOrchestrator([primary, backup]).chat([LLMMessage.user("go")]))
+    assert primary.calls == 1
+    assert backup.calls == 0
 
 
 class _StreamingProvider(_Provider):

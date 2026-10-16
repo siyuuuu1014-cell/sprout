@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import re
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from hashlib import sha256
 from pathlib import Path
 from uuid import uuid4
 
@@ -20,6 +22,7 @@ class ProjectKnowledgeItem:
     scope: str = "workspace"
     evidence_ids: tuple[str, ...] = ()
     confidence: float = 1.0
+    details: Mapping[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,7 +38,7 @@ class ProjectKnowledgeBuilder:
         root = Path(workspace.root)
 
         pyproject = root / "pyproject.toml"
-        if pyproject.is_file():
+        if pyproject.is_file() and not _skip_path(root, pyproject):
             evidence.append(pyproject.resolve().as_posix())
             project = self._read_pyproject(pyproject)
             if project.get("name"):
@@ -44,7 +47,7 @@ class ProjectKnowledgeBuilder:
                         workspace,
                         len(items),
                         f"Project name: {project['name']}",
-                        evidence,
+                        self._evidence([pyproject]),
                     )
                 )
             if project.get("description"):
@@ -53,12 +56,12 @@ class ProjectKnowledgeBuilder:
                         workspace,
                         len(items),
                         f"Project description: {project['description']}",
-                        evidence,
+                        self._evidence([pyproject]),
                     )
                 )
 
         package_json = root / "package.json"
-        if package_json.is_file():
+        if package_json.is_file() and not _skip_path(root, package_json):
             evidence.append(package_json.resolve().as_posix())
             package = self._read_json(package_json)
             if package.get("name"):
@@ -67,7 +70,7 @@ class ProjectKnowledgeBuilder:
                         workspace,
                         len(items),
                         f"Node package: {package['name']}",
-                        evidence,
+                        self._evidence([package_json]),
                     )
                 )
             scripts = package.get("scripts")
@@ -77,7 +80,7 @@ class ProjectKnowledgeBuilder:
                         workspace,
                         len(items),
                         "Node scripts: " + ", ".join(scripts),
-                        evidence,
+                        self._evidence([package_json]),
                     )
                 )
             dependencies = package.get("dependencies")
@@ -87,12 +90,12 @@ class ProjectKnowledgeBuilder:
                         workspace,
                         len(items),
                         "Node dependencies: " + ", ".join(dependencies),
-                        evidence,
+                        self._evidence([package_json]),
                     )
                 )
 
         go_mod = root / "go.mod"
-        if go_mod.is_file():
+        if go_mod.is_file() and not _skip_path(root, go_mod):
             evidence.append(go_mod.resolve().as_posix())
             module = self._go_module(go_mod)
             if module:
@@ -101,12 +104,12 @@ class ProjectKnowledgeBuilder:
                         workspace,
                         len(items),
                         f"Go module: {module}",
-                        evidence,
+                        self._evidence([go_mod]),
                     )
                 )
 
         cargo = root / "Cargo.toml"
-        if cargo.is_file():
+        if cargo.is_file() and not _skip_path(root, cargo):
             evidence.append(cargo.resolve().as_posix())
             package = self._read_toml(cargo).get("package", {})
             if isinstance(package, dict) and package.get("name"):
@@ -115,7 +118,7 @@ class ProjectKnowledgeBuilder:
                         workspace,
                         len(items),
                         f"Rust crate: {package['name']}",
-                        evidence,
+                        self._evidence([cargo]),
                     )
                 )
 
@@ -142,6 +145,8 @@ class ProjectKnowledgeBuilder:
                     len(items),
                     f"Test commands: {', '.join(manifest.test_commands)}",
                     evidence,
+                    kind="inference",
+                    confidence=0.7,
                 )
             )
         if manifest.entry_points:
@@ -277,7 +282,9 @@ class ProjectKnowledgeBuilder:
         confidence: float = 1.0,
     ) -> ProjectKnowledgeItem:
         return ProjectKnowledgeItem(
-            id=f"{workspace.id}:knowledge:{index}",
+            id=f"{workspace.id}:knowledge:" + sha256(json.dumps(
+                [kind, statement, sorted(evidence_ids)], ensure_ascii=False,
+            ).encode()).hexdigest()[:32],
             statement=statement,
             kind=kind,
             scope="workspace",
@@ -297,7 +304,7 @@ class ProjectKnowledgeBuilder:
         languages = set(manifest.detected_languages)
         root = Path(workspace.root)
 
-        if "python" in languages and (root / "src").is_dir():
+        if "python" in languages and (root / "src").is_dir() and not _skip_path(root, root / "src"):
             evidence_ids = [*evidence, (root / "src").resolve().as_posix()]
             items.append(
                 self._item(
@@ -310,11 +317,13 @@ class ProjectKnowledgeBuilder:
                 )
             )
 
-        has_tests = (root / "tests").is_dir() or any(
-            root.rglob("test_*.py")
+        test_files = self._find_by_predicate(
+            root,
+            lambda _, path: path.suffix.casefold() == ".py"
+            and (path.name.startswith("test_") or path.name.endswith("_test.py")),
         )
-        if "python" in languages and has_tests:
-            evidence_ids = [*evidence, (root / "tests").resolve().as_posix()]
+        if "python" in languages and test_files:
+            evidence_ids = self._evidence(test_files)
             items.append(
                 self._item(
                     workspace,
@@ -344,7 +353,7 @@ class ProjectKnowledgeBuilder:
     def _read_pyproject(path: Path) -> dict:
         try:
             data = tomllib.loads(path.read_text(encoding="utf-8"))
-        except (OSError, tomllib.TOMLDecodeError):
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError):
             return {}
         project = data.get("project", {})
         return project if isinstance(project, dict) else {}
@@ -353,7 +362,7 @@ class ProjectKnowledgeBuilder:
     def _read_json(path: Path) -> dict:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, UnicodeError, json.JSONDecodeError):
             return {}
         return data if isinstance(data, dict) else {}
 
@@ -361,7 +370,7 @@ class ProjectKnowledgeBuilder:
     def _read_toml(path: Path) -> dict:
         try:
             data = tomllib.loads(path.read_text(encoding="utf-8"))
-        except (OSError, tomllib.TOMLDecodeError):
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError):
             return {}
         return data if isinstance(data, dict) else {}
 
@@ -369,7 +378,7 @@ class ProjectKnowledgeBuilder:
     def _go_module(path: Path) -> str:
         try:
             text = path.read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, UnicodeError):
             return ""
         match = re.search(r"(?m)^module\s+(.+)$", text)
         return match.group(1).strip() if match else ""
@@ -382,7 +391,7 @@ class ProjectKnowledgeBuilder:
                 continue
             if path.name.casefold() in names:
                 matches.append(path)
-        return sorted(matches)[:20]
+        return sorted(matches)
 
     @staticmethod
     def _find_by_predicate(root: Path, predicate) -> list[Path]:
@@ -392,7 +401,7 @@ class ProjectKnowledgeBuilder:
                 continue
             if predicate(root, path):
                 matches.append(path)
-        return sorted(matches)[:30]
+        return sorted(matches)
 
     @staticmethod
     def _relative_paths(root: Path, paths: list[Path]) -> list[str]:
@@ -414,7 +423,7 @@ class ProjectKnowledgeBuilder:
         for path in paths:
             try:
                 text = path.read_text(encoding="utf-8")
-            except OSError:
+            except (OSError, UnicodeError):
                 continue
             for line in text.splitlines():
                 stripped = line.strip()
@@ -428,7 +437,7 @@ class ProjectKnowledgeBuilder:
     @staticmethod
     def _sprout_database_statement(root: Path) -> tuple[str, list[str]] | None:
         topology = root / "src" / "Sprout" / "storage" / "topology.py"
-        if not topology.is_file():
+        if not topology.is_file() or _skip_path(root, topology):
             return None
         statement = (
             "Sprout database topology: runtime storage ownership is declared in "
@@ -449,6 +458,10 @@ _SKIP_PARTS = {
     "dist",
     "build",
     ".idea",
+    ".workbuddy",
+    ".claude",
+    ".pytest_tmp",
+    ".pytest-tmp",
 }
 
 _DOCUMENTATION_NAMES = {
@@ -526,9 +539,10 @@ _DATABASE_NAMES = {
 def _skip_path(root: Path, path: Path) -> bool:
     try:
         relative = path.relative_to(root)
+        path.resolve().relative_to(root.resolve())
     except ValueError:
         return True
-    return any(part in _SKIP_PARTS for part in relative.parts)
+    return any(part.casefold() in _SKIP_PARTS for part in relative.parts)
 
 
 def _is_docker_asset(root: Path, path: Path) -> bool:
@@ -544,9 +558,12 @@ def _is_package_manifest(root: Path, path: Path) -> bool:
 
 
 def _is_interface_asset(root: Path, path: Path) -> bool:
-    del root
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return False
     name = path.name.casefold()
-    parts = {part.casefold() for part in path.parts}
+    parts = {part.casefold() for part in relative.parts[:-1]}
     return (
         name in _INTERFACE_NAMES
         or path.suffix.casefold() == ".proto"

@@ -10,8 +10,11 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from Sprout.config.settings import Settings
+from Sprout.gateway.identity import Principal
 from Sprout.gateway.rpc_gateway import RPCGateway
 from Sprout.runtime.runtime import Runtime
+
+from ..auth import principal_of
 
 
 def _unauthorized(message: str, status_code: int) -> JSONResponse:
@@ -52,6 +55,12 @@ def create_rpc_routes(runtime: Runtime, settings: Settings | None = None) -> lis
         payload = await request.json()
         if not isinstance(payload, dict):
             return JSONResponse({"error": "expected JSON object"}, status_code=400)
-        return JSONResponse(await gateway.handle(payload))
+        principal = principal_of(request)
+        if principal is None or not principal.authenticated:
+            # The independently configured RPC token identifies one deployment
+            # operator, not an arbitrary user named by JSON parameters.
+            principal = (Principal(user_id="rpc-user", authenticated=True, source="rpc")
+                         if auth_enabled else None)
+        return JSONResponse(await gateway.handle(payload, principal=principal))
 
     return [Route("/api/rpc", rpc_endpoint, methods=["POST"])]

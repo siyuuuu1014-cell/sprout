@@ -29,6 +29,12 @@ def _survivor_args(marker, delay: float = _CHILD_LIFETIME) -> list[str]:
     return ["-c", script]
 
 
+async def test_run_capture_noninteractive_stdin_is_eof() -> None:
+    code, out, _ = await run_capture(sys.executable, "-c",
+                                   "import sys; print(repr(sys.stdin.read()))", timeout=5)
+    assert code == 0 and out.strip() == "''"
+
+
 async def test_run_capture_returns_streams() -> None:
     code, out, err = await run_capture(sys.executable, "-c", "print('hello')")
     assert code == 0

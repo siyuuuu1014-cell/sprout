@@ -62,6 +62,7 @@ async def _parked_task(gateway: ProjectGateway, tmp_path: Path, status: TaskStat
     """A task sitting in ``status``, with a workspace, as the pipeline leaves it."""
     root = tmp_path / "proj"
     root.mkdir(parents=True, exist_ok=True)
+    (root / ".git").mkdir(exist_ok=True)
     (root / "README.md").write_text("# demo\n", encoding="utf-8")
     workspace = await gateway.open_workspace(str(root))
     task = await gateway.create_task(workspace.id, "修复一个不存在的问题")

@@ -90,6 +90,7 @@ def graph_to_dict(graph: ExecutionGraph) -> dict[str, Any]:
     """Encode an execution graph without non-JSON types."""
     return {
         "task_id": graph.task_id,
+        "dispatch_key": graph.dispatch_key,
         "nodes": [node_to_dict(node) for node in graph.nodes],
         "entry_node_ids": list(graph.entry_node_ids),
         "created_at": graph.created_at.isoformat(),

@@ -19,12 +19,14 @@ class CLIGateway:
         *,
         workspace_id: str = "",
         user_id: str = "cli-user",
+        execution_mode: str = "code",
     ) -> GatewayResponse:
         from Sprout.gateway.temporal_bridge import submit_gateway_workflow
 
         await submit_gateway_workflow(
             {
                 "transport": "cli",
+                "execution_mode": execution_mode,
                 "id": workspace_id or "cli",
                 "instruction": instruction,
                 "user_id": user_id,
@@ -33,6 +35,7 @@ class CLIGateway:
         return await self._gateway.execute(
             GatewayRequest(
                 transport="cli",
+                execution_mode=execution_mode,
                 instruction=instruction,
                 caller=Principal(user_id=user_id),
                 workspace_id=workspace_id,
@@ -57,12 +60,14 @@ class WebGateway:
         *,
         workspace_id: str = "",
         user_id: str = "web-user",
+        execution_mode: str = "code",
     ) -> GatewayResponse:
         from Sprout.gateway.temporal_bridge import submit_gateway_workflow
 
         await submit_gateway_workflow(
             {
                 "transport": "web",
+                "execution_mode": execution_mode,
                 "id": workspace_id or "web",
                 "instruction": instruction,
                 "user_id": user_id,
@@ -71,6 +76,7 @@ class WebGateway:
         return await self._gateway.execute(
             GatewayRequest(
                 transport="web",
+                execution_mode=execution_mode,
                 instruction=instruction,
                 caller=Principal(user_id=user_id),
                 workspace_id=workspace_id,
@@ -95,12 +101,14 @@ class MCPGateway:
         *,
         workspace_id: str = "",
         user_id: str = "mcp-client",
+        execution_mode: str = "code",
     ) -> GatewayResponse:
         from Sprout.gateway.temporal_bridge import submit_gateway_workflow
 
         await submit_gateway_workflow(
             {
                 "transport": "mcp",
+                "execution_mode": execution_mode,
                 "id": workspace_id or "mcp",
                 "instruction": instruction,
                 "user_id": user_id,
@@ -109,6 +117,7 @@ class MCPGateway:
         return await self._gateway.execute(
             GatewayRequest(
                 transport="mcp",
+                execution_mode=execution_mode,
                 instruction=instruction,
                 caller=Principal(user_id=user_id),
                 workspace_id=workspace_id,

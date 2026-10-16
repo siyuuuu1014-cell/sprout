@@ -3,12 +3,39 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from Sprout.workspace.models import ReadPlan, Workspace
+from Sprout.workspace.serialization import to_jsonable
+
+if TYPE_CHECKING:
+    from Sprout.workspace.intelligence import WorkspaceAnalysis
+
+ANALYZER_VERSION = "10"
+
+
+def snapshot_id(analysis: WorkspaceAnalysis) -> str:
+    """Backend-independent identity for one analyzed project version."""
+    identity = {
+        "workspace_id": analysis.workspace.id,
+        "root": str(analysis.workspace.root),
+        "revision": analysis.fingerprint.revision,
+        "resources": dict(analysis.fingerprint.resource_hashes),
+        "analyzer_version": ANALYZER_VERSION,
+        "knowledge": to_jsonable(analysis.knowledge),
+        "graph": to_jsonable(analysis.graph),
+        "manifest": {
+            key: value for key, value in to_jsonable(analysis.manifest)["fields"].items()
+            if key != "created_at"
+        },
+    }
+    encoded = json.dumps(identity, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(encoded.encode()).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)

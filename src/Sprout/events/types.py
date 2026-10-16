@@ -35,8 +35,10 @@ from Sprout.events.catalog import (
     RUNTIME_STOPPED,
     SESSION_CREATED,
     SKILL_PUBLISHED,
+    TASK_MODE_CONFIRMED,
     TOOL_DENIED,
     TOOL_EXECUTED,
+    VERIFICATION_OVERRIDDEN,
 )
 
 __all__ = [
@@ -70,6 +72,8 @@ __all__ = [
     "RUNTIME_STOPPED",
     "SESSION_CREATED",
     "SKILL_PUBLISHED",
+    "TASK_MODE_CONFIRMED",
     "TOOL_DENIED",
     "TOOL_EXECUTED",
+    "VERIFICATION_OVERRIDDEN",
 ]

@@ -11,6 +11,7 @@ from Sprout.agent.base import AgentResult, history_messages
 from Sprout.agent.executor import ActionExecutor
 from Sprout.agent.planner import DirectPlanner, Planner
 from Sprout.agent.step_store import get_agent_step_store
+from Sprout.llm.base import ModelBudgetExhausted
 from Sprout.llm.client import invoke_model
 from Sprout.llm.language import detect_language
 from Sprout.llm.messages import LLMMessage, Role, ToolCall, Usage
@@ -131,33 +132,27 @@ class AgentLoop:
         model_calls = 0
         tool_calls = 0
         task_budget = context.metadata.get("task_budget", {})
-        budget_model_calls = _budget_int(
-            task_budget, "max_model_calls", self.max_model_calls
-        )
-        budget_tool_calls = _budget_int(
-            task_budget, "max_tool_calls", self.max_tool_calls
-        )
+        budget_model_calls = _budget_int(task_budget, "max_model_calls", self.max_model_calls)
+        budget_tool_calls = _budget_int(task_budget, "max_tool_calls", self.max_tool_calls)
         budget_tokens = _budget_int(task_budget, "max_tokens", self.max_tokens)
 
-        resume_calls = _tool_calls_from_metadata(
-            context.metadata.get("resume_tool_calls")
-        )
+        resume_calls = _tool_calls_from_metadata(context.metadata.get("resume_tool_calls"))
         if resume_calls:
             # A resumed tool result still belongs to the assistant tool-call
             # turn that originally requested it. Providers such as DeepSeek
             # reject a bare role=tool message without this preceding message.
             messages.append(LLMMessage.assistant("", resume_calls))
-            tool_messages, tool_calls, approval_ids, tool_summary = (
-                await self._execute_tool_calls(
-                    resume_calls,
-                    requested_by=requested_by,
-                    session_id=context.session.id,
-                    tool_calls=tool_calls,
-                    budget_tool_calls=budget_tool_calls,
-                    node_tools=context.tools,
-                )
+            tool_messages, tool_calls, approval_ids, tool_summary = await self._execute_tool_calls(
+                resume_calls,
+                requested_by=requested_by,
+                session_id=context.session.id,
+                tool_calls=tool_calls,
+                budget_tool_calls=budget_tool_calls,
+                node_tools=context.tools,
             )
             messages.extend(tool_messages)
+            if tool_summary.get("workspace_requested"):
+                return AgentResult(content="", metadata={"workspace_requested": True})
             if approval_ids:
                 return AgentResult(
                     content=(
@@ -188,6 +183,8 @@ class AgentLoop:
                 break
             try:
                 response = await invoke_model(self.model, messages, tools=specs)
+            except ModelBudgetExhausted:
+                raise
             except Exception as exc:
                 fallback = _tool_result_fallback(messages, exc, response_language)
                 if fallback is not None:
@@ -255,6 +252,8 @@ class AgentLoop:
             if not tool_messages:
                 continue
             messages.extend(tool_messages)
+            if tool_summary.get("workspace_requested"):
+                return AgentResult(content="", metadata={"workspace_requested": True})
             if approval_ids:
                 return AgentResult(
                     content=(
@@ -281,11 +280,7 @@ class AgentLoop:
                 )
 
         last_assistant = next(
-            (
-                m.content
-                for m in reversed(messages)
-                if m.role is Role.ASSISTANT and m.content
-            ),
+            (m.content for m in reversed(messages) if m.role is Role.ASSISTANT and m.content),
             "",
         )
         content = last_assistant or "Reached the maximum number of tool steps."
@@ -352,12 +347,8 @@ class AgentLoop:
         model_calls = 0
         tool_calls = 0
         task_budget = context.metadata.get("task_budget", {})
-        budget_model_calls = _budget_int(
-            task_budget, "max_model_calls", self.max_model_calls
-        )
-        budget_tool_calls = _budget_int(
-            task_budget, "max_tool_calls", self.max_tool_calls
-        )
+        budget_model_calls = _budget_int(task_budget, "max_model_calls", self.max_model_calls)
+        budget_tool_calls = _budget_int(task_budget, "max_tool_calls", self.max_tool_calls)
 
         while steps < self.max_steps:
             if budget_model_calls and model_calls >= budget_model_calls:
@@ -371,10 +362,13 @@ class AgentLoop:
                     if response.text:
                         yield response.text
                     return
-                messages.append(
-                    LLMMessage.assistant(response.content, response.tool_calls)
-                )
-                tool_messages, tool_calls, approval_ids, _ = await self._execute_tool_calls(
+                messages.append(LLMMessage.assistant(response.content, response.tool_calls))
+                (
+                    tool_messages,
+                    tool_calls,
+                    approval_ids,
+                    tool_summary,
+                ) = await self._execute_tool_calls(
                     response.tool_calls,
                     requested_by=requested_by,
                     session_id=context.session.id,
@@ -385,6 +379,9 @@ class AgentLoop:
                 if not tool_messages:
                     continue
                 messages.extend(tool_messages)
+                if tool_summary.get("workspace_requested"):
+                    yield AgentResult(content="", metadata={"workspace_requested": True})
+                    return
                 if approval_ids:
                     yield AgentResult(
                         content="",
@@ -412,10 +409,8 @@ class AgentLoop:
             model_calls += 1
             if not final_tool_calls:
                 return
-            messages.append(
-                LLMMessage.assistant("".join(content_parts), final_tool_calls)
-            )
-            tool_messages, tool_calls, approval_ids, _ = await self._execute_tool_calls(
+            messages.append(LLMMessage.assistant("".join(content_parts), final_tool_calls))
+            tool_messages, tool_calls, approval_ids, tool_summary = await self._execute_tool_calls(
                 final_tool_calls,
                 requested_by=requested_by,
                 session_id=context.session.id,
@@ -426,6 +421,9 @@ class AgentLoop:
             if not tool_messages:
                 continue
             messages.extend(tool_messages)
+            if tool_summary.get("workspace_requested"):
+                yield AgentResult(content="", metadata={"workspace_requested": True})
+                return
             if approval_ids:
                 yield AgentResult(
                     content="",
@@ -477,9 +475,8 @@ class AgentLoop:
         # shared across nodes, so the scope travels with the call rather than
         # living on the executor.
         executor = (
-            self.executor.with_scoped_tools(node_tools)
-            if node_tools
-            else self.executor
+            self.executor.with_scoped_tools(node_tools, strict=True)
+            if node_tools is not None else self.executor
         )
         outcomes = await executor.run_calls_detailed(
             allowed_calls,
@@ -496,11 +493,11 @@ class AgentLoop:
         ]
         tool_calls += len(allowed_calls)
         approval_ids = [
-            outcome.result.approval_id
-            for outcome in outcomes
-            if outcome.requires_approval
+            outcome.result.approval_id for outcome in outcomes if outcome.requires_approval
         ]
         for outcome in outcomes:
+            if outcome.result.workspace_request:
+                summary["workspace_requested"] = True
             if outcome.result.ok:
                 summary["success"] += 1
             elif outcome.requires_approval:
@@ -585,8 +582,7 @@ def _localized_tool_fallback_header(language: str) -> str:
         "中文": "工具已执行，但模型暂时无法生成后续总结。下面是工具返回结果：",
         "繁體中文": "工具已執行，但模型暫時無法產生後續總結。以下是工具返回結果：",
         "English": (
-            "The tool ran, but the model could not generate the follow-up summary. "
-            "Tool result:"
+            "The tool ran, but the model could not generate the follow-up summary. Tool result:"
         ),
         "日本語": "ツールは実行されましたが、モデルが後続の要約を生成できませんでした。ツール結果:",
         "한국어": "도구는 실행되었지만 모델이 후속 요약을 생성하지 못했습니다. 도구 결과:",

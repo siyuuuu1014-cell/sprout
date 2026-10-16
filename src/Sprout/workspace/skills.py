@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-import re
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from hashlib import sha256
 from pathlib import Path
 
 from Sprout.workspace.graph import WorkspaceEdge, WorkspaceNode
 from Sprout.workspace.knowledge import ProjectKnowledgeItem
-from Sprout.workspace.models import WorkspaceGranularity
-
-_FRONTMATTER_RE = re.compile(r"(?ms)^---\n(.*?)\n---")
+from Sprout.workspace.models import ResourceKind, ResourceRef, WorkspaceGranularity
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,12 +17,17 @@ class SkillWorkspaceAnalysis:
     nodes: tuple[WorkspaceNode, ...] = ()
     edges: tuple[WorkspaceEdge, ...] = ()
     knowledge_items: tuple[ProjectKnowledgeItem, ...] = ()
+    resource_hashes: Mapping[str, str] = field(default_factory=dict)
 
 
 class SkillWorkspaceAnalyzer:
-    """Scan SKILL.md files into graph nodes and project knowledge items."""
+    """Describe loadable artifacts without granting trust or executing them."""
 
     def analyze(self, workspace_id: str, skills_dir: str | Path) -> SkillWorkspaceAnalysis:
+        # Skills package assembly imports security, which imports workspace
+        # models. Delay the capability import until analysis to avoid a cycle.
+        from Sprout.skills.loader import iter_skill_artifacts
+
         root = Path(skills_dir).resolve()
         if not root.exists():
             return SkillWorkspaceAnalysis()
@@ -31,21 +35,33 @@ class SkillWorkspaceAnalyzer:
         nodes: list[WorkspaceNode] = []
         edges: list[WorkspaceEdge] = []
         knowledge_items: list[ProjectKnowledgeItem] = []
-        for index, path in enumerate(sorted(root.rglob("SKILL.md"))):
-            skill = self._read_skill(path)
-            name = skill.get("name") or path.parent.name
-            description = skill.get("description", "").strip()
+        resource_hashes: dict[str, str] = {}
+        tool_ids: set[str] = set()
+        for skill, artifact in sorted(iter_skill_artifacts(root), key=lambda item: str(item[1])):
+            path = artifact if artifact.is_file() else artifact / "SKILL.md"
+            name = skill.name
+            description = skill.description
             evidence = path.resolve().as_posix()
+            # Location distinguishes same-name installations; content updates
+            # preserve identity while changing the enclosing snapshot version.
+            identity = sha256(str(artifact.resolve()).encode()).hexdigest()[:32]
+            resource_hashes[evidence] = skill.digest
 
             skill_node = WorkspaceNode(
-                id=f"{workspace_id}:skill:{name}",
+                id=f"{workspace_id}:skill:{identity}",
+                resource=ResourceRef(
+                    workspace_id=workspace_id,
+                    path=evidence,
+                    content_hash=skill.digest,
+                    kind=ResourceKind.DOCUMENTATION,
+                ),
                 kind="skill",
                 name=name,
                 qualified_name=name,
                 granularity=WorkspaceGranularity.SKILL.value,
             )
             nodes.append(skill_node)
-            for tool in self._required_tools(skill):
+            for tool in sorted(set(skill.required_tools)):
                 tool_node = WorkspaceNode(
                     id=f"{workspace_id}:tool:{tool}",
                     kind="tool",
@@ -53,18 +69,21 @@ class SkillWorkspaceAnalyzer:
                     qualified_name=tool,
                     granularity=WorkspaceGranularity.SKILL.value,
                 )
-                nodes.append(tool_node)
+                if tool_node.id not in tool_ids:
+                    nodes.append(tool_node)
+                    tool_ids.add(tool_node.id)
                 edges.append(
                     WorkspaceEdge(
                         id=f"{skill_node.id}->{tool_node.id}:requires",
                         source=skill_node.id,
                         target=tool_node.id,
                         relation="requires",
+                        evidence=(evidence,),
                     )
                 )
             knowledge_items.append(
                 ProjectKnowledgeItem(
-                    id=f"{workspace_id}:skill-knowledge:{index}",
+                    id=f"{workspace_id}:skill-knowledge:{identity}",
                     statement=f"Skill: {name}"
                     + (f" - {description}" if description else ""),
                     kind="skill",
@@ -78,35 +97,7 @@ class SkillWorkspaceAnalyzer:
             nodes=tuple(nodes),
             edges=tuple(edges),
             knowledge_items=tuple(knowledge_items),
-        )
-
-    @staticmethod
-    def _read_skill(path: Path) -> dict[str, str]:
-        try:
-            text = path.read_text(encoding="utf-8")
-        except OSError:
-            return {}
-        match = _FRONTMATTER_RE.match(text)
-        if not match:
-            return {}
-
-        result: dict[str, str] = {}
-        for line in match.group(1).splitlines():
-            if ":" not in line:
-                continue
-            key, value = line.split(":", 1)
-            result[key.strip()] = value.strip().strip("\"'")
-        return result
-
-    @staticmethod
-    def _required_tools(skill: dict[str, str]) -> tuple[str, ...]:
-        raw = skill.get("required_tools", "")
-        if not raw:
-            return ()
-        return tuple(
-            item.strip()
-            for item in raw.replace(",", "\n").splitlines()
-            if item.strip()
+            resource_hashes=resource_hashes,
         )
 
 

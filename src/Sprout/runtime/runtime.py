@@ -43,6 +43,7 @@ from Sprout.events import (
     EventBus,
     register_builtin_events,
 )
+from Sprout.events.catalog import TASK_MODE_CONFIRMED
 from Sprout.execution.apply import ApplyBroker
 from Sprout.execution.database_broker import DatabaseBroker
 from Sprout.execution.file_broker import FileBroker
@@ -65,7 +66,7 @@ from Sprout.message.attachment import Attachment
 from Sprout.message.converter import assistant_envelope, turn_envelope
 from Sprout.message.models import Message, OutboundMessage, StreamChunk
 from Sprout.orchestration.compiler import ExecutionGraphBuilder
-from Sprout.orchestration.models import ExecutionGraph, ExecutionNode, NodeStatus
+from Sprout.orchestration.models import ExecutionGraph, ExecutionNode, NodeStatus, NodeType
 from Sprout.orchestration.terminal import TemporalOrchestratorBackend
 from Sprout.registry.base import Registry
 from Sprout.rootstock.contract import SessionStore
@@ -73,9 +74,9 @@ from Sprout.runtime.changes import ChangeProposalService
 from Sprout.runtime.locks import WorkspaceLockManager
 from Sprout.runtime.middleware import LoggingMiddleware, MiddlewareChain
 from Sprout.runtime.nodes import NodeExecutor
-from Sprout.runtime.queue import TaskQueueBackend, create_task_queue
+from Sprout.runtime.queue import TaskQueueBackend, TemporalTaskQueue, create_task_queue
 from Sprout.runtime.result import RuntimeInfo
-from Sprout.runtime.state import NodeStateMachine, TaskStateMachine
+from Sprout.runtime.state import TaskStateMachine
 from Sprout.runtime.workspaces import WorkspaceService
 from Sprout.sandbox.lifecycle import SandboxLifecycleService
 from Sprout.security.approval import ApprovalManager, ApprovalRecord, ApprovalStatus
@@ -97,8 +98,10 @@ from Sprout.task.models import (
     DelegationScope,
     Task,
     TaskBudget,
+    TaskExecutionMode,
     TaskResult,
     TaskStatus,
+    execution_metadata,
 )
 from Sprout.trajectory.models import ArtifactSnapshot, TrajectoryEvent
 from Sprout.trajectory.recorder import JsonlTrajectoryRecorder, trajectory_path
@@ -329,9 +332,7 @@ class Runtime:
         self.tools = tools
         self.skills = skills
         self.events = register_builtin_events(events or EventBus())
-        self.middleware = middleware or MiddlewareChain(
-            middlewares=(LoggingMiddleware(),)
-        )
+        self.middleware = middleware or MiddlewareChain(middlewares=(LoggingMiddleware(),))
         self.agents: Registry[Agent] = Registry()
         self._default_agent = default_agent
         self._session_store: SessionStore = storage.session_store()
@@ -345,15 +346,15 @@ class Runtime:
         )
         # Expose the read-only workspace query surface to agents. The import is
         # lazy because the tools package pulls the security/system tool surface.
+        from Sprout.tools.project_analyze_tool import ProjectAnalyzeTool
         from Sprout.tools.workspace_query_tool import WorkspaceQueryTool
 
         self.tools.register(WorkspaceQueryTool(self._workspaces.analyze))
+        self.tools.register(ProjectAnalyzeTool(analyze=self._workspaces.analyze_path))
         self._contexts = ContextBuilder(
             storage,
             workspace_analysis_provider=self._workspaces.analyze,
-            skill_disclosure=(
-                settings.skills.disclosure if settings is not None else ""
-            ),
+            skill_disclosure=(settings.skills.disclosure if settings is not None else ""),
         )
         self._sandbox_lifecycle = SandboxLifecycleService(storage.metadata)
         self._policy_engine = policy_engine or PolicyEngine()
@@ -381,6 +382,7 @@ class Runtime:
         )
         self._file_broker = FileBroker(
             self._policy_engine,
+            approvals=self._approvals,
             classify_overrides=security.classify_overrides if security is not None else {},
         )
         self._apply_broker = ApplyBroker(
@@ -439,12 +441,20 @@ class Runtime:
         # Production assembly supplies the Temporal queue. Injection keeps
         # isolated unit tests from requiring a running Temporal server.
         self._task_queue = task_queue or create_task_queue()
+        if isinstance(self._task_queue, TemporalTaskQueue):
+            if (
+                not isinstance(self._orchestrator_backend, TemporalOrchestratorBackend)
+                or storage.metadata is None
+            ):
+                raise ValueError("Temporal queue requires a durable Temporal orchestrator")
+            self._task_queue.bind(self.execute)
         self._worker_task: asyncio.Task[None] | None = None
         self._outbox_worker: OutboxWorker | None = None
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._graph_builder = ExecutionGraphBuilder()
         self._router: AgentRouter | None = None
         self._started = False
+        self._worker_stop_requested = False
         #: Inbound message ids whose workspace consent has already been
         #: answered. Consent is one task, and one answer: without this a second
         #: "yes" would queue the same instruction again under a second task.
@@ -607,6 +617,10 @@ class Runtime:
             process_broker=self._process_broker,
             apply_broker=self._apply_broker,
             changes=self._changes(),
+            coding_dispatch=getattr(self, "_isolated_coding_dispatch", None),
+            isolated_coding_required=getattr(self, "_isolated_coding_required", False),
+            coding_session_factory=getattr(self, "_isolated_coding_session_factory", None),
+            coding_commands=getattr(self, "_isolated_coding_commands", None),
         )
 
     # -- assembly ---------------------------------------------------------
@@ -667,16 +681,22 @@ class Runtime:
             self._record_security("approval.swept_at_startup", {"count": swept})
 
     async def stop(self) -> None:
-        if not self._started:
-            return
-        self._started = False
-        # Drain the outbox before the store closes: the worker's final flush
-        # writes through the same database handle.
-        await self._stop_outbox_worker()
-        if self._background_tasks:
-            await asyncio.gather(*self._background_tasks, return_exceptions=True)
-        await self.events.publish(Event(RUNTIME_STOPPED, {}))
-        await self.storage.close()
+        # Workers can be started independently of start(). Join them even when
+        # there is no started Runtime/storage lifecycle to close.
+        try:
+            await self.stop_worker()
+        finally:
+            if self._started:
+                self._started = False
+                try:
+                    if self._background_tasks:
+                        await asyncio.gather(*self._background_tasks, return_exceptions=True)
+                    # Flush after local writers finish, while the database is open.
+                    await self._stop_outbox_worker()
+                    await self.events.publish(Event(RUNTIME_STOPPED, {}))
+                finally:
+                    # A failed worker/flush must not leave authority connections open.
+                    await self.storage.close()
 
     async def _start_outbox_worker(self) -> None:
         """Drain the transactional outbox into the derived layers.
@@ -746,16 +766,12 @@ class Runtime:
                 await self._persist_turns(
                     session,
                     held,
-                    AgentResult(
-                        content=outbound.content, metadata=dict(outbound.metadata)
-                    ),
+                    AgentResult(content=outbound.content, metadata=dict(outbound.metadata)),
                 )
             return await self.middleware.after(held or message, outbound)
 
         agent = self._router.route(message)
-        await self.events.publish(
-            Event(AGENT_STARTED, {"session_id": session.id}, message.id)
-        )
+        await self.events.publish(Event(AGENT_STARTED, {"session_id": session.id}, message.id))
         try:
             result = await agent.run(message, context)
         except Exception as exc:
@@ -778,19 +794,13 @@ class Runtime:
             await self._persist_turns(
                 session,
                 held,
-                AgentResult(
-                    content=outbound.content, metadata=dict(outbound.metadata)
-                ),
+                AgentResult(content=outbound.content, metadata=dict(outbound.metadata)),
             )
             return await self.middleware.after(held, outbound)
 
         await self._persist_turns(session, message, result)
-        await self.events.publish(
-            Event(AGENT_COMPLETED, {"session_id": session.id}, message.id)
-        )
-        await self.events.publish(
-            Event(MESSAGE_SENT, {"session_id": session.id}, message.id)
-        )
+        await self.events.publish(Event(AGENT_COMPLETED, {"session_id": session.id}, message.id))
+        await self.events.publish(Event(MESSAGE_SENT, {"session_id": session.id}, message.id))
         outbound = OutboundMessage(
             content=result.content,
             channel=message.channel,
@@ -800,9 +810,7 @@ class Runtime:
         )
         return await self.middleware.after(message, outbound)
 
-    async def _handle_task(
-        self, message: Message, session
-    ) -> OutboundMessage:
+    async def _handle_task(self, message: Message, session) -> OutboundMessage:
         """Queue a coding task for background execution and ack immediately.
 
         Callers reach this when the message carries a workspace id. A task
@@ -811,18 +819,23 @@ class Runtime:
         directory, then resumes here via :meth:`grant_workspace_consent`.
         """
         workspace_id = str(message.metadata.get("workspace_id") or "")
+        workspace = await self.get_workspace(workspace_id)
+        if workspace is not None and not (workspace.root / ".git").exists():
+            return OutboundMessage(
+                content="编码任务需要 Git 仓库。请先自行初始化 Git，再重新提交；只读分析仍可使用。",
+                channel=message.channel,
+                session_id=session.id,
+                correlation_id=message.id,
+                metadata={"intent": "task", "blocked_reason": "git_repository_required"},
+            )
         # The surface the operator used, not the one the resume happens to run
         # on. A consented task resumes over an internal message, and taking the
         # source from there filed every such task as ``unknown``.
-        source = str(
-            message.metadata.get("origin_channel") or message.channel or ""
-        )
+        source = str(message.metadata.get("origin_channel") or message.channel or "")
         task = await self.create_task(
             workspace_id,
             message.content,
-            actor=Principal(
-                user_id=message.user_id or "anonymous", source=source
-            ),
+            actor=Principal(user_id=message.user_id or "anonymous", source=source),
             source=source,
             # Recorded so a later turn can report this task back to the session
             # that asked for it. Without it a parked task belongs to no
@@ -894,9 +907,7 @@ class Runtime:
                 parked.append(task)
         return parked
 
-    async def task_progress(
-        self, task: Task
-    ) -> tuple[str, str]:
+    async def task_progress(self, task: Task) -> tuple[str, str]:
         """What a parked task is waiting for: ``(kind, id)``.
 
         ``kind`` is ``"approval"`` or ``"proposal"`` and ``id`` is what the
@@ -906,9 +917,7 @@ class Runtime:
         """
         proposals = await self.list_change_proposals(task.id)
         pending = [
-            proposal
-            for proposal in proposals
-            if proposal.status is ChangeProposalStatus.PENDING
+            proposal for proposal in proposals if proposal.status is ChangeProposalStatus.PENDING
         ]
         if pending:
             return "proposal", pending[0].id
@@ -1207,18 +1216,14 @@ class Runtime:
         """
         held, metadata = await self._held_workspace_consent(session_id)
         if held is None or metadata is None:
-            raise LookupError(
-                f"No pending workspace consent for session {session_id!r}"
-            )
+            raise LookupError(f"No pending workspace consent for session {session_id!r}")
         proposed = str(metadata.get("proposed_workspace_root") or "")
         workspace = await self.open_workspace(
             root if root is not None else Path(proposed or Path.cwd())
         )
         # Marked consumed before the task is queued: a second answer must fail
         # even if queueing the first one is slow.
-        self._consumed_consents.add(
-            str(dict(held.metadata or {}).get("message_id") or "")
-        )
+        self._consumed_consents.add(str(dict(held.metadata or {}).get("message_id") or ""))
         session = await self._session_store.get_session(session_id)
         if session is None:
             raise LookupError(f"Unknown session: {session_id!r}")
@@ -1240,11 +1245,7 @@ class Runtime:
                         if metadata.get("cli_language")
                         else {}
                     ),
-                    **(
-                        {"foreground_task": True}
-                        if metadata.get("foreground_task")
-                        else {}
-                    ),
+                    **({"foreground_task": True} if metadata.get("foreground_task") else {}),
                     # Carried over from the held turn so the task is filed under
                     # the surface the operator used rather than "internal".
                     "origin_channel": str(metadata.get("origin_channel") or ""),
@@ -1258,9 +1259,7 @@ class Runtime:
         intent = str(classification.get("intent") or "conversation")
         if intent not in _INTENT_EVENTS:
             intent = "conversation"
-        trigger_event = str(
-            classification.get("trigger_event") or _INTENT_EVENTS[intent]
-        )
+        trigger_event = str(classification.get("trigger_event") or _INTENT_EVENTS[intent])
         if trigger_event not in _INTENT_EVENTS.values():
             trigger_event = _INTENT_EVENTS[intent]
         confidence = _clamp_float(classification.get("confidence"), default=0.5)
@@ -1422,11 +1421,7 @@ class Runtime:
         *,
         similar_context: list[dict[str, Any]],
     ) -> str:
-        memory_meta = (
-            context.memory.metadata
-            if hasattr(context.memory, "metadata")
-            else {}
-        )
+        memory_meta = context.memory.metadata if hasattr(context.memory, "metadata") else {}
         recent = []
         for item in list(context.memory)[-6:]:
             role = getattr(item, "role", "")
@@ -1501,17 +1496,13 @@ class Runtime:
                 await self._finish_stream_turn(
                     session,
                     held,
-                    AgentResult(
-                        content=outbound.content, metadata=dict(outbound.metadata)
-                    ),
+                    AgentResult(content=outbound.content, metadata=dict(outbound.metadata)),
                     outbound,
                 )
             return
 
         agent = self._router.route(message)
-        await self.events.publish(
-            Event(AGENT_STARTED, {"session_id": session.id}, message.id)
-        )
+        await self.events.publish(Event(AGENT_STARTED, {"session_id": session.id}, message.id))
 
         chunks: list[str] = []
         stream = getattr(agent, "stream", None)
@@ -1560,9 +1551,7 @@ class Runtime:
             await self._finish_stream_turn(
                 session,
                 held,
-                AgentResult(
-                    content=outbound.content, metadata=dict(outbound.metadata)
-                ),
+                AgentResult(content=outbound.content, metadata=dict(outbound.metadata)),
                 outbound,
             )
             return
@@ -1579,9 +1568,7 @@ class Runtime:
             metadata=dict(result.metadata),
         )
         yield StreamChunk(outbound=outbound)
-        self._schedule_background_task(
-            self._finish_stream_turn(session, message, result, outbound)
-        )
+        self._schedule_background_task(self._finish_stream_turn(session, message, result, outbound))
 
     def schedule_background(self, coroutine) -> None:
         """Run a coroutine off the turn path, drained by ``stop()``.
@@ -1610,9 +1597,7 @@ class Runtime:
             await self.events.publish(
                 Event(AGENT_COMPLETED, {"session_id": session.id}, message.id)
             )
-            await self.events.publish(
-                Event(MESSAGE_SENT, {"session_id": session.id}, message.id)
-            )
+            await self.events.publish(Event(MESSAGE_SENT, {"session_id": session.id}, message.id))
             await self.middleware.after(message, outbound)
         except Exception as exc:
             await self.events.publish(
@@ -1644,9 +1629,7 @@ class Runtime:
                 pending = metadata["pending_tool_calls"]
                 break
         if pending is None:
-            raise LookupError(
-                f"No pending approval found for session {session_id!r}"
-            )
+            raise LookupError(f"No pending approval found for session {session_id!r}")
         message = Message(
             content=content,
             channel="internal",
@@ -1675,9 +1658,7 @@ class Runtime:
                 pending = metadata["pending_tool_calls"]
                 break
         if pending is None:
-            raise LookupError(
-                f"No pending approval found for session {session_id!r}"
-            )
+            raise LookupError(f"No pending approval found for session {session_id!r}")
         message = Message(
             content="",
             channel="internal",
@@ -1697,9 +1678,7 @@ class Runtime:
             skills=self.skills.list(),
         )
         agent = self._router.route(message)
-        await self.events.publish(
-            Event(AGENT_STARTED, {"session_id": session.id}, message.id)
-        )
+        await self.events.publish(Event(AGENT_STARTED, {"session_id": session.id}, message.id))
         try:
             result = await agent.run(message, context)
         except Exception as exc:
@@ -1712,12 +1691,8 @@ class Runtime:
             )
             raise
         await self._persist_assistant_turn(session, message, result)
-        await self.events.publish(
-            Event(AGENT_COMPLETED, {"session_id": session.id}, message.id)
-        )
-        await self.events.publish(
-            Event(MESSAGE_SENT, {"session_id": session.id}, message.id)
-        )
+        await self.events.publish(Event(AGENT_COMPLETED, {"session_id": session.id}, message.id))
+        await self.events.publish(Event(MESSAGE_SENT, {"session_id": session.id}, message.id))
         outbound = OutboundMessage(
             content=result.content,
             channel="cli",
@@ -1729,9 +1704,7 @@ class Runtime:
 
     # -- turn persistence (the single authority write point) -----------------
 
-    async def _offload_body(
-        self, content: str, envelope: dict
-    ) -> tuple[str, dict]:
+    async def _offload_body(self, content: str, envelope: dict) -> tuple[str, dict]:
         """Move an oversized turn body to the blobstore (fail-open).
 
         Below the threshold, or when no blobstore is wired, the body stays
@@ -1750,9 +1723,7 @@ class Runtime:
         offloaded = {**envelope, "blob_uri": uri, "content_bytes": size}
         return content[:TURN_PREVIEW_CHARS], offloaded
 
-    async def _persist_turns(
-        self, session: Session, message: Message, result: AgentResult
-    ) -> None:
+    async def _persist_turns(self, session: Session, message: Message, result: AgentResult) -> None:
         """Append the user and assistant turns with their full envelopes.
 
         This is the only authority write point of the online path (P1): the
@@ -1761,24 +1732,18 @@ class Runtime:
         publishes the stored turn ids/seqs so derived lanes and observers can
         react without re-reading the session store.
         """
-        user_body, user_envelope = await self._offload_body(
-            message.content, turn_envelope(message)
-        )
+        user_body, user_envelope = await self._offload_body(message.content, turn_envelope(message))
         assistant_body, assistant_envelope_dict = await self._offload_body(
             result.content, assistant_envelope(message, result.metadata)
         )
-        user_turn = Turn(
-            session.id, "user", user_body, metadata=user_envelope
-        )
+        user_turn = Turn(session.id, "user", user_body, metadata=user_envelope)
         assistant_turn = Turn(
             session.id, "assistant", assistant_body, metadata=assistant_envelope_dict
         )
         await self._session_store.append_turn(user_turn)
         await Runtime._persist_attachments(self, user_turn, message)
         await self._session_store.append_turn(assistant_turn)
-        stored = list(
-            await self._session_store.recent_turns(session.id, limit=2)
-        )
+        stored = list(await self._session_store.recent_turns(session.id, limit=2))
         payload: dict = {"session_id": session.id}
         if len(stored) == 2:
             payload["turn_ids"] = [stored[0].id, stored[1].id]
@@ -1786,9 +1751,7 @@ class Runtime:
         else:  # fallback when a backend cannot read back
             payload["turn_ids"] = [user_turn.id, assistant_turn.id]
             payload["seqs"] = [user_turn.seq, assistant_turn.seq]
-        await self.events.publish(
-            Event(MESSAGE_PERSISTED, payload, message.id)
-        )
+        await self.events.publish(Event(MESSAGE_PERSISTED, payload, message.id))
 
     @staticmethod
     async def _persist_attachments(runtime: Runtime, turn: Turn, message: Message) -> None:
@@ -1846,9 +1809,7 @@ class Runtime:
             session.id, "assistant", assistant_body, metadata=assistant_envelope_dict
         )
         await self._session_store.append_turn(assistant_turn)
-        stored = list(
-            await self._session_store.recent_turns(session.id, limit=1)
-        )
+        stored = list(await self._session_store.recent_turns(session.id, limit=1))
         payload: dict = {"session_id": session.id}
         if stored:
             payload["turn_ids"] = [stored[0].id]
@@ -1856,9 +1817,7 @@ class Runtime:
         else:
             payload["turn_ids"] = [assistant_turn.id]
             payload["seqs"] = [assistant_turn.seq]
-        await self.events.publish(
-            Event(MESSAGE_PERSISTED, payload, message.id)
-        )
+        await self.events.publish(Event(MESSAGE_PERSISTED, payload, message.id))
 
     # -- public application services (used by CLI, MCP, Web API) -------------
     def describe(self) -> RuntimeInfo:
@@ -1905,9 +1864,7 @@ class Runtime:
 
     async def create_session(self, user_id: str, *, session_id: str | None = None) -> Session:
         session = await self._sessions.create(user_id, session_id=session_id)
-        await self.events.publish(
-            Event(SESSION_CREATED, {"session_id": session.id}, session.id)
-        )
+        await self.events.publish(Event(SESSION_CREATED, {"session_id": session.id}, session.id))
         return session
 
     async def history(self, session_id: str, limit: int = 50) -> list[Turn]:
@@ -1955,6 +1912,7 @@ class Runtime:
         delegation_scope: DelegationScope | None = None,
         budget: TaskBudget | None = None,
         metadata: dict[str, object] | None = None,
+        execution_mode: str = TaskExecutionMode.CODE,
     ) -> Task:
         """Create and persist a task without starting orchestration yet."""
         store = self.storage.metadata
@@ -1963,6 +1921,12 @@ class Runtime:
         workspace = await store.get_workspace(workspace_id)
         if workspace is None:
             raise LookupError(f"Workspace not found: {workspace_id}")
+        task_metadata = execution_metadata(metadata or {}, execution_mode)
+        if execution_mode == TaskExecutionMode.CODE and not (workspace.root / ".git").exists():
+            raise ValueError(
+                "Coding tasks require a Git repository. Initialize Git yourself first; "
+                "Sprout will not initialize or modify repository state automatically."
+            )
         task = Task(
             workspace_id=workspace_id,
             instruction=instruction,
@@ -1970,10 +1934,43 @@ class Runtime:
             source=source,
             delegation_scope=delegation_scope or DelegationScope(),
             budget=budget or TaskBudget(),
-            metadata=metadata or {},
+            metadata=task_metadata,
         )
         await store.save_task(task)
         return task
+
+    async def confirm_task_mode(self, task_id: str, execution_mode: str) -> Task:
+        """Confirm an untouched historical task, never reinterpret executed work."""
+        store = self.storage.metadata
+        if store is None:
+            raise RuntimeError("MetadataStore is not configured")
+        task = await store.get_task(task_id)
+        if task is None:
+            raise LookupError(f"Task not found: {task_id}")
+        if task.execution_mode != TaskExecutionMode.UNCONFIRMED:
+            raise ValueError("Task mode is already confirmed")
+        if (
+            task.status != TaskStatus.CREATED
+            or await store.list_execution_nodes(task_id)
+            or await store.list_change_proposals(task_id)
+        ):
+            raise ValueError("Historical task has execution evidence; create a new typed task")
+        task_metadata = execution_metadata(task.metadata, execution_mode)
+        workspace = await store.get_workspace(task.workspace_id)
+        if workspace is None:
+            raise LookupError(f"Workspace not found: {task.workspace_id}")
+        if execution_mode == TaskExecutionMode.CODE and not (workspace.root / ".git").exists():
+            raise ValueError("Coding tasks require Git; initialize Git yourself first")
+        confirmed = replace(task, metadata=task_metadata)
+        await store.save_task(confirmed)
+        await self.events.publish(
+            Event(
+                TASK_MODE_CONFIRMED,
+                {"task_id": task_id, "execution_mode": confirmed.execution_mode.value},
+                task_id,
+            )
+        )
+        return confirmed
 
     async def create_task_from_strategy(
         self,
@@ -2039,6 +2036,7 @@ class Runtime:
         source: str = "cli",
         language: str = "",
         use_model_planner: bool = False,
+        execution_mode: str = TaskExecutionMode.CODE,
     ) -> Task:
         """Create a task through strategy planning, falling back if it fails.
 
@@ -2067,6 +2065,18 @@ class Runtime:
         whether decomposition helps a *complex*, multi-file requirement. The
         capability is kept, not deleted — it is just not the default.
         """
+        workspace = await self.get_workspace(workspace_id)
+        if workspace is None:
+            raise LookupError(f"Workspace not found: {workspace_id}")
+        execution_metadata({}, execution_mode)
+        if execution_mode == TaskExecutionMode.READ_ONLY or not (workspace.root / ".git").exists():
+            return await self.create_task(
+                workspace_id,
+                instruction,
+                actor=actor,
+                source=source,
+                execution_mode=execution_mode,
+            )
         try:
             return await self.create_task_from_strategy(
                 workspace_id,
@@ -2089,6 +2099,7 @@ class Runtime:
                 source=source,
                 metadata={
                     "plan_kind": "fallback",
+                    "require_acceptance_tests": True,
                     **({"response_language": language} if language else {}),
                 },
             )
@@ -2105,10 +2116,105 @@ class Runtime:
             raise RuntimeError("MetadataStore is not configured")
         return await metadata.list_tasks(workspace_id)
 
-    async def read_trajectory(self, task_id: str) -> list[TrajectoryEvent]:
-        recorder = JsonlTrajectoryRecorder(
-            trajectory_path(self._trajectory_dir, task_id)
+    async def get_task_submissions(self, task_id: str) -> list[dict[str, Any]]:
+        """Inspect durable transport state without contacting the scheduler."""
+        if await self.get_task(task_id) is None:
+            raise LookupError(f"Task not found: {task_id}")
+        return await self._metadata_or_raise().list_task_submissions(task_id)
+
+    async def synchronize_task_result(self, expected, result):
+        """Internal projection port; callers use authenticated TaskActions.sync."""
+        writer = getattr(self._metadata_or_raise(), "synchronize_task_result", None)
+        if writer is None:
+            raise ValueError("Metadata store does not support atomic result synchronization")
+        return await writer(expected, result)
+
+    async def get_task_execution_report(self, task_id: str) -> dict[str, Any]:
+        """Inspect node ownership without clearing it or contacting the worker."""
+        task = await self.get_task(task_id)
+        if task is None:
+            raise LookupError(f"Task not found: {task_id}")
+        nodes = []
+        for node in await self._metadata_or_raise().list_execution_nodes(task_id):
+            guard = node.metadata.get("execution_guard", {})
+            state = guard.get("state", "unclaimed")
+            if state == "active":
+                state = "occupied_or_unconfirmed"
+            elif not guard and node.status in {NodeStatus.RUNNING, NodeStatus.FAILED}:
+                state = "legacy_unconfirmed"
+            output = node.metadata.get("output")
+            nodes.append(
+                {
+                    "node_id": node.id,
+                    "type": node.type.value,
+                    "status": node.status.value,
+                    "attempts": node.attempts,
+                    "execution_state": state,
+                    "owner": guard.get("owner"),
+                    "started_at": guard.get("started_at"),
+                    "settled_at": guard.get("settled_at"),
+                    "reason": output.get("reason") if isinstance(output, dict) else None,
+                    "error": node.metadata.get("error"),
+                    "budget_stopped": any(kind in str(node.metadata.get("error") or "")
+                        for kind in ("ModelBudgetExhausted", "LiveRequestLimit")),
+                }
+            )
+        return {"version": 1, "task_id": task_id, "status": task.status.value, "nodes": nodes}
+
+    async def get_task_budget_report(self, task_id: str) -> dict[str, Any]:
+        """Read durable allowance evidence; unsupported stores are not zero usage."""
+        from Sprout.task.reporting import budget_projection
+
+        task = await self.get_task(task_id)
+        if task is None:
+            raise LookupError(f"Task not found: {task_id}")
+        reader = getattr(self._metadata_or_raise(), "model_budget_report", None)
+        if reader is None:
+            return budget_projection(None, task.budget.max_model_calls)
+        return await reader(task_id, task.budget.max_model_calls)
+
+    async def get_verification_report(self, task_id: str) -> dict[str, object]:
+        """Read existing evidence without executing checks or trusting cached reports."""
+        from Sprout.execution.verification import (
+            build_verification_report,
+            proposal_verification_report,
         )
+
+        task = await self.get_task(task_id)
+        if task is None:
+            raise LookupError(f"Task not found: {task_id}")
+        proposals = await self.list_change_proposals(task_id)
+        proposal = max(proposals, key=lambda item: item.created_at) if proposals else None
+        node_id = None
+        if proposal is not None:
+            report = proposal_verification_report(proposal)
+        else:
+            nodes = await self.storage.metadata.list_execution_nodes(task_id)
+            evaluation = None
+            for node in reversed(nodes):
+                output = node.metadata.get("output")
+                if (
+                    node.type is NodeType.EVALUATION
+                    and isinstance(output, dict)
+                    and not output.get("skipped")
+                ):
+                    evaluation = output
+                    node_id = node.id
+                    break
+            report = build_verification_report(
+                NodeExecutor._test_results_from(evaluation),
+                evaluation,
+            )
+        return {
+            "task_id": task_id,
+            "task_status": task.status.value,
+            "proposal_id": proposal.id if proposal else None,
+            "evaluation_node_id": node_id,
+            **report.to_payload(),
+        }
+
+    async def read_trajectory(self, task_id: str) -> list[TrajectoryEvent]:
+        recorder = JsonlTrajectoryRecorder(trajectory_path(self._trajectory_dir, task_id))
         return await recorder.read_all()
 
     async def run_task_process(
@@ -2117,6 +2223,7 @@ class Runtime:
         command: tuple[str, ...],
         *,
         timeout_seconds: float | None = None,
+        max_output_bytes: int | None = None,
     ) -> ProcessResult:
         task = await self.get_task(task_id)
         if task is None:
@@ -2130,8 +2237,27 @@ class Runtime:
             cwd=workspace.root,
             task_id=task_id,
             timeout_seconds=timeout_seconds,
+            **({"max_output_bytes": max_output_bytes} if max_output_bytes is not None else {}),
             scope=task.delegation_scope,
+            source=task.source,
+            requested_by=task.actor.user_id,
+            actor=task.actor,
+            resource_scope=workspace.id,
         )
+
+    async def authorize_task_process(self, task_id: str, command: tuple[str, ...]) -> ProcessResult:
+        """Broker-only preflight, never a reusable execution authorization token."""
+        task = await self.get_task(task_id)
+        if task is None:
+            raise LookupError("Task not found")
+        workspace = await self.get_workspace(task.workspace_id)
+        if workspace is None:
+            raise LookupError("Workspace not found")
+        return await self._process_broker.run(
+            workspace, command, cwd=workspace.root, task_id=task_id,
+            scope=task.delegation_scope, source=task.source,
+            requested_by=task.actor.user_id, actor=task.actor, resource_scope=workspace.id,
+            preflight_only=True)
 
     async def get_change_proposal(self, proposal_id: str) -> ChangeProposal | None:
         return await self._changes().get(proposal_id)
@@ -2206,9 +2332,7 @@ class Runtime:
         if task is None:
             raise LookupError(f"Task not found: {task_id}")
         if not TaskStateMachine.can_transition(task.status, TaskStatus.CANCELLED):
-            raise ValueError(
-                f"Task {task_id} is {task.status.value}; it cannot be cancelled"
-            )
+            raise ValueError(f"Task {task_id} is {task.status.value}; it cannot be cancelled")
         await metadata.update_task_status(task_id, TaskStatus.CANCELLED)
         self._record_security(
             "task.cancelled",
@@ -2249,9 +2373,16 @@ class Runtime:
         proposal_id: str,
         *,
         allow_failing_tests: bool = False,
+        force: bool = False,
+        override_reason: str = "",
+        decided_by: str = "cli",
     ) -> ApplyResult:
         result = await self._changes().apply(
-            proposal_id, allow_failing_tests=allow_failing_tests
+            proposal_id,
+            allow_failing_tests=allow_failing_tests,
+            force=force,
+            override_reason=override_reason,
+            decided_by=decided_by,
         )
         if result.applied:
             proposal = await self._changes().get(proposal_id)
@@ -2279,12 +2410,100 @@ class Runtime:
         task: Task,
         *,
         artifact_snapshot: ArtifactSnapshot | None = None,
+        replay_resume_owner: str | None = None,
     ) -> TaskResult:
         async with self._workspace_locks.lock(task.workspace_id):
+            authoritative = await self._metadata_or_raise().get_task(task.id)
+            if (authoritative is not None
+                    and authoritative.status == TaskStatus.WAITING_RESOURCE
+                    and authoritative.metadata.get("replay_stage") == "image_preflight"):
+                claim = await self._metadata_or_raise().get_replay_resume(task.id)
+                if (not claim or claim["state"] != "active"
+                        or claim["owner"] != replay_resume_owner
+                        or claim.get("requested_by") != authoritative.actor.user_id
+                        or claim.get("plan_fingerprint") != authoritative.metadata.get(
+                            "replay_plan", {}).get("fingerprint")):
+                    raise ValueError("Replay preflight waits require the dedicated recovery entry")
+                task = authoritative
             return await self._execute_task(
                 task,
                 artifact_snapshot=artifact_snapshot,
             )
+
+    async def submit_persisted_task(self, task_id: str):
+        """Fresh submission only, using a deployment-configured Temporal route.
+
+        Existing histories are observation-only, never recovery authorization.
+        Isolated replay experiments retain their dedicated admission service.
+        """
+        from dataclasses import asdict
+
+        metadata = self._metadata_or_raise()
+        task = await metadata.get_task(task_id)
+        if task is None:
+            raise LookupError(f"Task not found: {task_id}")
+        async with self._workspace_locks.lock(task.workspace_id):
+            task = await metadata.get_task(task_id)
+            if task is None:
+                raise LookupError(f"Task not found: {task_id}")
+            records = await metadata.list_task_submissions(task_id)
+            if records:
+                return {"task_id": task_id, "status": task.status.value,
+                        "new_submission": False, "worker_started": False,
+                        "submission_ids": [record["id"] for record in records],
+                        "next_action": "Observe existing submissions; no automatic retry"}
+            if task.metadata.get("replay_plan"):
+                raise ValueError("Isolated experiments require dedicated coding-submit admission")
+            if task.status not in {TaskStatus.CREATED, TaskStatus.READY}:
+                raise ValueError("Fresh created/ready task required; not a recovery entry")
+            if await metadata.list_execution_nodes(task_id):
+                raise ValueError("Existing nodes require observation, not fresh submission")
+            if not isinstance(self._orchestrator_backend, TemporalOrchestratorBackend):
+                raise ValueError("Explicit deployment Temporal backend required; no local fallback")
+            backend = self._orchestrator_backend.submission_only(metadata=metadata)
+            result = await self._execute_task(task, artifact_snapshot=None, backend=backend)
+            submitted = await metadata.list_task_submissions(task_id)
+            return {**asdict(result), "new_submission": bool(submitted), "worker_started": False,
+                    "result_waited": False}
+
+    async def retry_pending_submission(self, task_id: str, *, submission_id: str):
+        """Explicit retry of a known connection failure, never an execution retry."""
+        from dataclasses import asdict
+
+        from Sprout.orchestration.models import ExecutionGraph
+        from Sprout.orchestration.terminal.temporal import TemporalConfig
+
+        metadata = self._metadata_or_raise()
+        task = await metadata.get_task(task_id)
+        if task is None:
+            raise LookupError(f"Task not found: {task_id}")
+        async with self._workspace_locks.lock(task.workspace_id):
+            task = await metadata.get_task(task_id)
+            records = await metadata.list_task_submissions(task_id)
+            if len(records) != 1 or records[0]["id"] != submission_id:
+                raise ValueError("One exact original submission required")
+            record = records[0]
+            if (task is None or task.status != TaskStatus.WAITING_RESOURCE
+                    or task.metadata.get("replay_plan")):
+                raise ValueError("Ordinary task waiting for scheduling required")
+            if (record.get("state") != "pending" or record.get("phase") != "connect"
+                    or record.get("accepted") or record.get("run_id")):
+                raise ValueError("Only known pre-submission connection failures may be retried")
+            if (record.get("task_id") != task_id
+                    or record.get("payload", {}).get("task_id") != task_id
+                    or not all(isinstance(record.get(key), str) and record[key].strip()
+                               for key in ("host", "namespace", "task_queue"))):
+                raise ValueError("Original submission payload and route required")
+            if await metadata.list_execution_nodes(task_id):
+                raise ValueError("Existing execution evidence requires observation, not retry")
+            backend = TemporalOrchestratorBackend(TemporalConfig(
+                host=record["host"], namespace=record["namespace"],
+                task_queue=record["task_queue"]), metadata=metadata, wait_for_result=False)
+            # Backend selects the existing record and its frozen payload, not a
+            # newly compiled graph. REJECT_DUPLICATE preserves workflow identity.
+            result = await backend.execute(ExecutionGraph(task_id=task_id))
+            return {**asdict(result), "new_submission": False, "retry_requested": True,
+                    "worker_started": False, "result_waited": False}
 
     async def submit_task(self, task: Task) -> None:
         """Queue a task for later execution by a worker."""
@@ -2292,7 +2511,7 @@ class Runtime:
 
     async def run_task_worker(self) -> None:
         """Consume queued tasks and execute them serially per workspace."""
-        while True:
+        while not self._worker_stop_requested:
             task = await self._task_queue.get()
             try:
                 await self.execute(task)
@@ -2301,33 +2520,90 @@ class Runtime:
 
     def start_worker(self) -> None:
         if self._worker_task is None or self._worker_task.done():
+            self._worker_stop_requested = False
             self._worker_task = asyncio.create_task(
                 self.run_task_worker(),
                 name="sema-task-worker",
             )
 
     async def stop_worker(self) -> None:
-        if self._worker_task is not None:
-            self._worker_task.cancel()
+        worker = self._worker_task
+        if worker is not None:
+            # Cancellation may be consumed by an execution adapter. The explicit
+            # flag still prevents consuming the next queued task in that case.
+            if not self._worker_stop_requested:
+                self._worker_stop_requested = True
+                worker.cancel()
             try:
-                await self._worker_task
+                await worker
             except asyncio.CancelledError:
                 pass
-            self._worker_task = None
+            finally:
+                if self._worker_task is worker:
+                    self._worker_task = None
+
+    @staticmethod
+    def _task_for_execution(task: Task, workspace: Workspace) -> Task:
+        """Enforce the same admission contract on execution, resume and workers."""
+        if task.execution_mode == TaskExecutionMode.UNCONFIRMED:
+            raise ValueError(
+                "Historical task execution mode is unconfirmed; confirm mode or create a new task"
+            )
+        if task.execution_mode == TaskExecutionMode.CODE and not (workspace.root / ".git").exists():
+            raise ValueError("Coding tasks require Git; initialize Git yourself first")
+        return replace(task, metadata=execution_metadata(task.metadata, task.execution_mode))
+
+    async def _isolated_execution_wait(self, task: Task) -> TaskResult | None:
+        """Apply the same fail-closed admission to initial and resumed execution.
+
+        A callable dispatcher is only a necessary condition, not commissioning
+        or write authority; node-level binding and validation remain mandatory.
+        """
+        if not getattr(self, "_isolated_coding_required", False):
+            return None
+        if callable(getattr(self, "_isolated_coding_dispatch", None)):
+            return None
+        metadata = self.storage.metadata
+        if metadata is None:
+            raise RuntimeError("MetadataStore is not configured")
+        current = await metadata.get_task(task.id)
+        if current and current.status in {
+            TaskStatus.COMPLETED, TaskStatus.CANCELLED, TaskStatus.ROLLED_BACK
+        }:
+            return TaskResult(task_id=task.id, status=current.status)
+        await metadata.update_task_status(task.id, TaskStatus.WAITING_RESOURCE)
+        return TaskResult(task_id=task.id, status=TaskStatus.WAITING_RESOURCE,
+                          error="Isolated coding backend not ready; no host fallback")
 
     async def _execute_task(
         self,
         task: Task,
         *,
         artifact_snapshot: ArtifactSnapshot | None,
+        backend=None,
     ) -> TaskResult:
         """Run a task through the V0.1 project execution pipeline."""
         metadata = self.storage.metadata
         if metadata is None:
             raise RuntimeError("MetadataStore is not configured")
+        isolated_wait = await self._isolated_execution_wait(task)
+        if isolated_wait is not None:
+            return isolated_wait
+        if isinstance(backend or self._orchestrator_backend, TemporalOrchestratorBackend):
+            authoritative = await metadata.get_task(task.id)
+            if authoritative is not None:
+                task = authoritative
+                if task.status in {
+                    TaskStatus.COMPLETED,
+                    TaskStatus.CANCELLED,
+                    TaskStatus.ROLLED_BACK,
+                }:
+                    return TaskResult(task_id=task.id, status=task.status)
         workspace = await metadata.get_workspace(task.workspace_id)
         if workspace is None:
             raise LookupError(f"Workspace not found: {task.workspace_id}")
+
+        task = self._task_for_execution(task, workspace)
 
         manifest = self._scanner.scan(workspace)
         workspace = Workspace(
@@ -2343,12 +2619,8 @@ class Runtime:
         required_paths = tuple(task.metadata.get("required_paths") or ())
         tool_names = tuple(task.metadata.get("tool_names") or ())
         steps = tuple(task.metadata.get("steps") or ())
-        verification_commands = tuple(
-            task.metadata.get("verification_commands") or ()
-        )
-        read_plan = self._scanner.build_read_plan(
-            workspace, task, required_paths=required_paths
-        )
+        verification_commands = tuple(task.metadata.get("verification_commands") or ())
+        read_plan = self._scanner.build_read_plan(workspace, task, required_paths=required_paths)
         graph = self._graph_builder.build(
             task,
             read_plan,
@@ -2365,9 +2637,10 @@ class Runtime:
         graph = await self._restore_graph(graph)
         recorder = JsonlTrajectoryRecorder(trajectory_path(self._trajectory_dir, task.id))
         executor = self._executor(metadata)
+        previous_skills = self.skills.list()
         pinned_skill = await executor.pin_snapshot(recorder, artifact_snapshot, task.id)
         try:
-            result = await self._orchestrator_for(metadata).execute(
+            result = await (backend or self._orchestrator_for(metadata)).execute(
                 graph,
                 handler=executor.handler(task, workspace, read_plan),
                 recorder=recorder,
@@ -2377,7 +2650,11 @@ class Runtime:
             return result
         finally:
             if pinned_skill is not None:
-                self.skills.unregister(pinned_skill.name)
+                previous = previous_skills.get(pinned_skill.name)
+                if previous is None:
+                    self.skills.unregister(pinned_skill.name)
+                else:
+                    self.skills.register(previous)
 
     async def resume_task(self, task: Task) -> TaskResult:
         """Continue a task parked in WAITING_APPROVAL after a human decision.
@@ -2388,19 +2665,32 @@ class Runtime:
         metadata = self.storage.metadata
         if metadata is None:
             raise RuntimeError("MetadataStore is not configured")
+        authoritative = await metadata.get_task(task.id)
+        if authoritative is None:
+            raise LookupError(f"Task not found: {task.id}")
+        # Callers may retain a pre-approval snapshot. Never compile a resumed
+        # graph from its stale workspace, mode, actor, scope or acceptance data.
+        task = authoritative
+        if task.status in {
+            TaskStatus.COMPLETED, TaskStatus.CANCELLED, TaskStatus.ROLLED_BACK
+        }:
+            return TaskResult(task_id=task.id, status=task.status)
+        if (task.status == TaskStatus.WAITING_RESOURCE
+                and task.metadata.get("replay_stage") == "image_preflight"):
+            raise ValueError("Replay preflight waits require the dedicated recovery entry")
+        isolated_wait = await self._isolated_execution_wait(task)
+        if isolated_wait is not None:
+            return isolated_wait
         workspace = await metadata.get_workspace(task.workspace_id)
         if workspace is None:
             raise LookupError(f"Workspace not found: {task.workspace_id}")
+        task = self._task_for_execution(task, workspace)
         manifest = workspace.manifest or self._scanner.scan(workspace)
         required_paths = tuple(task.metadata.get("required_paths") or ())
         tool_names = tuple(task.metadata.get("tool_names") or ())
         steps = tuple(task.metadata.get("steps") or ())
-        verification_commands = tuple(
-            task.metadata.get("verification_commands") or ()
-        )
-        read_plan = self._scanner.build_read_plan(
-            workspace, task, required_paths=required_paths
-        )
+        verification_commands = tuple(task.metadata.get("verification_commands") or ())
+        read_plan = self._scanner.build_read_plan(workspace, task, required_paths=required_paths)
         graph = self._graph_builder.build(
             task,
             read_plan,
@@ -2433,10 +2723,20 @@ class Runtime:
         so a resumed workflow needs the already-completed statuses here.
         """
         metadata = self._metadata_or_raise()
-        stored = {
-            node.id: node
-            for node in await metadata.list_execution_nodes(graph.task_id)
-        }
+        graph = replace(
+            graph,
+            dispatch_key=(await self._execution_resume_key(graph.task_id)) or json.dumps([[], []]),
+        )
+        stored = {node.id: node for node in await metadata.list_execution_nodes(graph.task_id)}
+        confirmed = []
+        for record in await metadata.list_task_submissions(graph.task_id):
+            result = record.get("result", {})
+            previous = stored.get(result.get("node_id"))
+            if result.get("status") == "waiting_resource" and previous is not None:
+                if previous.status in {NodeStatus.COMPLETED, NodeStatus.SKIPPED}:
+                    confirmed.append(record["id"])
+        if confirmed:
+            graph = replace(graph, dispatch_key=graph.dispatch_key + json.dumps(sorted(confirmed)))
         if not stored:
             return graph
         restored: list[ExecutionNode] = []
@@ -2455,6 +2755,22 @@ class Runtime:
             )
         return replace(graph, nodes=tuple(restored))
 
+    async def _execution_resume_key(self, task_id: str) -> str:
+        """Only persisted decisions may resume a known approval wait."""
+        metadata = self._metadata_or_raise()
+        decisions = sorted(
+            f"{record.id}:{record.decided_at}"
+            for record in await self.list_approvals()
+            if record.task_id == task_id and record.decided_at is not None
+        )
+        proposals = sorted(
+            f"{proposal.id}:"
+            f"{'approved' if proposal.status.value == 'applied' else proposal.status.value}"
+            for proposal in await metadata.list_change_proposals(task_id)
+            if proposal.status.value in {"approved", "applied", "rejected"}
+        )
+        return json.dumps([decisions, proposals]) if decisions or proposals else ""
+
     async def execute_node(self, node: ExecutionNode) -> dict[str, Any]:
         """Run one orchestration node on behalf of an external scheduler.
 
@@ -2467,91 +2783,94 @@ class Runtime:
         task = await metadata.get_task(node.task_id)
         if task is None:
             raise LookupError(f"Task not found: {node.task_id}")
-        workspace = await metadata.get_workspace(task.workspace_id)
-        if workspace is None:
-            raise LookupError(f"Workspace not found: {task.workspace_id}")
-        manifest = workspace.manifest or self._scanner.scan(workspace)
-        workspace = Workspace(
-            id=workspace.id,
-            root=workspace.root,
-            kind=workspace.kind,
-            revision=workspace.revision,
-            manifest=manifest,
-        )
-        read_plan = self._scanner.build_read_plan(workspace, task)
-        executor = self._executor(metadata)
-        recorder = JsonlTrajectoryRecorder(
-            trajectory_path(self._trajectory_dir, task.id)
-        )
-        NodeStateMachine.validate(node.status, NodeStatus.RUNNING)
-        running = replace(node, status=NodeStatus.RUNNING, attempts=node.attempts + 1)
-        await metadata.save_execution_node(running)
-        await recorder.record(
-            TrajectoryEvent(
-                name="node.started",
-                task_id=task.id,
-                payload={"node_id": node.id},
-            )
-        )
-        try:
-            output = await executor.execute_node(node, workspace, read_plan, task)
-        except Exception as exc:
-            failed = replace(
-                node,
-                status=NodeStatus.FAILED,
-                metadata={
-                    **node.metadata,
-                    "error": f"{type(exc).__name__}: {exc}",
-                },
-            )
-            await metadata.save_execution_node(failed)
-            await recorder.record(
-                TrajectoryEvent(
-                    name="node.failed",
-                    task_id=task.id,
-                    payload={"node_id": node.id},
-                )
-            )
-            raise
-        if isinstance(output, dict) and output.get("waiting"):
-            waiting = replace(
-                node,
-                status=NodeStatus.WAITING,
-                metadata={**node.metadata, "output": output},
-            )
-            await metadata.save_execution_node(waiting)
-            await recorder.record(
-                TrajectoryEvent(
-                    name="node.waiting",
-                    task_id=task.id,
-                    payload={"node_id": node.id},
-                )
-            )
+        if task.status in {TaskStatus.CANCELLED, TaskStatus.ROLLED_BACK}:
             return {
                 "node_id": node.id,
                 "type": node.type.value,
-                "status": NodeStatus.WAITING.value,
-                "output": output,
+                "status": "cancelled",
+                "output": {},
             }
-        completed = replace(
-            node,
-            status=NodeStatus.COMPLETED,
-            metadata={**node.metadata, "output": output},
+        workspace = await metadata.get_workspace(task.workspace_id)
+        if workspace is None:
+            raise LookupError(f"Workspace not found: {task.workspace_id}")
+        task = self._task_for_execution(task, workspace)
+        persisted = await metadata.get_execution_node(node.id)
+        if persisted is not None and persisted.task_id == task.id:
+            if persisted.type != node.type:
+                raise ValueError("Execution node type does not match persisted authority")
+            if persisted.status == NodeStatus.COMPLETED:
+                return {
+                    "node_id": persisted.id,
+                    "type": persisted.type.value,
+                    "status": "completed",
+                    "output": dict(persisted.metadata.get("output") or {}),
+                }
+            if persisted.status == NodeStatus.SKIPPED:
+                return {"status": "skipped"}
+        isolated_experiment = task.execution_mode == TaskExecutionMode.CODE and (
+            "replay_plan" in task.metadata or "replay_source_task_id" in task.metadata
         )
-        await metadata.save_execution_node(completed)
-        await recorder.record(
-            TrajectoryEvent(
-                name="node.completed",
-                task_id=task.id,
-                payload={"node_id": node.id},
+        if isolated_experiment and (
+            getattr(self, "_isolated_coding_required", False) is not True
+            or not callable(getattr(self, "_isolated_coding_dispatch", None))
+            or not callable(getattr(self, "_isolated_coding_session_factory", None))
+        ):
+            # Activities bypass submission admission and may run in another
+            # process. Never infer host execution authority from its defaults.
+            # Do not claim the node: no effect was attempted and a commissioned
+            # worker may subsequently accept the same persisted task.
+            return {
+                "node_id": node.id,
+                "type": node.type.value,
+                "status": "waiting_resource",
+                "output": {"waiting": True, "waiting_kind": "resource",
+                           "waiting_reason": "isolated_worker_not_assembled",
+                           "error": "Isolated worker assembly required; no host fallback"},
+            }
+        if task.execution_mode == TaskExecutionMode.READ_ONLY:
+            if node.type not in {NodeType.READ, NodeType.AGENT}:
+                raise ValueError("Read-only tasks cannot execute mutation or verification nodes")
+            if node.type is NodeType.AGENT:
+                node = replace(node, metadata={**node.metadata, "read_only": True})
+        from Sprout.orchestration.execution_guard import NodeExecutionGuard
+
+        recorder = None
+
+        async def execute_owned(running: ExecutionNode):
+            nonlocal recorder
+            manifest = workspace.manifest or self._scanner.scan(workspace)
+            prepared = replace(workspace, manifest=manifest)
+            read_plan = self._scanner.build_read_plan(prepared, task)
+            executor = self._executor(metadata)
+            recorder = JsonlTrajectoryRecorder(trajectory_path(self._trajectory_dir, task.id))
+            await recorder.record(
+                TrajectoryEvent(
+                    name="node.started",
+                    task_id=task.id,
+                    payload={"node_id": running.id},
+                )
             )
+            if (
+                task.execution_mode == TaskExecutionMode.READ_ONLY
+                and running.type == NodeType.AGENT
+            ):
+                running = replace(running, metadata={**running.metadata, "read_only": True})
+            return await executor.execute_node(running, prepared, read_plan, task)
+
+        result = await NodeExecutionGuard(metadata).execute(
+            node,
+            execute_owned,
+            resume_key=await self._execution_resume_key(task.id),
         )
-        return {
-            "node_id": node.id,
-            "type": node.type.value,
-            "status": NodeStatus.COMPLETED.value,
-            "output": output,
-        }
+        if recorder is not None:
+            await recorder.record(
+                TrajectoryEvent(
+                    name="node.completed" if result["status"] == "completed" else "node.waiting",
+                    task_id=task.id,
+                    payload={"node_id": node.id, "output": result.get("output")},
+                )
+            )
+        return result
 
     def list_skills(self) -> dict[str, Skill]:
         return self.skills.list()
@@ -2567,9 +2886,7 @@ class Runtime:
     async def search_knowledge(self, query: str, limit: int = 5) -> list[KnowledgeItem]:
         return list(await self.storage.knowledge.search(query, limit=limit))
 
-    async def list_approvals(
-        self, status: ApprovalStatus | None = None
-    ) -> list[ApprovalRecord]:
+    async def list_approvals(self, status: ApprovalStatus | None = None) -> list[ApprovalRecord]:
         return list(await self.storage.operational.list_approvals(status))
 
     async def pending_approvals(self) -> list[ApprovalRecord]:

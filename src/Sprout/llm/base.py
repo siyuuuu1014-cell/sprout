@@ -11,6 +11,10 @@ if TYPE_CHECKING:
     from Sprout.tools.spec import ToolSpec
 
 
+class ModelBudgetExhausted(RuntimeError):
+    """Explicit call authorization exhausted; never retry, fall back or summarize away."""
+
+
 class ModelProvider(Protocol):
     """A chat-completion backend. Implementations are added as adapters.
 

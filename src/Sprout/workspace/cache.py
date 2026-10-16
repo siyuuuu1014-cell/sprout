@@ -1,10 +1,8 @@
-"""In-memory cache for WorkspaceAnalysis objects with an optional hot lane.
+"""Version-addressed project analysis cache; the authority chooses the version.
 
-The full analysis object stays in memory because it contains graphs and
-knowledge items that do not round-trip through JSON cleanly. When a cache
-store is configured, a compact fingerprint snapshot is mirrored there so a
-later process (or an operator) can see what revision was last analyzed and how
-large the derived data was, without re-scanning.
+There is deliberately no mutable latest-version pointer in the derived lane.
+Delayed writers cannot replace another version. Foreign process mirrors expire
+via TTL; local invalidation removes only the versions this instance knows.
 """
 
 from __future__ import annotations
@@ -12,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from Sprout.workspace.invalidation import snapshot_id
 from Sprout.workspace.serialization import from_jsonable, to_jsonable
 
 if TYPE_CHECKING:
@@ -22,30 +21,48 @@ if TYPE_CHECKING:
 @dataclass(slots=True)
 class WorkspaceAnalysisCache:
     cache_store: CacheStore | None = None
-    key_prefix: str = "sprout:workspace:analysis:"
-    _entries: dict[str, WorkspaceAnalysis] = field(default_factory=dict)
+    ttl_seconds: int = 3600
+    _entries: dict[tuple[str, str], WorkspaceAnalysis] = field(default_factory=dict)
+    _known_versions: dict[str, set[str]] = field(default_factory=dict)
 
-    async def get(self, workspace_id: str) -> WorkspaceAnalysis | None:
-        """Return the cached analysis from memory, or the hot lane, or None."""
-        if workspace_id in self._entries:
-            return self._entries[workspace_id]
-        if self.cache_store is None:
+    async def get(
+        self, workspace_id: str, *, expected_snapshot_id: str | None,
+    ) -> WorkspaceAnalysis | None:
+        """Read only the version selected by ProjectAnalysisStore; failures miss."""
+        if expected_snapshot_id is None:
             return None
-        raw = await self.cache_store.get(self._key(workspace_id))
-        if raw is None:
+        local = self._entries.get((workspace_id, expected_snapshot_id))
+        if local is not None:
+            return local if self._matches(local, workspace_id, expected_snapshot_id) else None
+        if self.cache_store is None:
             return None
         try:
             from Sprout.workspace.intelligence import WorkspaceAnalysis
 
-            return from_jsonable(raw, WorkspaceAnalysis)
+            raw = await self.cache_store.get(self._key(workspace_id, expected_snapshot_id))
+            if not isinstance(raw, dict) or raw.get("snapshot_id") != expected_snapshot_id:
+                return None
+            analysis = from_jsonable(raw["analysis"], WorkspaceAnalysis)
+            if not self._matches(analysis, workspace_id, expected_snapshot_id):
+                return None
+            self.put(workspace_id, analysis)
+            return analysis
         except Exception:  # noqa: BLE001 - a stale/unreadable snapshot is a miss
             return None
 
-    def put(self, workspace_id: str, analysis: WorkspaceAnalysis) -> None:
-        self._entries[workspace_id] = analysis
+    @staticmethod
+    def _matches(analysis: WorkspaceAnalysis, workspace_id: str, version: str) -> bool:
+        return analysis.workspace.id == workspace_id and snapshot_id(analysis) == version
 
-    def _key(self, workspace_id: str) -> str:
-        return f"{self.key_prefix}{workspace_id}"
+    def put(self, workspace_id: str, analysis: WorkspaceAnalysis) -> None:
+        if analysis.workspace.id != workspace_id:
+            raise ValueError("Project cache workspace identity mismatch")
+        version = snapshot_id(analysis)
+        self._entries[(workspace_id, version)] = analysis
+        self._known_versions.setdefault(workspace_id, set()).add(version)
+
+    def _key(self, workspace_id: str, version: str) -> str:
+        return f"project:{workspace_id}:analysis:{version}"
 
     async def persist(
         self,
@@ -55,24 +72,34 @@ class WorkspaceAnalysisCache:
         """Mirror the full analysis snapshot into the hot lane."""
         if self.cache_store is None:
             return
-        await self.cache_store.set(self._key(workspace_id), to_jsonable(analysis))
+        if analysis.workspace.id != workspace_id:
+            raise ValueError("Project cache workspace identity mismatch")
+        version = snapshot_id(analysis)
+        await self.cache_store.set(
+            self._key(workspace_id, version),
+            {"snapshot_id": version, "analysis": to_jsonable(analysis)},
+            ttl_seconds=self.ttl_seconds,
+        )
+        self._known_versions.setdefault(workspace_id, set()).add(version)
 
     async def forget(self, workspace_id: str | None = None) -> None:
         """Drop the hot-lane mirror for one workspace or all workspaces."""
-        if self.cache_store is None:
-            return
-        if workspace_id is None:
-            # The cache-store contract has no scan/clear-all; invalidating the
-            # in-memory map already covers the current process, and the hot
-            # mirrors are keyed so stale entries are simply overwritten later.
-            return
-        await self.cache_store.delete(self._key(workspace_id))
+        self.invalidate(workspace_id)
+        targets = (list(self._known_versions) if workspace_id is None else [workspace_id])
+        for target in targets:
+            versions = self._known_versions.get(target, set())
+            if self.cache_store is not None:
+                for version in tuple(versions):
+                    await self.cache_store.delete(self._key(target, version))
+            self._known_versions.pop(target, None)
 
     def invalidate(self, workspace_id: str | None = None) -> None:
         if workspace_id is None:
             self._entries.clear()
             return
-        self._entries.pop(workspace_id, None)
+        for key in tuple(self._entries):
+            if key[0] == workspace_id:
+                self._entries.pop(key, None)
 
 
 __all__ = ["WorkspaceAnalysisCache"]

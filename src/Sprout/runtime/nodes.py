@@ -7,18 +7,34 @@ closure, so the graph runner never sees brokers, prompts, or output clamping
 
 from __future__ import annotations
 
+import json
 import shutil
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
 from Sprout.agent.router import AgentRouter
 from Sprout.artifacts.models import ArtifactKind
 from Sprout.context.builder import ContextBuilder
+from Sprout.execution.acceptance import (
+    acceptance_commands,
+    acceptance_demo_path,
+    acceptance_test_path,
+    render_acceptance_demo,
+    render_acceptance_tests,
+)
 from Sprout.execution.apply import ApplyBroker
 from Sprout.execution.change import ChangeProposalBuilder
+from Sprout.execution.coding_command_tool import IsolatedCodingCommandTool
 from Sprout.execution.file_broker import FileBroker
+from Sprout.execution.isolated_auxiliary import auxiliary_commands
+from Sprout.execution.isolated_model_tools import (
+    IsolatedModelPathGuard,
+    IsolatedModelTool,
+    public_acceptance,
+)
 from Sprout.execution.models import (
     ChangeProposalStatus,
     ProcessResult,
@@ -35,13 +51,22 @@ from Sprout.execution.sandbox_tool import (
     SandboxSearchTool,
     SandboxWriteTool,
 )
+from Sprout.execution.verification import (
+    build_verification_report,
+    classify_verification_command,
+    proposal_verification_blocker,
+)
 from Sprout.llm.language import detect_language
 from Sprout.message.models import Message
 from Sprout.orchestration.models import ExecutionNode, NodeType
 from Sprout.sandbox.git_worktree import GitWorktreeSandbox
+from Sprout.sandbox.isolated_git_worktree import IsolatedGitWorktreeSandbox
 from Sprout.skills.models import Skill
 from Sprout.skills.registry import SkillRegistry
+from Sprout.skills.tools import SkillViewTool
 from Sprout.storage.contracts.metadata import MetadataStore
+from Sprout.strategy.acceptance import AcceptanceSpec, acceptance_prompt
+from Sprout.strategy.model_planner import ModelStrategyPlanner
 from Sprout.task.models import Task
 from Sprout.tools.registry import ToolRegistry
 from Sprout.trajectory.models import ArtifactSnapshot, TrajectoryEvent
@@ -143,6 +168,10 @@ class NodeExecutor:
         process_broker: ProcessBroker,
         apply_broker: ApplyBroker,
         changes: Any | None = None,
+        coding_dispatch=None,
+        isolated_coding_required: bool = False,
+        coding_session_factory=None,
+        coding_commands=None,
     ) -> None:
         self._metadata = metadata
         self._router = router
@@ -154,6 +183,10 @@ class NodeExecutor:
         self._process_broker = process_broker
         self._apply_broker = apply_broker
         self._changes = changes
+        self._coding_dispatch = coding_dispatch
+        self._isolated_coding_required = isolated_coding_required
+        self._coding_session_factory = coding_session_factory
+        self._coding_commands = coding_commands
         self._change_builder = ChangeProposalBuilder()
 
     def handler(
@@ -173,11 +206,20 @@ class NodeExecutor:
         read_plan: ReadPlan,
         task: Task,
     ) -> Any:
+        """Bind the persistent task allowance across planning and coding nodes."""
+        from Sprout.llm.task_budget import task_model_budget
+
+        with task_model_budget(self._metadata, task.id, node.id, task.budget.max_model_calls):
+            return await self._execute_node(node, workspace, read_plan, task)
+
+    async def _execute_node(self, node, workspace, read_plan, task):
         """Run one node and return its persisted output."""
         if node.type is NodeType.READ:
             return await self._read(workspace, read_plan, task)
         if node.type is NodeType.PLAN:
             return await self._plan(node, workspace, task)
+        if node.type is NodeType.TEST_DESIGN:
+            return await self._test_design(node, workspace, task)
         if node.type is NodeType.SUBTASK:
             return await self._subtask(node, workspace, task)
         if node.type is NodeType.AGENT:
@@ -204,6 +246,11 @@ class NodeExecutor:
         artifact = await self._metadata.get_artifact(artifact_snapshot.artifact_id)
         if artifact is None or artifact.version != artifact_snapshot.artifact_version:
             return None
+        if (
+            artifact_snapshot.content_hash is not None
+            and sha256(artifact.content.encode()).hexdigest() != artifact_snapshot.content_hash
+        ):
+            raise ValueError("Pinned artifact content does not match snapshot")
         await recorder.record(
             TrajectoryEvent(
                 name="artifact.pinned",
@@ -215,6 +262,12 @@ class NodeExecutor:
             )
         )
         if artifact.kind is not ArtifactKind.SKILL:
+            return None
+        existing = self._skills.list().get(artifact.name)
+        if (existing is not None and existing.version == artifact.version
+                and existing.instructions == artifact.content):
+            # Reuse the exact loaded skill, including trust, tool requirements
+            # and activation state. No temporary registration needs cleanup.
             return None
         pinned = Skill(
             name=artifact.name,
@@ -248,6 +301,12 @@ class NodeExecutor:
     async def _agent(
         self, node: ExecutionNode, workspace: Workspace, task: Task
     ) -> dict:
+        if node.metadata.get("read_only"):
+            result = await self._plan(
+                node, workspace, task,
+                prompt="Analyze the project without modifying any files.\n" + task.instruction,
+            )
+            return {"content": result["plan"], "read_only": True}
         nodes = await self._metadata.list_execution_nodes(task.id)
         sandbox_tools: list = []
         sandbox_ref = self._sandbox_ref_from(self._output_for(nodes, NodeType.SANDBOX))
@@ -276,10 +335,12 @@ class NodeExecutor:
                     self._file_broker,
                     scope=task.delegation_scope,
                     task_id=task.id,
+                    source=task.source, requested_by=task.actor.user_id,
                 ),
                 "sandbox_list_files": SandboxListTool(sandbox_ref),
                 "sandbox_search": SandboxSearchTool(sandbox_ref),
-                "sandbox_git_inspect": SandboxGitTool(sandbox_ref),
+                "sandbox_git_inspect": SandboxGitTool(
+                    sandbox_ref, allow_host_git=not self._isolated_coding_required),
             }
             tool_names = set(node.metadata.get("tool_names") or ())
             sandbox_tools = (
@@ -292,7 +353,25 @@ class NodeExecutor:
                 else list(available_tools.values())
             )
         resources = self._resources(self._output_for(nodes, NodeType.READ), workspace)
+        sandbox_tools, resources = self._model_access(task, sandbox_ref, sandbox_tools, resources)
+        if (self._isolated_coding_required and sandbox_ref is not None
+                and callable(getattr(getattr(self, "_coding_commands", None), "execute", None))):
+            allowed = set(node.metadata.get("tool_names") or ())
+            if not allowed or "isolated_coding_command" in allowed:
+                sandbox_tools.append(IsolatedCodingCommandTool(
+                    self._coding_commands, task=task, node=node, sandbox=sandbox_ref))
         feedback = self._previous_evaluation_feedback(node, nodes)
+        node_skills = {}
+        allowed = set(node.metadata.get("tool_names") or ())
+        if (self._isolated_coding_required and sandbox_ref is not None
+                and (not allowed or "skill_view" in allowed)):
+            registry = getattr(self, "_skills", None)
+            node_skills = {name: replace(skill, origin="")
+                for name, skill in (registry.list() if registry is not None else {}).items()
+                if skill.enabled and skill.trust == "trusted"}
+            if node_skills:
+                # Node-local frozen bodies, not a global tool or host file reader.
+                sandbox_tools.append(SkillViewTool(node_skills))
         plan_output = self._output_for(nodes, NodeType.PLAN)
         plan = (
             str(plan_output.get("plan", ""))
@@ -300,6 +379,17 @@ class NodeExecutor:
             else ""
         )
         findings = self._subtask_findings(nodes)
+        design = self._output_for(nodes, NodeType.TEST_DESIGN)
+        if isinstance(design, dict):
+            visible_spec = (public_acceptance(design.get("acceptance_spec"))
+                            if self._isolated_coding_required else design.get("acceptance_spec"))
+            plan += (
+                "\nFrozen requirement tests (do not modify these tests):\n"
+                + json.dumps(visible_spec, ensure_ascii=False)
+                + ("\nHost-owned isolated JSON checks; expected outputs are withheld."
+                   if self._isolated_coding_required
+                   else "\nTest file: " + str(design.get("test_path")))
+            )
         if self._router is None:
             raise RuntimeError("No agent router configured")
         message = Message(
@@ -324,10 +414,14 @@ class NodeExecutor:
             user_id=task.actor.user_id,
             node_id=node.id,
             tools={tool.spec.name: tool for tool in sandbox_tools},
+            skills=node_skills,
             files=tuple(item["path"] for item in resources),
             metadata={
                 "task_id": task.id,
                 "resources": tuple(resources),
+                "resume_tool_calls": (node.metadata.get("output") or {}).get(
+                    "pending_tool_calls", (),
+                ),
                 "task_budget": {
                     "max_model_calls": task.budget.max_model_calls,
                     "max_tool_calls": task.budget.max_tool_calls,
@@ -344,10 +438,14 @@ class NodeExecutor:
             "content": result.content[:_NODE_OUTPUT_LIMIT],
             "node_id": node.id,
             "resources": [item["path"] for item in resources],
+            "waiting": bool(result.metadata.get("approval_required")),
+            "pending_approvals": list(result.metadata.get("approval_ids") or ()),
+            "pending_tool_calls": list(result.metadata.get("pending_tool_calls") or ()),
         }
 
     async def _plan(
-        self, node: ExecutionNode, workspace: Workspace, task: Task
+        self, node: ExecutionNode, workspace: Workspace, task: Task,
+        *, prompt: str | None = None,
     ) -> dict:
         """Run a read-only planning pass before the first edit round."""
         nodes = await self._metadata.list_execution_nodes(task.id)
@@ -363,13 +461,14 @@ class NodeExecutor:
                 ),
                 SandboxListTool(sandbox_ref),
                 SandboxSearchTool(sandbox_ref),
-                SandboxGitTool(sandbox_ref),
+                SandboxGitTool(sandbox_ref, allow_host_git=not self._isolated_coding_required),
             ]
         resources = self._resources(self._output_for(nodes, NodeType.READ), workspace)
+        plan_tools, resources = self._model_access(task, sandbox_ref, plan_tools, resources)
         if self._router is None:
             raise RuntimeError("No agent router configured")
         message = Message(
-            content=self._plan_prompt(task, workspace, resources),
+            content=prompt or self._plan_prompt(task, workspace, resources),
             channel="task",
             user_id=task.actor.user_id,
             metadata={
@@ -393,6 +492,84 @@ class NodeExecutor:
         return {
             "plan": result.content[:_NODE_OUTPUT_LIMIT],
             "node_id": node.id,
+        }
+
+    async def _test_design(
+        self, node: ExecutionNode, workspace: Workspace, task: Task,
+    ) -> dict:
+        """Freeze concrete input/output tests and record pre-change results."""
+        nodes = await self._metadata.list_execution_nodes(task.id)
+        sandbox = self._sandbox_ref_from(self._output_for(nodes, NodeType.SANDBOX))
+        if sandbox is None:
+            raise RuntimeError("Acceptance tests require an isolated Git worktree")
+        previous = node.metadata.get("output") or {}
+        if self._isolated_coding_required:
+            payload = task.metadata.get("acceptance_spec")
+            if payload is None:
+                return {"waiting": True, "waiting_kind": "configuration",
+                        "reason": "frozen_source_acceptance_required"}
+            spec = AcceptanceSpec.from_payload(payload)
+            fingerprint = sha256(json.dumps(spec.to_payload(), sort_keys=True).encode()).hexdigest()
+            if (previous.get("acceptance_fingerprint")
+                    and previous["acceptance_fingerprint"] != fingerprint):
+                raise RuntimeError("Frozen source acceptance changed")
+            if self._coding_session_factory is None:
+                return {"waiting": True, "waiting_kind": "configuration",
+                        "reason": "isolated_session_not_assembled",
+                        "acceptance_spec": spec.to_payload(), "acceptance_fingerprint": fingerprint}
+            session = self._coding_session_factory(task=task, node=node, sandbox=sandbox)
+            measured = await session.verify(acceptance_spec=spec.to_payload(),
+                                            regression_spec=None, phase="baseline")
+            return {**measured, "isolated_design": True, "acceptance_spec": spec.to_payload(),
+                    "acceptance_fingerprint": fingerprint, "baseline": measured.get("results", []),
+                    "baseline_failed": measured.get("status") == "failed"}
+        payload = previous.get("acceptance_spec")
+        if payload is None:
+            resources = self._resources(self._output_for(nodes, NodeType.READ), workspace)
+            prompt = acceptance_prompt(task.instruction) + "\nProject evidence:\n" + json.dumps(
+                resources, ensure_ascii=False,
+            )
+            planned = await self._plan(node, workspace, task, prompt=prompt)
+            payload = ModelStrategyPlanner._parse_json(planned["plan"])
+        spec = AcceptanceSpec.from_payload(payload)
+        path = acceptance_test_path(task.id)
+        source = render_acceptance_tests(spec)
+        written = await self._file_broker.write_text(
+            sandbox, path, source, task_id=task.id, scope=task.delegation_scope,
+        )
+        if not written.wrote:
+            raise RuntimeError(f"Cannot write acceptance tests: {written.reason}")
+        demo_path = acceptance_demo_path(task.id)
+        demo_source = render_acceptance_demo(spec)
+        demo_written = await self._file_broker.write_text(
+            sandbox, demo_path, demo_source, task_id=task.id, scope=task.delegation_scope,
+        )
+        if not demo_written.wrote:
+            raise RuntimeError(f"Cannot write minimal demo: {demo_written.reason}")
+        baseline = []
+        pending = []
+        for index, (case, command) in enumerate(zip(
+            spec.cases, acceptance_commands(spec, path), strict=True
+        )):
+            outcome = await self._run_verification_command(
+                workspace, command, sandbox.root, task, 1,
+                node=node, command_slot=f"baseline-{index}",
+            )
+            if outcome.needs_approval:
+                pending.append(outcome.approval_id)
+            elif not outcome.allowed:
+                raise RuntimeError(f"Acceptance baseline was denied: {outcome.error}")
+            baseline.append({
+                "case_id": case.id, "exit_code": outcome.exit_code,
+                "executed": outcome.allowed,
+                "output": _clamp_test_output(outcome.stdout, outcome.stderr, outcome.error),
+            })
+        return {
+            "acceptance_spec": spec.to_payload(), "test_path": path,
+            "test_hash": sha256(source.encode()).hexdigest(), "baseline": baseline,
+            "demo_path": demo_path, "demo_hash": sha256(demo_source.encode()).hexdigest(),
+            "baseline_failed": any(item["exit_code"] == 1 for item in baseline),
+            "waiting": bool(pending), "pending_approvals": pending,
         }
 
     async def _subtask(
@@ -422,7 +599,7 @@ class NodeExecutor:
                 ),
                 SandboxListTool(sandbox_ref),
                 SandboxSearchTool(sandbox_ref),
-                SandboxGitTool(sandbox_ref),
+                SandboxGitTool(sandbox_ref, allow_host_git=not self._isolated_coding_required),
             ]
 
         # Prefer the step's own target files; fall back to the task's read plan
@@ -441,6 +618,7 @@ class NodeExecutor:
         else:
             resources = all_resources
 
+        tools, resources = self._model_access(task, sandbox_ref, tools, resources)
         if self._router is None:
             raise RuntimeError("No agent router configured")
         message = Message(
@@ -473,13 +651,24 @@ class NodeExecutor:
             "findings": result.content[:_NODE_OUTPUT_LIMIT],
         }
 
+    def _model_access(self, task, sandbox, tools, resources):
+        if not self._isolated_coding_required:
+            return tools, resources
+        if sandbox is None:
+            raise ValueError("Isolated model tools require a managed sandbox")
+        guard = IsolatedModelPathGuard(sandbox, task)
+        return ([IsolatedModelTool(tool, guard) for tool in tools],
+                tuple(item for item in resources if guard.allows(item["path"])))
+
     async def _sandbox(self, workspace: Workspace) -> dict:
         if workspace.kind is not WorkspaceKind.GIT_REPOSITORY:
             return {
                 "status": "not_applicable",
                 "reason": "workspace is not a Git repository",
             }
-        ref = await GitWorktreeSandbox(workspace).create()
+        provider = (IsolatedGitWorktreeSandbox if self._isolated_coding_required
+                    else GitWorktreeSandbox)
+        ref = await provider(workspace).create()
         return {
             "id": ref.id,
             "kind": ref.kind,
@@ -500,6 +689,54 @@ class NodeExecutor:
         nodes = await self._metadata.list_execution_nodes(task.id)
         sandbox_ref = self._sandbox_ref_from(self._output_for(nodes, NodeType.SANDBOX))
         cwd = sandbox_ref.root if sandbox_ref is not None else workspace.root
+        if self._isolated_coding_required:
+            if self._coding_session_factory is None or sandbox_ref is None:
+                return {"waiting": True, "waiting_kind": "configuration",
+                        "reason": "isolated_session_not_assembled", "status": "unverified"}
+            session = self._coding_session_factory(task=task, node=node, sandbox=sandbox_ref)
+            has_auxiliary = any(node.metadata.get(key) for key in
+                   ("test_commands", "build_commands", "verification_commands"))
+            if has_auxiliary and not callable(getattr(session, "verify_auxiliary", None)):
+                return {"waiting": True, "waiting_kind": "configuration",
+                        "reason": "isolated_auxiliary_checks_adapter_required",
+                        "status": "unverified"}
+            auxiliary_commands(node.metadata)  # Reject malformed empty declarations too.
+            design = self._output_for(nodes, NodeType.TEST_DESIGN)
+            if not isinstance(design, dict):
+                raise RuntimeError("Frozen isolated acceptance design missing")
+            if design.get("isolated_design") is not True:
+                return {"waiting": True, "waiting_kind": "configuration",
+                        "reason": "isolated_design_protocol_required", "status": "unverified"}
+            pinned = AcceptanceSpec.from_payload(task.metadata.get("acceptance_spec")).to_payload()
+            fingerprint = sha256(json.dumps(pinned, sort_keys=True).encode()).hexdigest()
+            if (design.get("acceptance_spec") != pinned
+                    or design.get("acceptance_fingerprint") != fingerprint):
+                raise RuntimeError("Frozen isolated acceptance design changed")
+            regression_spec = getattr(session, "regression_spec", None)
+            auxiliary = None
+            if callable(getattr(session, "verify_auxiliary", None)):
+                if regression_spec is None:
+                    return {"waiting": True, "waiting_kind": "configuration",
+                            "reason": "frozen_regression_spec_required", "verified": False}
+                auxiliary = await session.verify_auxiliary(node.metadata)
+                if auxiliary.get("waiting"):
+                    return auxiliary
+            measured = await session.verify(acceptance_spec=design["acceptance_spec"],
+                                            regression_spec=regression_spec, phase="evaluation")
+            if not measured.get("waiting"):
+                if auxiliary is not None:
+                    measured = dict(measured)
+                    measured["results"] = [*measured.get("results", []),
+                                           *auxiliary.get("results", [])]
+                    measured["test_results"] = [*measured.get("test_results", []),
+                                                *auxiliary.get("test_results", [])]
+                    measured["verified"] = (measured.get("verified") is True
+                                            and auxiliary.get("verified") is True)
+                    if auxiliary.get("status") != "passed":
+                        measured["status"] = "failed"
+                measured["verification_report"] = build_verification_report(
+                    self._test_results_from(measured), measured).to_payload()
+            return measured
 
         planned: list[tuple[str, tuple[str, ...]]] = [
             ("test", tuple(str(command).split()))
@@ -520,6 +757,32 @@ class NodeExecutor:
                 continue
             planned.append((str(item.get("kind") or "acceptance"), tuple(command.split())))
         planned.extend(await self._static_check_commands(workspace, sandbox_ref))
+        design = self._output_for(nodes, NodeType.TEST_DESIGN)
+        acceptance_spec = None
+        if isinstance(design, dict):
+            acceptance_spec = AcceptanceSpec.from_payload(design.get("acceptance_spec"))
+            test_path = str(design["test_path"])
+            read = await self._file_broker.read_text(
+                sandbox_ref, test_path, task_id=task.id, scope=task.delegation_scope,
+            )
+            if not read.wrote or sha256(read.content.encode()).hexdigest() != design["test_hash"]:
+                raise RuntimeError("Frozen acceptance tests were removed or modified")
+            demo_path = str(design["demo_path"])
+            demo = await self._file_broker.read_text(
+                sandbox_ref, demo_path, task_id=task.id, scope=task.delegation_scope,
+            )
+            if not demo.wrote or sha256(demo.content.encode()).hexdigest() != design["demo_hash"]:
+                raise RuntimeError("Frozen minimal demo was removed or modified")
+            planned.extend(
+                (f"acceptance:{case.id}", command)
+                for case, command in zip(
+                    acceptance_spec.cases, acceptance_commands(acceptance_spec, test_path),
+                    strict=True,
+                )
+            )
+            planned.append(("poc", ("python", demo_path)))
+        elif task.metadata.get("require_acceptance_tests"):
+            raise RuntimeError("Requirement acceptance tests are missing")
         if not planned:
             planned = self._fallback_verification(workspace)
         attempts = max(1, int(node.metadata.get("verification_attempts", 1)))
@@ -529,13 +792,15 @@ class NodeExecutor:
         failed: list[str] = []
         withheld: list[str] = []
         pending_approvals: list[str] = []
-        for kind, parts in planned:
+        for index, (kind, parts) in enumerate(planned):
             if not parts:
                 continue
             outcome = await self._run_verification_command(
-                workspace, parts, cwd, task, attempts
+                workspace, parts, cwd, task, attempts,
+                node=node, command_slot=f"evaluation-{index}",
             )
-            passed = outcome.allowed and outcome.exit_code == 0
+            command_outcome = classify_verification_command(outcome)
+            passed = command_outcome == "passed"
             name = f"{kind}: {' '.join(parts)}"
             test_results.append(
                 TestResult(
@@ -553,6 +818,9 @@ class NodeExecutor:
             records.append(
                 {
                     "kind": kind,
+                    "name": name,
+                    "outcome": command_outcome,
+                    "cwd": str(cwd),
                     "command": list(parts),
                     "exit_code": outcome.exit_code,
                     "allowed": outcome.allowed,
@@ -577,7 +845,7 @@ class NodeExecutor:
             failed=len(failed),
             withheld=len(withheld),
         )
-        return {
+        output = {
             "test_commands": [
                 " ".join(command) for kind, command in planned if kind == "test"
             ],
@@ -592,6 +860,9 @@ class NodeExecutor:
             "results": records,
             "test_results": [_test_result_payload(item) for item in test_results],
             "status": status,
+            "acceptance_spec": acceptance_spec.to_payload() if acceptance_spec else None,
+            "baseline": design.get("baseline") if isinstance(design, dict) else None,
+            "demo_path": design.get("demo_path") if isinstance(design, dict) else None,
             "failed_commands": failed,
             # Carried separately so an approver can tell "this failed" from
             # "nobody checked": the two need different decisions.
@@ -604,6 +875,10 @@ class NodeExecutor:
             "waiting": bool(pending_approvals),
             "pending_approvals": list(dict.fromkeys(pending_approvals)),
         }
+        output["verification_report"] = build_verification_report(
+            test_results, output,
+        ).to_payload()
+        return output
 
     async def _run_verification_command(
         self,
@@ -612,8 +887,16 @@ class NodeExecutor:
         cwd: Path,
         task: Task,
         attempts: int,
+        *, node: ExecutionNode | None = None, command_slot: str = "",
     ) -> ProcessResult:
         """Run one verification command, retrying transient failures."""
+        if self._isolated_coding_required:
+            if node is None or not command_slot:
+                raise RuntimeError("Isolated command identity unavailable")
+            if self._coding_dispatch is None:
+                raise RuntimeError("Isolated coding backend not ready; no host fallback")
+            return await self._coding_dispatch(
+                task=task, node=node, command=parts, cwd=cwd, command_slot=command_slot)
         outcome = None
         for attempt in range(attempts):
             outcome = await self._process_broker.run(
@@ -649,7 +932,8 @@ class NodeExecutor:
         languages = set(manifest.detected_languages) if manifest is not None else set()
         commands: list[tuple[str, tuple[str, ...]]] = []
 
-        python_files = tuple(path for path in changed if path.endswith(".py"))
+        python_files = tuple(path for path in changed
+                             if path.endswith(".py") and (sandbox_ref.root / path).is_file())
         if python_files:
             commands.append(("check", ("python", "-m", "compileall", "-q", *python_files)))
             if shutil.which("ruff"):
@@ -712,7 +996,9 @@ class NodeExecutor:
         diffs = []
         files_changed: tuple[str, ...] = ()
         if sandbox_ref is not None:
-            sandbox = GitWorktreeSandbox(workspace)
+            provider = (IsolatedGitWorktreeSandbox if self._isolated_coding_required
+                        else GitWorktreeSandbox)
+            sandbox = provider(workspace)
             diff = await sandbox.diff(sandbox_ref)
             if diff.diff_text:
                 diffs.append(diff)
@@ -760,6 +1046,9 @@ class NodeExecutor:
                 # An approver must be able to tell "this passed", "this failed"
                 # and "nobody checked" apart — they are different decisions.
                 "verification": {
+                    # Every authored change needs requirement evidence, even
+                    # when a legacy/direct task omitted the design marker.
+                    "acceptance_required": True,
                     "status": (
                         evaluation.get("status")
                         if isinstance(evaluation, dict)
@@ -767,6 +1056,10 @@ class NodeExecutor:
                     ),
                     "failed_commands": failed,
                     "unverified_commands": unverified,
+                    **({key: evaluation.get(key) for key in (
+                        "acceptance_spec", "baseline", "demo_path", "results", "cwd",
+                        "verification_report",
+                    )} if isinstance(evaluation, dict) else {}),
                 },
             },
         )
@@ -785,16 +1078,31 @@ class NodeExecutor:
         }
 
     async def _apply(self, workspace: Workspace, task: Task) -> dict:
+        if self._isolated_coding_required:
+            return {"waiting": True, "waiting_kind": "configuration",
+                    "reason": "isolated_apply_adapter_required", "applied": False}
         proposals = await self._metadata.list_change_proposals(task.id)
         if not proposals:
+            if task.metadata.get("require_acceptance_tests"):
+                raise RuntimeError("Coding task produced no verified change proposal")
             return {"status": "no_change_proposal"}
         proposal = proposals[0]
+        if proposal.status is ChangeProposalStatus.APPLIED:
+            if proposal.metadata.get("verification_override"):
+                raise RuntimeError("Change was force-applied; the task is not verified")
+            blocker = proposal_verification_blocker(proposal)
+            if blocker:
+                raise RuntimeError(blocker)
+            return {"proposal_id": proposal.id, "applied": True, "already_applied": True}
         if proposal.status is not ChangeProposalStatus.APPROVED:
             return {
                 "proposal_id": proposal.id,
                 "status": proposal.status.value,
                 "waiting": True,
             }
+        blocker = proposal_verification_blocker(proposal)
+        if blocker:
+            raise RuntimeError(blocker)
         if self._changes is not None:
             result = await self._changes.apply(proposal.id)
         else:
@@ -940,6 +1248,10 @@ class NodeExecutor:
     ) -> str:
         """Compose the node-level instruction: task plus only its own resources."""
         lines = [task.instruction]
+        lines.extend(["", "Use the resource contents and planning findings supplied below first. "
+            "Avoid listing or rereading unchanged files already shown in full; read again when "
+            "content is missing, truncated, or freshness matters. Proceed with the requested "
+            "implementation rather than asking whether to execute the plan."])
         lines.extend(
             [
                 "",
@@ -1012,6 +1324,9 @@ class NodeExecutor:
             "Produce a concrete implementation plan for the task below.",
             "Do not modify files yet. Inspect the allowed resources if needed, "
             "then list the exact files, symbols, and edits you intend to make.",
+            "Use supplied resource contents first; do not reread unchanged files shown in full. "
+            "Read when content is missing, truncated, or freshness matters. Keep the plan concise "
+            "and do not ask whether to proceed: the execution step follows this planning step.",
             "",
             "Task:",
             task.instruction,

@@ -22,6 +22,7 @@ class DelegationGateway:
         workspace_id: str,
         caller_id: str,
         scope: DelegationScope,
+        execution_mode: str = "code",
     ) -> GatewayResponse:
         return await self._gateway.execute(
             GatewayRequest(
@@ -29,6 +30,7 @@ class DelegationGateway:
                 instruction=instruction,
                 caller=Principal(user_id=caller_id),
                 workspace_id=workspace_id,
+                execution_mode=execution_mode,
                 delegation_scope=scope,
             )
         )

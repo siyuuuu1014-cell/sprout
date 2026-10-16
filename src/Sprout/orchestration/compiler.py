@@ -48,6 +48,20 @@ class ExecutionGraphBuilder:
                 "resources": [ref.path for ref in read_plan.resources],
             },
         )
+        if task.metadata.get("execution_mode") == "read_only":
+            analysis_node = ExecutionNode(
+                id=f"{task.id}:agent",
+                task_id=task.id,
+                type=NodeType.AGENT,
+                dependencies=(read_id,),
+                metadata={"read_only": True},
+                budget=NodeBudget(
+                    max_attempts=agent_max_attempts, timeout_seconds=agent_timeout_seconds
+                ),
+            )
+            return ExecutionGraph(
+                task_id=task.id, nodes=(read_node, analysis_node), entry_node_ids=(read_id,)
+            )
         sandbox_node = ExecutionNode(
             id=sandbox_id,
             task_id=task.id,
@@ -88,14 +102,22 @@ class ExecutionGraphBuilder:
         # evaluation output and can repair a failing change before approval.
         loops = max(1, verify_loops)
         nodes: list[ExecutionNode] = [read_node, sandbox_node, plan_node, *subtask_nodes]
+        test_design_id = None
+        if task.metadata.get("require_acceptance_tests"):
+            test_design_id = f"{task.id}:test_design"
+            nodes.append(
+                ExecutionNode(
+                    id=test_design_id,
+                    task_id=task.id,
+                    type=NodeType.TEST_DESIGN,
+                    dependencies=subtask_ids or (plan_id,),
+                    budget=NodeBudget(max_attempts=1, timeout_seconds=evaluation_timeout_seconds),
+                )
+            )
         previous_evaluation_id: str | None = None
         for index in range(loops):
             agent_id = f"{task.id}:agent" if index == 0 else f"{task.id}:agent:{index}"
-            verify_id = (
-                f"{task.id}:evaluation"
-                if index == 0
-                else f"{task.id}:evaluation:{index}"
-            )
+            verify_id = f"{task.id}:evaluation" if index == 0 else f"{task.id}:evaluation:{index}"
             agent_metadata: dict[str, object] = {"instruction": task.instruction}
             if previous_evaluation_id is not None:
                 agent_metadata["previous_evaluation_node_id"] = previous_evaluation_id
@@ -106,6 +128,8 @@ class ExecutionGraphBuilder:
             # previous evaluation so they can repair a failed change instead.
             if previous_evaluation_id is not None:
                 agent_dependencies: tuple[str, ...] = (previous_evaluation_id,)
+            elif test_design_id is not None:
+                agent_dependencies = (test_design_id,)
             elif subtask_ids:
                 agent_dependencies = subtask_ids
             else:
@@ -206,9 +230,7 @@ class ExecutionGraphBuilder:
                         "index": index,
                         "description": description,
                         "kind": str(step.get("kind") or "other"),
-                        "target_paths": [
-                            str(path) for path in step.get("target_paths") or ()
-                        ],
+                        "target_paths": [str(path) for path in step.get("target_paths") or ()],
                         "acceptance": str(step.get("acceptance") or ""),
                     },
                     budget=NodeBudget(

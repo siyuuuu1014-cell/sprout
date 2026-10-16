@@ -29,6 +29,7 @@ from Sprout.runtime.factory import create_runtime
 from Sprout.tests.fake_model import FakeModel
 
 REQUIREMENT = "给 user 模块加一个导出 CSV 的函数"
+VALID_EXPORT = "def export_users(users):\n    return 'id\\n1\\n' if users else ''\n"
 
 
 def _repo(tmp_path: Path, *, gitignore: bool = True) -> Path:
@@ -102,6 +103,7 @@ def _runtime(tmp_path: Path, model: FakeModel):
     settings.storage.session = f"sqlite:///{db}"
     settings.storage.trajectory_dir = str(tmp_path / "traj")
     settings.storage.blobs_dir = str(tmp_path / "blobs")
+    settings.storage.project_root = str(tmp_path / "projects")
     settings.security.audit.path = str(tmp_path / "audit.jsonl")
     runtime = create_runtime(settings)
 
@@ -127,6 +129,87 @@ def _commit_count(repo: Path) -> int:
         text=True,
     )
     return int(out.stdout.strip())
+
+
+@pytest.mark.parametrize("decision", ["approve", "reject", "cancel"])
+@pytest.mark.parametrize("mutation", ["delete", "rename"])
+def test_delete_approval_survives_restart_and_controls_commit(tmp_path, decision, mutation):
+    from Sprout.llm.messages import LLMResponse, ToolCall
+
+    class DeletingModel(FakeModel):
+        deleted = False
+
+        async def chat(self, messages, *, tools=()):
+            response = await super().chat(messages, tools=tools)
+            if not response.tool_calls and not self.deleted and any(
+                tool.name == "sandbox_apply_patch" for tool in tools
+            ):
+                self.deleted = True
+                return LLMResponse(content=None, tool_calls=(ToolCall(
+                    id="delete-file", name="sandbox_apply_patch", arguments={
+                        "patch": (
+                            "--- a/obsolete.py\n+++ /dev/null\n@@ -1 +0,0 @@\n-value = 1\n"
+                            if mutation == "delete" else "diff --git a/obsolete.py b/renamed.py\n"
+                            "similarity index 100%\nrename from obsolete.py\nrename to renamed.py\n"
+                        ),
+                    },
+                ),), finish_reason="tool_use", model=self.name)
+            return response
+
+    repo = _repo(tmp_path)
+    obsolete = repo / "obsolete.py"
+    obsolete.write_text("value = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "obsolete.py"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-qm", "add obsolete"], cwd=repo,
+                   check=True, capture_output=True)
+    before = _commit_count(repo)
+    model = DeletingModel(edits={"src/export.py": VALID_EXPORT})
+
+    async def run():
+        runtime = _runtime(tmp_path, model)
+        workspace = await runtime.open_workspace(repo)
+        gateway = ProjectGateway(runtime, transport="cli", default_user="operator")
+        task = await gateway.create_task(workspace.id, REQUIREMENT)
+        await runtime.execute(task)
+        deletion = None
+        for _ in range(8):
+            pending = [item for item in await runtime._approvals.pending()
+                       if item.task_id == task.id]
+            deletion = next((item for item in pending if item.tool == "file_delete"), None)
+            if deletion:
+                break
+            assert pending, "Task did not reach its deletion approval"
+            for item in pending:
+                await runtime.decide_approval(item.id, True, decided_by="operator")
+        assert deletion is not None
+        assert obsolete.exists() and _commit_count(repo) == before
+        await runtime.stop()
+        restarted = _runtime(tmp_path, model)
+        try:
+            restored = await restarted.get_task(task.id)
+            assert restored.status.value == "waiting_approval"
+            if decision == "cancel":
+                final = await restarted.cancel_task(task.id)
+            elif decision == "reject":
+                await restarted.decide_approval(deletion.id, False, decided_by="operator")
+                final = await restarted.get_task(task.id)
+            else:
+                await restarted.decide_approval(deletion.id, True, decided_by="operator")
+                final = await _drive(restarted, await restarted.get_task(task.id))
+            return final
+        finally:
+            await restarted.stop()
+
+    final = asyncio.run(run())
+    if decision == "approve":
+        assert final.status.value == "completed"
+        assert not obsolete.exists() and _commit_count(repo) > before
+        if mutation == "rename":
+            assert (repo / "renamed.py").read_text(encoding="utf-8") == "value = 1\n"
+    else:
+        assert final.status.value == ("waiting_approval" if decision == "reject" else "cancelled")
+        assert obsolete.exists() and _commit_count(repo) == before
+        assert not (repo / "renamed.py").exists()
 
 
 async def _drive(runtime, task, *, max_rounds: int = 6):
@@ -203,7 +286,8 @@ def test_requirement_reaches_the_agent_as_a_planned_task(tmp_path: Path) -> None
     assert "required_paths" in metadata
 
 
-def test_a_verified_change_lands_in_the_workspace(tmp_path: Path) -> None:
+@pytest.mark.parametrize("correct", [True, False])
+def test_requirement_output_controls_whether_the_change_lands(tmp_path: Path, correct) -> None:
     """The whole path, ending in a real commit on the real repository.
 
     Regression: a refused apply returned a normal payload, so the task
@@ -212,7 +296,8 @@ def test_a_verified_change_lands_in_the_workspace(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     before = _commit_count(repo)
     model = FakeModel(
-        edits={"src/export.py": "def export_users(users):\n    return ''\n"}
+        edits={"src/export.py": VALID_EXPORT if correct else
+               "def export_users(users):\n    return ''\n"}
     )
 
     async def run():
@@ -226,6 +311,10 @@ def test_a_verified_change_lands_in_the_workspace(tmp_path: Path) -> None:
 
     final = __import__("asyncio").run(run())
 
+    if not correct:
+        assert final.status.value == "failed"
+        assert _commit_count(repo) == before
+        return
     assert final.status.value == "completed", "the happy path should settle green"
     # The whole point: "completed" has to mean the change is in the workspace.
     assert _commit_count(repo) > before, (
@@ -318,7 +407,7 @@ def test_a_proposal_offers_only_the_agents_edits(tmp_path: Path) -> None:
     have committed them.
     """
     repo = _repo(tmp_path, gitignore=False)
-    model = FakeModel(edits={"src/export.py": "def export_users(users):\n    return ''\n"})
+    model = FakeModel(edits={"src/export.py": VALID_EXPORT})
 
     async def run():
         runtime = _runtime(tmp_path, model)
@@ -379,7 +468,7 @@ def test_approving_a_withheld_command_wakes_the_parked_task(
     problem — it always goes through ``Runtime.decide_approval``, which resumes.
     """
     repo = _repo(tmp_path)
-    model = FakeModel(edits={"src/export.py": "def export_users(users):\n    return ''\n"})
+    model = FakeModel(edits={"src/export.py": VALID_EXPORT})
     config = _cli_config(tmp_path)
     live: dict = {}
 

@@ -9,6 +9,7 @@ from Sprout.strategy.intake import RequirementIntake
 from Sprout.strategy.model_planner import ModelStrategyPlanner
 from Sprout.strategy.models import Requirement, StrategyPlan
 from Sprout.strategy.planner import RequirementPlanner
+from Sprout.strategy.project_profile import ProjectProfile, inspect_project
 from Sprout.strategy.verification import VerificationPlanner
 
 
@@ -37,8 +38,12 @@ class StrategyPipeline:
 
     def plan(self, root: str | Path, requirement: Requirement) -> StrategyPlan:
         report = self.impact.analyze(root, requirement)
-        verification = self.verification.build(report)
-        return self.planner.build(requirement, report, verification)
+        return self._build(root, requirement, report)
+
+    def _build(self, root, requirement, report, *, profile=None):
+        profile = profile or inspect_project(root, report)
+        verification = self.verification.build(report, profile=profile)
+        return self.planner.build(requirement, report, verification, profile=profile)
 
     def plan_user_request(
         self,
@@ -67,11 +72,12 @@ class StrategyPipeline:
     async def plan_from_project_database(self, root, text, search, model) -> StrategyPlan:
         requirement = self.intake.from_user(text)
         report = await self.impact.analyze_from_project_database(requirement, search)
-        plan = self.planner.build(requirement, report, self.verification.build(report))
+        # Database-only analysis must not silently gain a filesystem scan.
+        plan = self._build(root, requirement, report, profile=ProjectProfile())
         return await self.model_planner.refine(plan, model)
 
     async def plan_cross_validated(self, root, text, search, model) -> StrategyPlan:
         requirement = self.intake.from_user(text)
         report = await self.impact.analyze_cross_validated(root, requirement, search)
-        plan = self.planner.build(requirement, report, self.verification.build(report))
+        plan = self._build(root, requirement, report)
         return await self.model_planner.refine(plan, model)

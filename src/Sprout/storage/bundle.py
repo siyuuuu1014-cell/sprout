@@ -15,6 +15,7 @@ from Sprout.storage.contracts.knowledge import KnowledgeStore
 from Sprout.storage.contracts.metadata import MetadataStore
 from Sprout.storage.contracts.observations import ObservationStore
 from Sprout.storage.contracts.operational import OperationalStore
+from Sprout.storage.contracts.projects import ProjectAnalysisStore
 from Sprout.storage.contracts.skills import SkillStore
 from Sprout.storage.contracts.vectors import VectorStore
 from Sprout.storage.local.filesystem.blobs import FileBlobStore
@@ -62,12 +63,14 @@ class StorageBundle:
     memory_index: SqliteMemoryIndex | None = None
     lanes: SixLaneFanout | None = None
     usage: Any | None = None
+    projects: ProjectAnalysisStore | None = None
 
     @classmethod
     def in_memory(cls) -> StorageBundle:
         from Sprout.memory.backends.memory_store import MemoryMemoryStore
         from Sprout.memory.backends.session_search import MemorySessionSearch
         from Sprout.rootstock.backends.memory_store import MemorySessionStore
+        from Sprout.storage.local.memory.projects import MemoryProjectAnalysisStore
 
         return cls(
             operational=MemoryOperationalStore(),
@@ -80,6 +83,7 @@ class StorageBundle:
             memory=MemoryMemoryStore(),
             session_search=MemorySessionSearch(),
             vectors=MemoryVectorStore(),
+            projects=MemoryProjectAnalysisStore(),
         )
 
     def session_store(self) -> SessionStore:
@@ -102,6 +106,7 @@ class StorageBundle:
             self.context,
             self.lanes,
             self.usage,
+            self.projects,
         ):
             close = getattr(store, "close", None)
             if close is None:
@@ -399,6 +404,9 @@ def create_storage(
 
             memory_store = MirroredMemoryStore(memory_store, lanes)
 
+    from Sprout.storage.local.sqlite.projects import SqliteProjectAnalysisStore
+
+    projects = SqliteProjectAnalysisStore(settings.project_root, pragmas)
     return StorageBundle(
         operational=operational,
         knowledge=knowledge,
@@ -416,6 +424,7 @@ def create_storage(
         memory_index=memory_index,
         lanes=lanes,
         usage=usage,
+        projects=projects,
     )
 
 
@@ -440,6 +449,10 @@ async def storage_status(bundle: StorageBundle) -> dict[str, Any]:
         "sqlite": _as_dict(detect_sqlite_capabilities()),
     }
     status["core"] = {"tasks": operational.get("tasks", 0)}
+    if bundle.metadata is not None:
+        status["core"]["tasks"] = len(await bundle.metadata.list_tasks())
+    if bundle.projects is not None:
+        status["projects"] = await bundle.projects.status()
     status["audit"] = {"approvals": operational.get("approvals", 0)}
     if bundle.observations is not None:
         status["events"] = await bundle.observations.count_events()

@@ -18,6 +18,8 @@ approval would then cover only the turn that produced it.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 #: Carries ``{task_id, source, requested_by}`` from ``ToolExecutor`` to a tool
 #: that hands work to a broker. The broker gates the delegated action under its
 #: own tool name and a task-scoped grant, so dropping this context makes an
@@ -30,4 +32,14 @@ CONTEXT_KEY = "_sprout_context"
 #: noise at best.
 CONTEXT_TOOLS = frozenset({"cli_tool_run"})
 
-__all__ = ["CONTEXT_KEY", "CONTEXT_TOOLS"]
+__all__ = ["CONTEXT_KEY", "CONTEXT_TOOLS", "NodeToolInvocationContext"]
+
+
+@dataclass(frozen=True, slots=True)
+class NodeToolInvocationContext:
+    """Host-bound approval attribution; never deserialize from model arguments."""
+
+    task_id: str
+    source: str
+    requested_by: str
+    resource_scope: str

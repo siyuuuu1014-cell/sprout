@@ -18,6 +18,7 @@ class CandidateEvaluation:
     passed: bool
     hard_gate: HardGateResult
     utility: UtilityReport
+    pending: bool = False
 
 
 class CandidateEvaluator:
@@ -37,8 +38,19 @@ class CandidateEvaluator:
     ) -> CandidateEvaluation:
         hard_gate = self._hard_gate.evaluate(candidate, checks)
         utility = self._utility.evaluate(candidate)
+        missing = checks is None or checks.tests_passed is None or checks.regression_free is None
+        known_gate = self._hard_gate.evaluate(
+            candidate,
+            GateChecks(
+                True if checks is None or checks.tests_passed is None else checks.tests_passed,
+                True
+                if checks is None or checks.regression_free is None
+                else checks.regression_free,
+            ),
+        )
         return CandidateEvaluation(
             passed=hard_gate.passed and utility.score >= self._utility_threshold,
             hard_gate=hard_gate,
             utility=utility,
+            pending=missing and known_gate.passed and utility.score >= self._utility_threshold,
         )

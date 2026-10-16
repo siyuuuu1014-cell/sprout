@@ -60,6 +60,17 @@ class FakeModel:
     ) -> LLMResponse:
         prompt = "\n".join(m.content or "" for m in messages)
 
+        if "ACCEPTANCE_DESIGN_JSON" in prompt:
+            self.calls.append("acceptance_design")
+            return LLMResponse(content=json.dumps({"cases": [
+                {"id": "export_normal", "target": "src.export:export_users",
+                 "args": [[{"id": 1}]], "kwargs": {}, "expected_output": "id\n1\n",
+                 "category": "normal"},
+                {"id": "export_empty", "target": "src.export:export_users",
+                 "args": [[]], "kwargs": {}, "expected_output": "",
+                 "category": "boundary"},
+            ]}), finish_reason="stop", model=self.name)
+
         if _INTENT_MARKER in prompt:
             self.calls.append("intent")
             return LLMResponse(

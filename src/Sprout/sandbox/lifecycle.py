@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 
 from Sprout.execution.models import ChangeProposal, SandboxRef
+from Sprout.execution.replay_boundary import isolated_replay_task
 from Sprout.orchestration.models import NodeType
 from Sprout.sandbox.git_worktree import GitWorktreeSandbox
 from Sprout.storage.contracts.metadata import MetadataStore
@@ -33,7 +34,7 @@ class SandboxLifecycleService:
         Waiting approval tasks keep their worktrees because apply/rollback may
         still need the branch and its pending diff.
         """
-        if result.status not in _TERMINAL_TASK_STATUSES:
+        if isolated_replay_task(task) or result.status not in _TERMINAL_TASK_STATUSES:
             return
         refs = await self._proposal_refs(task.id)
         if not refs:
@@ -50,6 +51,8 @@ class SandboxLifecycleService:
         task = await self._task(proposal.task_id)
         if task is None:
             return
+        if isolated_replay_task(task):
+            return
         workspace = await self._workspace_for_task(task)
         if workspace is None:
             return
@@ -60,7 +63,11 @@ class SandboxLifecycleService:
         if self._metadata is None:
             return
         referenced = await self._referenced_roots()
+        preserved = {task.workspace_id for task in await self._metadata.list_tasks()
+                     if isolated_replay_task(task)}
         for workspace in await self._metadata.list_workspaces():
+            if workspace.id in preserved:
+                continue
             await self._reconcile_workspace(workspace, referenced)
 
     async def _proposal_refs(self, task_id: str) -> tuple[SandboxRef, ...]:
@@ -95,7 +102,7 @@ class SandboxLifecycleService:
             # proposal (the verification command asks a human). Its sandbox is
             # the only place the resumed work can run, so it must be treated as
             # referenced even though no proposal row exists yet.
-            if task.status in _TERMINAL_TASK_STATUSES:
+            if task.status in _TERMINAL_TASK_STATUSES and not isolated_replay_task(task):
                 continue
             for node in await self._metadata.list_execution_nodes(task.id):
                 if node.type is not NodeType.SANDBOX:

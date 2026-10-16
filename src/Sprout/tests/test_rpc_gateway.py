@@ -48,6 +48,7 @@ def test_rpc_gateway_dispatches_project_methods(tmp_path: Path) -> None:
                 "params": {
                     "workspace_id": workspace.id,
                     "instruction": "explain this project",
+                    "execution_mode": "read_only",
                 },
             }
         )

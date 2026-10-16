@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import tomllib
 from collections.abc import Mapping
@@ -269,16 +270,14 @@ def _parse_required_tools(value: str) -> list[str]:
 
 def skill_to_toml(skill: Skill) -> str:
     """Serialize a skill back to TOML (used by the evolution publisher)."""
-    escaped_name = skill.name.replace('"', "'")
-    escaped_version = skill.version.replace('"', "'")
     lines = [
-        f'name = "{escaped_name}"',
-        f'version = "{escaped_version}"',
+        "name = " + json.dumps(skill.name, ensure_ascii=False),
+        "version = " + json.dumps(skill.version, ensure_ascii=False),
         f"enabled = {'true' if skill.enabled else 'false'}",
     ]
     if skill.required_tools:
-        tools = ", ".join(f'"{tool.replace(chr(34), chr(39))}"' for tool in skill.required_tools)
-        lines.append(f"required_tools = [{tools}]")
-    body = skill.instructions.replace('"""', "'''")
-    lines.append(f'instructions = """\n{body}\n"""')
+        lines.append("required_tools = " + json.dumps(skill.required_tools, ensure_ascii=False))
+    # JSON string escaping is valid TOML basic-string escaping. Do not append
+    # a newline or substitute quotes: the published candidate must round-trip.
+    lines.append("instructions = " + json.dumps(skill.instructions, ensure_ascii=False))
     return "\n".join(lines) + "\n"

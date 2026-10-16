@@ -28,14 +28,17 @@ class ActionExecutor:
         self._tools = tools
         self._max_actions = max_actions_per_step
 
-    def with_scoped_tools(self, node_tools: Mapping[str, Any]) -> ActionExecutor:
-        """A copy that dispatches this node's tools before the registry.
+    def with_scoped_tools(
+        self, node_tools: Mapping[str, Any], *, strict: bool = False,
+    ) -> ActionExecutor:
+        """A copy dispatching through this node's tool set.
 
         A copy, not a mutation: the agent is shared across nodes, so scoping
         state must travel with the call rather than live on the executor.
+        Model contexts use ``strict`` to disable registry fallback.
         """
         return ActionExecutor(
-            self._tools.with_scoped_tools(node_tools),
+            self._tools.with_scoped_tools(node_tools, strict=strict),
             max_actions_per_step=self._max_actions,
         )
 

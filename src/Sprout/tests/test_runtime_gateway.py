@@ -42,6 +42,7 @@ def test_runtime_gateway_executes_task(tmp_path: Path) -> None:
             GatewayRequest(
                 transport="mcp",
                 instruction="explain this project",
+                execution_mode="read_only",
                 workspace_id=workspace.id,
             )
         )

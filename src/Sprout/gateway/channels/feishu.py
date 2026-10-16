@@ -192,6 +192,7 @@ class FeishuGateway:
         response = await self._gateway.execute(
             GatewayRequest(
                 transport="feishu",
+                execution_mode="read_only",
                 instruction=text,
                 caller=Principal(user_id=sender_id, source="feishu"),
                 workspace_id=workspace_id,

@@ -36,7 +36,9 @@ class ArtifactConsolidator:
                 continue
             items.sort(key=lambda item: item.updated_at, reverse=True)
             for old in items[1:]:
-                if old.status in _PROTECTED:
+                if old.status in _PROTECTED or old.metadata.get("publication_guard", {}).get(
+                    "owner"
+                ):
                     continue
                 updated = replace(old, status=ArtifactStatus.DEPRECATED)
                 await metadata.save_artifact(updated)

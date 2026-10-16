@@ -66,7 +66,9 @@ def test_runtime_worker_processes_queued_tasks(tmp_path) -> None:
     async def run() -> None:
         runtime = create_runtime(settings, task_queue=TaskQueue())
         workspace = await runtime.open_workspace(tmp_path)
-        task = await runtime.create_task(workspace.id, "explain this project")
+        task = await runtime.create_task(
+            workspace.id, "explain this project", execution_mode="read_only",
+        )
         runtime.start_worker()
         await runtime.submit_task(task)
         await asyncio.sleep(0.2)

@@ -41,8 +41,12 @@ def kill_tree(process: asyncio.subprocess.Process) -> None:
 async def terminate(process: asyncio.subprocess.Process) -> None:
     """Kill and reap ``process``; safe to await from a timeout/cancel handler."""
     kill_tree(process)
+    async def discard(stream):
+        if stream is not None:
+            while await stream.read(4096):
+                pass
     with contextlib.suppress(ProcessLookupError, asyncio.CancelledError):
-        await process.wait()
+        await asyncio.gather(discard(process.stdout), discard(process.stderr), process.wait())
 
 
 async def run_capture(
@@ -62,6 +66,7 @@ async def run_capture(
         *args,
         cwd=None if cwd is None else str(cwd),
         env=dict(env) if env is not None else None,
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -80,3 +85,34 @@ async def run_capture(
         stdout.decode("utf-8", errors="replace"),
         stderr.decode("utf-8", errors="replace"),
     )
+
+
+class OutputLimitExceeded(ValueError):
+    """Combined stdout/stderr exceeded the requested capture budget."""
+
+
+async def capture_bounded(process, max_bytes: int):
+    if type(max_bytes) is not int or not 0 < max_bytes <= 8 * 1024 * 1024:
+        raise ValueError("Capture limit must be between 1 byte and 8 MiB")
+    total = 0
+
+    async def read(stream):
+        nonlocal total
+        chunks = []
+        while chunk := await stream.read(4096):
+            total += len(chunk)
+            if total > max_bytes:
+                raise OutputLimitExceeded("Process output limit exceeded")
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    readers = [asyncio.create_task(read(process.stdout)),
+               asyncio.create_task(read(process.stderr))]
+    try:
+        stdout, stderr = await asyncio.gather(*readers)
+        await process.wait()
+        return stdout, stderr
+    finally:
+        for reader in readers:
+            reader.cancel()
+        await asyncio.gather(*readers, return_exceptions=True)
