@@ -22,3 +22,12 @@
 - Project uses Python >=3.12; `uv.lock`, pytest and ruff. Inspect the current `pyproject.toml` before choosing commands.
 - Typical commands when supported by the environment: `uv sync --locked --group dev`, `uv run ruff check .`, `uv run pytest -q src/Sprout/tests`.
 - Some real Docker tests require explicit images or infrastructure; do not count them as passed when skipped. Treat Local and Temporal as separate integration claims.
+
+## Branch and pull-request workflow
+
+- Before every Rxx task, inspect the local branch, HEAD, index, worktree and remote `dev`. Attribute and preserve existing changes before switching branches; reuse the task's existing branch when appropriate.
+- Start each task from the latest confirmed `dev` on its own `codex/rxx-...` branch. R01 uses `codex/r01-baseline-ci`. Never develop or commit directly on `dev`.
+- Stage only explicitly named, task-owned paths. Never use `git add -A`; show the staged diff/file list before committing. Keep unrelated changes and historical document recovery in separate branches/PRs.
+- Local edits/tests/commits require task authorization. Report failed, skipped and not_run checks accurately; a draft commit is not acceptance or permission to merge.
+- Push only after explicit user approval. Then create a PR with base `dev` and the task branch as compare, including task ID, changes, tests, unfinished work and rollback. Attach the created PR to the chat.
+- Stop after creating the PR and await review. Never merge, delete the remote task branch, deploy, force-push or rewrite shared history without separate explicit approval.
