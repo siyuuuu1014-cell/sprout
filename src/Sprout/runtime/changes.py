@@ -157,7 +157,8 @@ class ChangeProposalService:
             applicability = (local_evidence_applicability(verification)
                              if self._local_acceptance else "unknown")
             if applicability != "match":
-                blocker = blocker or "Local acceptance executor " + applicability
+                blocker = "; ".join(filter(None, (
+                    blocker, "Local acceptance executor " + applicability)))
         forced = force or allow_failing_tests
         if forced and not override_reason.strip():
             return ApplyResult(

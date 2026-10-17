@@ -135,13 +135,13 @@ All intermediate failures remain recorded here rather than described as green:
 | Clean snapshot 3 | 2393 passed, 0 failed, 1 skipped, 58 not_run; 2 warnings | Before final two ambiguity regressions |
 | Final targeted boundary suite | 28 passed, 0 failed, 0 skipped | Includes dynamic parent paths and ambiguous target directory |
 
-Final immutable snapshot/evidence directory:
+Main-patch immutable snapshot/evidence directory (commit `08e418616c9ffb91a42b7a7d90563f522bd87532`):
 `D:/dev/projects/sprout/.workbuddy/test-runs/r01 win fix final/`.
 This directory is ignored local test evidence; do not upload it wholesale.
 It contains a new checkout, new venv, isolated test HOME/temp, source-manifest.json, logs and JUnit.
 Dependency artifacts were reused from the earlier task-owned uv cache; no existing venv was modified.
 
-Final source snapshot: 2454 collected, 2395 passed, 0 failed, 1 skipped,
+Main-patch source snapshot: 2454 collected, 2395 passed, 0 failed, 1 skipped,
 58 explicitly not_run (pytest displays deselected), 2 warnings; 295.13 seconds.
 R00: 67 passed. Examples: 18 passed. Ruff/imports/locked sync/lock check: exit 0.
 Fixed suite: 10/10 scenario_passed, 4 completed coding tasks, model_quality_measured=false.
@@ -250,3 +250,40 @@ integration gates remain unrun. Await user review and separate push authorizatio
   retain persisted metadata/history. No schema down-migration or user-data deletion is needed.
   Reverting restores the earlier interpreter/approval weakness, so it is not a safety endorsement.
 - Do not push the original branch containing b7f759c. Stop after this local task for user review.
+
+## Follow-up: retain both verification and environment override reasons
+
+After the main local commit, final review found an audit edge case: when historical verification
+already had a blocker, `blocker or environment_reason` discarded a simultaneous unknown/mismatch
+reason. Normal apply was still blocked, but the explicit force audit did not retain both reasons.
+
+An added parameter to the existing force regression reproduced this: **1 failed, 1 passed,
+7 deselected**. The failure was specifically the missing environment reason, not an absent API.
+The minimal follow-up changes only `runtime/changes.py` to concatenate both blocker reasons,
+and parameterizes the test for historical passing/failing evidence. All original checks and
+explicit force authorization/reason/audit behavior remain intact. Targeted apply/report tests:
+**9 passed**, Ruff passed. No main commit was amended/rebased/reset.
+
+Latest immutable source snapshot:
+`D:/dev/projects/sprout/.workbuddy/test-runs/r01 win fix audit final/`.
+It uses another new venv and the same reviewed dependency cache, not a user environment.
+The first install attempt in a fully stripped environment lacked a task TEMP before uv installation;
+uv could not create a temporary directory under the system directory (permission error).
+No pytest tests executed in that failed bootstrap; subsequent command bootstrap errors are not passes.
+That attempt's logs remain at the snapshot root. The retry sets task-owned TEMP/TMP/TMPDIR
+BEFORE uv and retains reports separately under `verified/`. No system-directory permissions,
+machine environment or user configuration were changed.
+
+Latest full verification: **2396 passed, 0 failed, 1 skipped, 58 not_run**, 2 warnings,
+280.08 seconds. Full collection: **2455**, zero errors (4.15 seconds). R00: **67 passed**;
+examples: **18 passed**; imports, Ruff, offline locked installation and lock check: exit 0.
+The new force combination increases the Apply/report group to 9 and new regression total to 29;
+Task E2E remains 13 passing and evaluation-runner tests remain 7 passing (ten fixed scenarios).
+No skip/gate changes were made. The sole skip and external not_run groups are unchanged.
+The final 9 source/test file hashes match this latest immutable snapshot. Only this audit
+document is updated after that snapshot. Local acceptance is met; remote/live acceptance is not claimed.
+
+The retry uses the same exact command families documented above, with report paths
+`../verified/{collect,r00,examples,l1}.xml`, gate reports under `../verified/`, basetemp
+`../verified/pytest-temp`, and all non-whitelisted environment variables removed before installation.
+Rollback, if later approved, reverts the follow-up and main commit in reverse order; no data migration.

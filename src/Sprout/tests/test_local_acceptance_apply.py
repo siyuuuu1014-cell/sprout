@@ -1,5 +1,6 @@
 """Public service, graph compatibility path and read projections fail closed."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -52,8 +53,11 @@ async def test_standalone_service_and_node_direct_apply_check_environment(state)
         apply.apply.assert_not_awaited()
 
 
-async def test_force_retains_unverified_environment_reason():
+@pytest.mark.parametrize("historical_passed", [True, False])
+async def test_force_retains_unverified_environment_reason(historical_passed):
     item = proposal(None)
+    if not historical_passed:
+        item = replace(item, test_results=(CheckResult("acceptance:normal: python", False),))
     task = Task(id="task", workspace_id="workspace")
     metadata = SimpleNamespace(get_change_proposal=AsyncMock(return_value=item),
         get_task=AsyncMock(return_value=task), get_workspace=AsyncMock(return_value=object()),
