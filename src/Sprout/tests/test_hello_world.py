@@ -1,24 +1,9 @@
-"""Verification for the root-level ``hello_world.py`` reference example.
-
-``hello_world.py`` lives at the repository root rather than inside the installed
-``Sprout`` package, so the root has to be on ``sys.path`` before it can be
-imported. ``[tool.pytest.ini_options] pythonpath = ["."]`` already does this, and
-the explicit insert below keeps the test correct when it is run from a rootdir
-that does not carry that setting.
-"""
+"""Behavior checks for the R01 reference fixture, not Agent coding acceptance."""
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
-#: ``src/Sprout/tests/test_hello_world.py`` -> repository root.
-_ROOT = Path(__file__).resolve().parents[3]
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-
-import hello_world as module  # noqa: E402
-from hello_world import GREETING, hello  # noqa: E402
+from Sprout.tests.fixtures import hello_world as module
+from Sprout.tests.fixtures.hello_world import GREETING, hello
 
 
 def test_builtin_self_check_passes() -> None:
