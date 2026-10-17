@@ -11,7 +11,7 @@
 存储 schema、任务执行、评测目标/Oracle/门禁，也没有恢复八份历史文档。
 文档恢复另开分支/PR，按用户决定分别归档至 docs/runbooks 和 docs/archive。
 当前已有 [Draft PR #2](https://github.com/siyuuuu1014-cell/sprout/pull/2)。本轮审查修正
-仅允许本地修改/提交，不再 push，不 merge、不转 Ready、不部署。
+已于随后经用户批准推送 c9eaec5；最新远端核查见末节。仍不 merge、不转 Ready、不部署。
 
 ## 示例测试：修复真实收集错误
 
@@ -85,6 +85,7 @@ python -m pytest -p scripts.ci_support.pytest_gates --integration-gates=temporal
 
 `.github/workflows/baseline.yml` 在 PR、dev push 和手动触发时运行 L0/L1；
 最小 contents:read，checkout 不保留凭证，不注入 secrets，失败仍上传日志/JUnit/JSON。
+以上为原始 R01 交付方式；R01-DIAG 起改为仅上传白名单 JSON，原始日志/JUnit 留本地，见末节。
 官方 Action 发布标签与 SHA 已于本轮用 git ls-remote 核实：
 
 - checkout v4.2.2 → 11bd71901bbe5b1630ceea73d27597364c9af683
@@ -290,3 +291,185 @@ Docker、Temporal、真实模型、外部数据库均 not_run，不继承历史�
 公开 API/持久化数据/审批/R00 实现不变，uv.lock 不变。回滚只撤回本轮六文件补丁或本地
 修正提交，不撤回 R00、原 R01 交付或历史资料。PR 必须维持 Draft，修正后双平台远端复验
 及 Windows 四项失败根因仍未解决前，**R01 完整 DoD 未满足，不合并、不进入 R02**。
+
+## c9eaec5 授权推送与第二轮远端验收（2026-10-16）
+
+本节是最新状态，前节“本轮未推送/not_run”均指此前本地修正交付时点；历史失败不覆盖。
+开始时分支 codex/r01-baseline-ci、HEAD c9eaec552d6b92efe580185a99a066cc46545272，
+工作树/暂存区干净。完整核对该提交六文件 Diff：评测只补空行，快照只纳入 Git 跟踪
+清单，新增回归保留原模拟文件，无其他业务修改、断言/门禁/Oracle 放宽。
+
+用户明确批准后正常执行 `git push origin codex/r01-baseline-ci`，远端由 d08de113
+快进至 **c9eaec552d6b92efe580185a99a066cc46545272**；没有 force push。PR #2 保持
+open/Draft、base dev、未合并。本地 dev、origin/dev、远端 dev 均仍为
+32e5f734fc556f5ccdce152b8ec949b75021fbd6。
+
+[Actions run 38885294318](https://github.com/siyuuuu1014-cell/sprout/actions/runs/38885294318)
+由 PR synchronize 自动启动；两平台 checkout 日志及 summary.json 均证实合并检查 SHA
+**eeeebb30b0e500cd0443366ae43092b25a7bf310**（c9eaec5 合入 32e5f734 的临时检查提交，
+不是已合并 dev）。不是旧 run 重跑，也没有手动放宽门禁。
+
+| 检查 | Ubuntu / Python3.12.15，job116921454445 | Windows / Python3.13.16，job116921454638 |
+|---|---|---|
+| 最终 job 状态 | completed/success | completed/failure |
+| uv / lock / sync | uv0.11.25；124锁包、66安装包；exit0 | uv0.11.25；124锁包、68安装包；exit0 |
+| imports / ruff | exit0 / exit0 | exit0 / exit0 |
+| 完整收集 | 2400项、0 errors、1 warning；4.25s | 2400项、0 errors、1 warning；6.89s |
+| 示例 / R00 | 18 / 67 passed，0 failed、0 skipped | 18 / 67 passed，0 failed、0 skipped |
+| 完整离线 L1 | **2341 passed、0 failed、1 skipped、58 not_run、2 warnings**；101.75s | **2337 passed、5 failed、0 skipped、58 not_run、2 warnings**；260.66s |
+| 模板 Ruff + 三个快照回归 | 四项均通过（JUnit逐项核查） | 四项均通过（JUnit逐项核查） |
+| 固定十场景评测 | 通过，保留10/10断言 | 失败，C01/C02/C03/R01未验证完成，6/10 |
+| 四个重点 task_e2e | 四项均通过 | 四项均失败，仍为 failed != completed |
+
+Ubuntu 唯一 skip：`test_execution_gate.py:673::test_read_broker_rejects_a_junction_escape`，
+JUnit 原因是 Windows junction 检查需要 Windows shell；不是本地 Windows 的 symlink skip。
+Windows 本次无跳过。两条 warning 仍是 Starlette/AnyIO 和 lark protobuf 弃用 API。
+58 not_run 仍为显式外部门禁，Docker/Temporal/真实模型/外部数据库均未运行，绝非通过。
+
+### Windows 剩余失败：已证实与未证实
+
+已读取两个 job 的实际日志，并下载检查两份 artifact 的 summary、JUnit、门禁清单：
+
+- [Ubuntu artifact 12038987947](https://github.com/siyuuuu1014-cell/sprout/actions/runs/38885294318/artifacts/12038987947)，
+  ZIP SHA256 `64ff113483db8fb7e2341f502e8c097cfdc192dbceca885f33357fbc58c9733b`。
+- [Windows artifact 12039318726](https://github.com/siyuuuu1014-cell/sprout/actions/runs/38885294318/artifacts/12039318726)，
+  ZIP SHA256 `b03d1ae06e6eff74a2adf17fd781664664a3b6c4a980de951276020998932223`。
+- 两份 ZIP 保留于 `.workbuddy/test-runs/r01-remote-run2/`，只读取、不执行内容、不提交临时证据。
+
+Windows JUnit：2342 executed、5 failures、0 errors、0 skipped，与 stdout 的2337 passed一致。
+失败逐项为：
+
+1. `test_evaluation_runner.py:58::test_fixed_suite_and_persisted_report`，6 != 10。
+2. `test_task_e2e.py:205::test_delete_approval_survives_restart_and_controls_commit[delete-approve]`。
+3. 同上 `[rename-approve]`。
+4. `test_task_e2e.py:318::test_requirement_output_controls_whether_the_change_lands[True]`。
+5. `test_task_e2e.py:424::test_a_proposal_offers_only_the_agents_edits`。
+
+**已证实**：模板 lint 本身已通过；同一提交 Ubuntu 全部固定评测和这四项 task_e2e 通过，
+Windows CI 仍失败，本地 Windows3.13.9 的同源码也曾全绿。说明远端 Windows 还有未解释
+差异；不能断言是 Python 小版本、Git/换行、测试环境或 Runtime 缺陷中的哪一个。
+不将“模板格式修正通过”等同于“Windows Agent 编码链路通过”。
+
+**证据缺口**：Windows artifact 实际只有18个顶层 log/xml/json。JUnit无 system-out；
+没有任务状态详情、NodeResult、VerificationReport、审批或 Apply 明细。评测 runner 已在
+`runner.py:287–299` 写 nodes.json / verification.json 后做完成断言，但它们位于 pytest-temp
+下，现有 workflow 的顶层上传 glob 不含这些目录；远端临时路径不是本地可读文件。
+因此只能确认链路未完成，尚不能区分验证子进程失败与审批/应用等阶段的失败，不猜测根因。
+
+### 建议下一步（未实施，需批准）
+
+先做 R01 小范围诊断补丁，而不是直接修改 Runtime：测试失败时输出 fixture 任务 ID、
+任务/节点状态、原始验证命令/退出码/stdout/stderr、审批/Apply 状态及 patch/revision 身份；
+只归档专用测试目录下白名单 JSON/文本，不上传用户配置、数据库、密钥或整套临时环境。
+沿用现有报告接口，不重设计 Schema；保留所有断言和完整 L1，远端重复这五项后再判断根因。
+预计范围是 test_evaluation_runner.py、test_task_e2e.py 和 baseline.yml 的诊断/证据上传，
+须先审查实际报告字段和最小保留方案。本轮没有修改这些测试或 workflow。
+
+若证据证明必须修 Runtime，应另提独立修复范围、失败回归、兼容/回滚和审批，不借 R01
+扩展任务执行/安全模块。本轮停止：**R01 DoD 未满足；Windows五项失败为明确阻塞**，
+不得合并、转 Ready 或进入 R02。
+
+本轮只推送已审核 c9eaec5。本节及 PR 描述更新作为本地文档差异展示，不新增提交/推送，
+避免让实际测试 SHA 和未审查的新提交混淆；远端 PR 描述单独更新，不改变 Git 分支内容。
+
+## R01-DIAG 本地诊断补丁（2026-10-17，未推送）
+
+用户已批准本轮诊断基础设施，不批准业务修复或推送。开始时 HEAD/远端 R01 都是
+c9eaec552d6b92efe580185a99a066cc46545272；dev/origin/dev/远端 dev 仍为32e5f734。
+工作树已有两份本报告/PR描述修改，属于上一轮授权远端核查的记录，原样保留并纳入本轮
+审计增量，不恢复八份历史文档。已复查 run38885294318：Ubuntu success、Windows failure，
+五项失败仍成立。本轮没有重新运行远端 CI，不用本地模拟结论代替 Windows 根因。
+
+### 数据来源与调用链（测试层，不修改业务）
+
+- `test_evaluation_runner.py::test_fixed_suite_and_persisted_report` 调用现有 run_suite 后、
+  原有断言前，仅对失败的 C01/C02/C03/R01 调用 evaluation_failures。
+  只读取该测试 tmp_path 下已有 task/nodes/verification/approvals/proposals/baseline JSON；
+  不复制原文件，不读 SQLite、模型对话或整套目录。保留原始10/10等全部断言。
+- `test_task_e2e.py` 三个目标测试函数（四个参数实例）在失败完成状态返回后、Runtime.stop
+  前调用 runtime_failure；使用现有 get_task、get_verification_report、list_approvals、
+  list_change_proposals 和测试 metadata.list_execution_nodes。审批按 task_id 筛选后投影；
+  不调用执行/授权/重试/审批/Apply。读取 Git HEAD/提交计数，绝不改原仓库内容。
+- `scripts/ci_support/diagnostics.py` 只做一次性只读投影，不新增持久化契约、查询 API 或
+  第二套验证系统；枚举来自已有模型，验证状态来自已有报告。节点 metadata 中只选择
+  attempts/status/type、output 的已知状态/布尔及 error 的固定类别信号；不导出 metadata。
+
+### 白名单及证据含义
+
+每个 JSON 含固定 fixture 名、平台/Python/Git/Ruff 数字版本及已知 stdout 编码；TaskStatus；
+节点类型/状态/记录索引/attempts；验证 verified、检查类型名（pytest/ruff/acceptance/poc，
+不保留任意原名）、passed/failed/not_run/unknown、固定 outcome、整数退出码和错误签名类别；
+审批及 proposal 状态枚举；Apply 尝试/确认/成功布尔（无证据为 null）及原因类别；Git HEAD
+是否变化、原/实际/预期最低提交数；最早失败节点/检查索引。fixture 名分别映射本节上方
+列明的五个原测试及固定场景，不使用用户输入或任务ID作文件名。
+
+`first_failure.ordering=record_order_not_wall_clock`：记录顺序不是时钟顺序证明；
+`root_cause=not_established`：出现模块缺失、WinError2/193、编码、权限、超时、Ruff I001、
+Git patch/身份/ownership 等固定文本签名，只证明观察到该信号，不自动推断底层根因。
+已完成 evaluation 节点的 output.status=failed 也计入首次失败，避免只看节点状态漏报。
+缺数据/查询异常只记固定 missing 名称和 unknown/null，不打印异常正文，不伪造成功。
+
+明确不导出：原始模型/系统提示词、instruction、完整 metadata、自由文本错误、原检查名、
+command/cwd、stdout/stderr/output、审批参数、proposal diff/文件内容、任何连接字符串、
+凭证或数据库。环境版本输出非数字即 unknown；JSON 字段不是任意对象序列化后再遮盖。
+
+### 受控 Artifact 范围
+
+`ci_baseline.py` 为测试进程设置专用 SPROUT_TEST_DIAGNOSTICS；现有本地原始日志/JUnit/
+门禁清单/临时数据库不变，runner 不再把子进程原始日志尾部打印到公开 Actions 日志。
+public_summary 只从已有结果提取固定步骤退出码、JUnit数字总计和门禁 total/not_run计数，
+不会上传源清单中的路径、命令、失败文本或测试名称。pytest和ruff命令/退出码规则不变。
+
+workflow 保留原矩阵、锁定安装、完整收集、L1、失败时上传以及固定 Action SHA；唯一上传路径：
+`.workbuddy/ci-baseline/public-diagnostics/*.json`。不上传原 *.log/*.xml/*.json 顶层文件，
+不扫描原始 pytest-temp，也不上传整个 .workbuddy。预期文件：
+
+- `baseline.json`：固定阶段/测试/门禁计数，包含失败退出码；全绿时也存在。
+- 仅当对应场景失败时：`eval_C01.json`、`eval_C02.json`、`eval_C03.json`、`eval_R01.json`。
+- 仅当对应正向端到端完成状态失败时：`e2e_delete_approve.json`、`e2e_rename_approve.json`、
+  `e2e_requirement_true.json`、`e2e_proposal.json`。
+
+最多九份，若 setup/异常使原报告缺失则相应摘要可能缺失/不完整，不能据缺失宣称场景通过。
+采集受限于目前五项已观察失败路径，不承诺捕获任何未知提前异常或 OS 崩溃。
+
+### 本地验证及停止条件
+
+新增 `test_ci_diagnostics.py` 15项：模拟 ModuleNotFoundError/exit2、Apply patch失败、
+未执行检查，检查最早失败；给任务/节点/检查/审批/proposal/版本/JUnit/日志/门禁记录放入
+模拟 key、私密提示词、文件内容，断言 JSON 不含原文；验证源 .env/DB 不被复制或删除、
+未知枚举/路径/版本不外泄、查询失败留 missing、workflow 只上传投影 JSON。
+首批13项通过0.42s；联合诊断/CI合同/评测/端到端/R00 **118 passed、0 failed、0 skipped**，
+101.13s。后续微调记录顺序定位及计数后，以独立干净环境复验为最终证据，详见下方补记。
+
+独立完整命令：
+
+```powershell
+.\.venv\Scripts\python.exe -B scripts/ci_baseline.py --output .workbuddy/test-runs/r01-diag-clean-1 --python D:/dev/runtimes/conda/python.exe
+```
+
+新文件先逐个显式暂存，确保只纳入 Git 跟踪文件的快照真实包含它们；最终提交前再次展示
+全部 staged diff。本地原始证据目录不提交；本轮不 push、不更新远端 PR 内容、不改 Draft。
+无生产源码/API/schema/Oracle/审批/门禁行为修改，回滚仅撤回本轮诊断/测试/CI补丁及记录，
+不撤回 c9eaec5 的格式和快照修正、不动 R00/用户数据。
+**R01-DIAG 本地补丁不等于 Windows 根因已查明；R01完整DoD仍未满足。** 等用户审查后
+另行授权推送，在远端真实失败上取得投影证据，再决定环境/fixture/Runtime独立修复范围。
+
+### 最终复验与提交边界
+
+独立 `.workbuddy/test-runs/r01-diag-clean-1/`：Python3.13.9 / uv0.11.25，lock解析124包、
+新环境安装68包；imports/ruff/lock/sync均exit0。完整收集 **2415项、0 errors、1 warning**，
+4.61s；示例 **18 passed、0 failed、0 skipped**（0.14s）；R00 **67 passed、0 failed、
+0 skipped**（0.24s）。最终完整离线L1 **2356 passed、0 failed、1 skipped、58 not_run、
+2 warnings**，313.47s，exit0。新增15项诊断测试均包含于该完整L1，不重复累加。
+唯一skip仍为本地Windows无法创建symlink的authz用例；两条warning仍为既有依赖弃用警告。
+Docker、Temporal、真实模型、外部数据库均not_run，未调用付费模型。
+
+public-diagnostics 实际只产生 baseline.json：本地正向任务未失败，不伪造Windows失败
+摘要；模拟失败的投影在专用单元测试目录中验证。完整log/JUnit保留于本地，不上传。
+代码/测试/workflow六文件的SHA256与该次source-manifest逐项一致；最终ruff和
+git diff --check均通过。审计文档补记在测试结束后，不冒充已测试的额外业务修改。
+
+暂停后恢复时发现操作者新增本地提交 `37934c9ac2346fd476732efd7254a18d86ee5750`
+（诊断模块及新增测试两文件，内容与已测快照一致）。保留该提交，不amend/reset；本轮
+只为其余六文件制作补充本地提交。另有操作者 `README-交接说明.md` 删除，完全不纳入
+暂存或提交、不恢复或删除其他文件。提交前展示准确staged diff；不推送任一本地新提交。

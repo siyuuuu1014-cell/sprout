@@ -14,9 +14,66 @@ import shutil
 import subprocess
 import sys
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def public_summary(output: Path, summary: dict) -> None:
+    """Publish only fixed labels and numeric outcomes, never logs/JUnit bodies."""
+    steps = {
+        "python-version",
+        "uv-version",
+        "lock",
+        "sync",
+        "imports",
+        "ruff",
+        "collect",
+        "examples",
+        "r00",
+        "l1",
+    }
+    public = {
+        "schema_version": 1,
+        "steps": [
+            {
+                "name": item["name"],
+                "exit_code": (item["exit_code"] if type(item["exit_code"]) is int else None),
+            }
+            for item in summary["steps"]
+            if item["name"] in steps
+        ],
+        "integrations": {key: "not_run" for key in ("docker", "temporal", "model", "databases")},
+        "tests": {},
+        "inventory_counts": {},
+    }
+    for name in ("collect", "examples", "r00", "l1"):
+        path = output / (name + ".xml")
+        if not path.is_file():
+            continue
+        try:
+            suites = ET.parse(path).getroot().findall("testsuite")
+            public["tests"][name] = {
+                key: sum(int(suite.get(key, "0")) for suite in suites)
+                for key in ("tests", "failures", "errors", "skipped")
+            }
+        except (ET.ParseError, ValueError):
+            public["tests"][name] = {"report_status": "unreadable"}
+    for name in ("collect", "l1"):
+        path = output / (name + "-gates.json")
+        if path.is_file():
+            try:
+                records = json.loads(path.read_text(encoding="utf-8"))["tests"]
+                public["inventory_counts"][name] = {
+                    "total": len(records),
+                    "not_run": sum(item.get("status") == "not_run" for item in records),
+                }
+            except (ValueError, KeyError, TypeError):
+                public["inventory_counts"][name] = {"report_status": "unreadable"}
+    path = output / "public-diagnostics"
+    path.mkdir(exist_ok=True)
+    (path / "baseline.json").write_text(json.dumps(public, indent=2), encoding="utf-8")
 
 
 def snapshot(destination: Path) -> None:
@@ -104,6 +161,7 @@ def main() -> int:
         "steps": [],
         "integrations": {key: "not_run" for key in ("docker", "temporal", "model", "databases")},
     }
+    public_summary(output, summary)
 
     def run(name, command, *, timeout=1800):
         print(f"[{name}] {' '.join(map(str, command))}", flush=True)
@@ -131,7 +189,9 @@ def main() -> int:
             }
         )
         (output / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
-        print(log.read_text(encoding="utf-8")[-5000:], flush=True)
+        public_summary(output, summary)
+        # Raw output stays local, never becomes a public diagnostic payload.
+        print(f"[{name}] exit_code={code}; raw log retained locally", flush=True)
         return code
 
     uv = shutil.which("uv")
@@ -152,6 +212,7 @@ def main() -> int:
             "PYTHONPATH": os.pathsep.join((str(checkout / "scripts/ci_support"), str(checkout))),
             "SPROUT_BASELINE_HOME": str(home),
             "SPROUT_BASELINE_OFFLINE": "1",
+            "SPROUT_TEST_DIAGNOSTICS": str(output / "public-diagnostics"),
         }
     )
     pytest = [

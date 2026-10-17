@@ -36,14 +36,13 @@ jobs:
           enable-cache: false
       - name: Locked clean install, L0 and offline L1
         run: python scripts/ci_baseline.py --output .workbuddy/ci-baseline
-      - name: Publish logs and JUnit even on failure
+      # Public repository: raw logs/JUnit/temp DBs stay off Artifacts.
+      # Baseline aggregates and failure projections contain allowlisted fields only.
+      - name: Publish allowlisted JSON diagnostics even on failure
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: baseline-${{ matrix.os }}-py${{ matrix.python }}
           if-no-files-found: error
           retention-days: 14
-          path: |
-            .workbuddy/ci-baseline/*.log
-            .workbuddy/ci-baseline/*.xml
-            .workbuddy/ci-baseline/*.json
+          path: .workbuddy/ci-baseline/public-diagnostics/*.json

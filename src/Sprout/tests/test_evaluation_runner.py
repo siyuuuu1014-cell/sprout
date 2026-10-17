@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from scripts.ci_support.diagnostics import evaluation_failures
 from Sprout.evaluation.fixtures import CASES
 from Sprout.evaluation.runner import _repo, run_suite
 
@@ -55,6 +56,7 @@ async def test_remote_temporal_environment_is_rejected(tmp_path, monkeypatch):
 async def test_fixed_suite_and_persisted_report(tmp_path, monkeypatch):
     monkeypatch.delenv("TEMPORAL_HOST", raising=False)
     report = await run_suite(tmp_path)
+    evaluation_failures(report, tmp_path)
     assert report["scenario_passed"] == 10, json.dumps(
         [
             {"id": item["id"], "error": item.get("error"), "evidence": item["evidence_dir"]}
