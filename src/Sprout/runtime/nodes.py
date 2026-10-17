@@ -22,6 +22,10 @@ from Sprout.execution.acceptance import (
     acceptance_commands,
     acceptance_demo_path,
     acceptance_test_path,
+    local_acceptance_evidence,
+    local_evidence_applicability,
+    local_executor_applicability,
+    local_executor_binding,
     render_acceptance_demo,
     render_acceptance_tests,
 )
@@ -172,6 +176,7 @@ class NodeExecutor:
         isolated_coding_required: bool = False,
         coding_session_factory=None,
         coding_commands=None,
+        local_acceptance: bool = True,
     ) -> None:
         self._metadata = metadata
         self._router = router
@@ -187,6 +192,7 @@ class NodeExecutor:
         self._isolated_coding_required = isolated_coding_required
         self._coding_session_factory = coding_session_factory
         self._coding_commands = coding_commands
+        self._local_acceptance = local_acceptance
         self._change_builder = ChangeProposalBuilder()
 
     def handler(
@@ -381,6 +387,9 @@ class NodeExecutor:
         findings = self._subtask_findings(nodes)
         design = self._output_for(nodes, NodeType.TEST_DESIGN)
         if isinstance(design, dict):
+            if (not self._isolated_coding_required and self._local_acceptance
+                    and local_evidence_applicability(design) != "match"):
+                return self._acceptance_wait("local_executor_unknown_or_mismatched")
             visible_spec = (public_acceptance(design.get("acceptance_spec"))
                             if self._isolated_coding_required else design.get("acceptance_spec"))
             plan += (
@@ -524,6 +533,15 @@ class NodeExecutor:
                     "acceptance_fingerprint": fingerprint, "baseline": measured.get("results", []),
                     "baseline_failed": measured.get("status") == "failed"}
         payload = previous.get("acceptance_spec")
+        binding = None
+        if self._local_acceptance:
+            if (previous.get("acceptance_spec") is not None
+                    and local_executor_applicability(previous.get("local_executor")) != "match"):
+                return {**previous, **self._acceptance_wait("local_executor_unknown_or_mismatched")}
+            try:
+                binding = local_executor_binding()
+            except (OSError, ValueError, ImportError):
+                return self._acceptance_wait("local_executor_unavailable")
         if payload is None:
             resources = self._resources(self._output_for(nodes, NodeType.READ), workspace)
             prompt = acceptance_prompt(task.instruction) + "\nProject evidence:\n" + json.dumps(
@@ -549,12 +567,16 @@ class NodeExecutor:
         baseline = []
         pending = []
         for index, (case, command) in enumerate(zip(
-            spec.cases, acceptance_commands(spec, path), strict=True
+            spec.cases, acceptance_commands(spec, path, python="python"), strict=True
         )):
-            outcome = await self._run_verification_command(
-                workspace, command, sandbox.root, task, 1,
-                node=node, command_slot=f"baseline-{index}",
-            )
+            if binding is not None:
+                outcome = await self._local_acceptance_run(
+                    workspace, task, sandbox.root, spec, path, case.id, binding)
+            else:
+                outcome = await self._run_verification_command(
+                    workspace, command, sandbox.root, task, 1,
+                    node=node, command_slot=f"baseline-{index}",
+                )
             if outcome.needs_approval:
                 pending.append(outcome.approval_id)
             elif not outcome.allowed:
@@ -563,14 +585,42 @@ class NodeExecutor:
                 "case_id": case.id, "exit_code": outcome.exit_code,
                 "executed": outcome.allowed,
                 "output": _clamp_test_output(outcome.stdout, outcome.stderr, outcome.error),
+                **({"category": local_acceptance_evidence(outcome, binding)}
+                   if binding is not None else {}),
             })
-        return {
+        output = {
             "acceptance_spec": spec.to_payload(), "test_path": path,
             "test_hash": sha256(source.encode()).hexdigest(), "baseline": baseline,
             "demo_path": demo_path, "demo_hash": sha256(demo_source.encode()).hexdigest(),
             "baseline_failed": any(item["exit_code"] == 1 for item in baseline),
             "waiting": bool(pending), "pending_approvals": pending,
         }
+        if binding is not None:
+            output["local_executor"] = binding
+            red = {"assertion_failed", "requirement_not_implemented",
+                   "target_module_not_implemented"}
+            output["baseline_failed"] = any(item["category"] in red for item in baseline)
+            output["local_baseline_valid"] = (not pending and all(
+                item["category"] in red | {"passed"} for item in baseline))
+            if not pending and not output["local_baseline_valid"]:
+                output.update(self._acceptance_wait("local_baseline_invalid"))
+        return output
+
+    @staticmethod
+    def _acceptance_wait(reason):
+        return {"waiting": True, "waiting_kind": "configuration", "reason": reason,
+                "status": "unverified", "verified": False}
+
+    async def _local_acceptance_run(self, workspace, task, cwd, spec, path, case_id, binding):
+        if self._isolated_coding_required or not self._local_acceptance:
+            raise RuntimeError("Local acceptance unavailable for this backend")
+        return await self._process_broker.run_local_acceptance(
+            workspace, spec, path, case_id, binding, cwd=cwd, task_id=task.id,
+            scope=task.delegation_scope, command_origin="manifest",
+            source=str(task.actor.source or "interactive"),
+            requested_by=task.actor.user_id or "system",
+            resource_scope=task.workspace_id,
+        )
 
     async def _subtask(
         self, node: ExecutionNode, workspace: Workspace, task: Task
@@ -759,7 +809,10 @@ class NodeExecutor:
         planned.extend(await self._static_check_commands(workspace, sandbox_ref))
         design = self._output_for(nodes, NodeType.TEST_DESIGN)
         acceptance_spec = None
+        local_cases = {}
         if isinstance(design, dict):
+            if self._local_acceptance and local_evidence_applicability(design) != "match":
+                return self._acceptance_wait("local_executor_unknown_or_mismatched")
             acceptance_spec = AcceptanceSpec.from_payload(design.get("acceptance_spec"))
             test_path = str(design["test_path"])
             read = await self._file_broker.read_text(
@@ -776,10 +829,13 @@ class NodeExecutor:
             planned.extend(
                 (f"acceptance:{case.id}", command)
                 for case, command in zip(
-                    acceptance_spec.cases, acceptance_commands(acceptance_spec, test_path),
+                    acceptance_spec.cases,
+                    acceptance_commands(acceptance_spec, test_path, python="python"),
                     strict=True,
                 )
             )
+            if self._local_acceptance:
+                local_cases = {f"acceptance:{case.id}": case.id for case in acceptance_spec.cases}
             planned.append(("poc", ("python", demo_path)))
         elif task.metadata.get("require_acceptance_tests"):
             raise RuntimeError("Requirement acceptance tests are missing")
@@ -795,11 +851,20 @@ class NodeExecutor:
         for index, (kind, parts) in enumerate(planned):
             if not parts:
                 continue
-            outcome = await self._run_verification_command(
-                workspace, parts, cwd, task, attempts,
-                node=node, command_slot=f"evaluation-{index}",
-            )
-            command_outcome = classify_verification_command(outcome)
+            if kind in local_cases:
+                outcome = await self._local_acceptance_run(
+                    workspace, task, cwd, acceptance_spec, test_path,
+                    local_cases[kind], design["local_executor"])
+                evidence = local_acceptance_evidence(outcome, design["local_executor"])
+                command_outcome = (
+                    "passed" if evidence == "passed" else
+                    "approval_required" if outcome.needs_approval else "check_failed")
+            else:
+                outcome = await self._run_verification_command(
+                    workspace, parts, cwd, task, attempts,
+                    node=node, command_slot=f"evaluation-{index}",
+                )
+                command_outcome = classify_verification_command(outcome)
             passed = command_outcome == "passed"
             name = f"{kind}: {' '.join(parts)}"
             test_results.append(
@@ -821,7 +886,7 @@ class NodeExecutor:
                     "name": name,
                     "outcome": command_outcome,
                     "cwd": str(cwd),
-                    "command": list(parts),
+                    "command": list(outcome.command if kind in local_cases else parts),
                     "exit_code": outcome.exit_code,
                     "allowed": outcome.allowed,
                     "allowlisted": outcome.allowlisted,
@@ -874,6 +939,8 @@ class NodeExecutor:
             # verification result that predates the grant.
             "waiting": bool(pending_approvals),
             "pending_approvals": list(dict.fromkeys(pending_approvals)),
+            **({"local_executor": design["local_executor"],
+                "local_baseline_valid": design["local_baseline_valid"]} if local_cases else {}),
         }
         output["verification_report"] = build_verification_report(
             test_results, output,
@@ -1060,6 +1127,11 @@ class NodeExecutor:
                         "acceptance_spec", "baseline", "demo_path", "results", "cwd",
                         "verification_report",
                     )} if isinstance(evaluation, dict) else {}),
+                    **({"local_executor": evaluation["local_executor"]}
+                       if isinstance(evaluation, dict) and "local_executor" in evaluation else {}),
+                    **({"local_baseline_valid": evaluation["local_baseline_valid"]}
+                       if isinstance(evaluation, dict)
+                       and "local_baseline_valid" in evaluation else {}),
                 },
             },
         )
@@ -1087,6 +1159,15 @@ class NodeExecutor:
                 raise RuntimeError("Coding task produced no verified change proposal")
             return {"status": "no_change_proposal"}
         proposal = proposals[0]
+        verification = proposal.metadata.get("verification")
+        if self._local_acceptance or (
+            isinstance(verification, dict) and "local_executor" in verification
+        ):
+            applicability = (local_evidence_applicability(verification)
+                             if self._local_acceptance else "unknown")
+            if applicability != "match":
+                return {**self._acceptance_wait("local_executor_" + applicability),
+                        "applied": False}
         if proposal.status is ChangeProposalStatus.APPLIED:
             if proposal.metadata.get("verification_override"):
                 raise RuntimeError("Change was force-applied; the task is not verified")

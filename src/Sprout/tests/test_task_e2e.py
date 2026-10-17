@@ -498,6 +498,13 @@ def test_approving_a_withheld_command_wakes_the_parked_task(
             if record.task_id == task.id
         ]
         assert pending, "a withheld command must ask for approval"
+        # The CLI decision under test grants the bound Acceptance launcher.
+        # Ordinary manifest verification remains a separate, unchanged grant;
+        # explicitly approve that prerequisite without resuming the task.
+        ordinary = await runtime.authorize_task_process(task.id, ("pytest", "-q"))
+        assert ordinary.needs_approval
+        await runtime._approvals.decide(
+            ordinary.approval_id, True, decided_by="t", channel="cli")
         return task.id, pending[0].id
 
     task_id, approval_id = asyncio.run(park())

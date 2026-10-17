@@ -18,10 +18,16 @@ import asyncio
 import os
 import time
 from collections.abc import Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from Sprout.execution.acceptance import (
+    local_acceptance_command,
+    local_executor_applicability,
+    local_executor_binding,
+)
 from Sprout.execution.models import ProcessResult
 from Sprout.execution.policy_emit import emit_policy_decision
 from Sprout.execution.proc import OutputLimitExceeded, capture_bounded
@@ -71,6 +77,28 @@ class ProcessBroker:
         # Without a manager, REQUIRE_APPROVAL stays a refusal — the previous
         # behaviour, and the fail-safe default when none is wired.
         self._approvals = approvals
+        self._acceptance_context = ContextVar("local_acceptance", default=None)
+
+    async def run_local_acceptance(
+        self, workspace, spec, path, case_id, frozen, **kwargs,
+    ) -> ProcessResult:
+        """Mint identity inside the broker, never honor a caller's claimed ID.
+
+        A frozen value is a restriction, not authority. This entry builds its
+        own command and still traverses the unchanged policy/approval boundary.
+        """
+        if local_executor_applicability(frozen) != "match":
+            return ProcessResult(command=(), allowed=False, started=False,
+                                 error="Local acceptance executor unknown or mismatched")
+        binding = local_executor_binding()
+        command = local_acceptance_command(spec, path, case_id, binding)
+        token = self._acceptance_context.set((command, binding))
+        try:
+            # A CLI tool's upstream approval is never an Acceptance binding grant.
+            kwargs.pop("upstream_approval_granted", None)
+            return await self.run(workspace, command, **kwargs)
+        finally:
+            self._acceptance_context.reset(token)
 
     @property
     def commands(self) -> CommandRegistry:
@@ -104,6 +132,12 @@ class ProcessBroker:
         ):
             raise ValueError("Capture limit must be between 1 byte and 8 MiB")
         command_tuple = tuple(str(part) for part in command)
+        context = self._acceptance_context.get()
+        if context is not None and (
+            command_tuple != context[0] or local_executor_applicability(context[1]) != "match"
+        ):
+            return ProcessResult(command=command_tuple, allowed=False, started=False,
+                                 error="Local acceptance executor changed")
         cwd_path = Path(cwd or workspace.root)
         resource = ResourceRef(
             workspace_id=workspace.id,
@@ -259,7 +293,8 @@ class ProcessBroker:
         # internal context is injected server-side and is never part of the
         # user arguments, so the broker can honor it without asking twice.
         # A DENY is handled above and can never be relaxed here.
-        if upstream_approval_granted:
+        context = self._acceptance_context.get()
+        if upstream_approval_granted and context is None:
             return None
         if self._approvals is None:
             return replace(
@@ -286,6 +321,8 @@ class ProcessBroker:
             "task_id": task_id,
             "resource_scope": resource_scope,
         }
+        if context is not None:
+            approval_arguments["local_acceptance_executor_v1"] = context[1]
         if await self._approvals.is_approved(
             APPROVAL_TOOL,
             approval_arguments,
