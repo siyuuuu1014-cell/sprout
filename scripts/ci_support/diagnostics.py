@@ -15,6 +15,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from scripts.ci_support.acceptance_probe import acceptance_launch
 from Sprout.execution.models import ChangeProposalStatus
 from Sprout.orchestration.models import NodeStatus, NodeType
 from Sprout.security.approval import ApprovalStatus
@@ -186,6 +187,11 @@ def project(
                 "signals": _signals(_get(item, "output")),
             }
         )
+        if kind == "acceptance":
+            checks[-1]["launch_diagnostic"] = acceptance_launch(
+                command, _get(item, "output"),
+                executed=_get(item, "executed"), passed=_get(item, "passed"),
+            )
     projected_nodes = []
     for index, item in enumerate(nodes):
         metadata = _get(item, "metadata", {})
