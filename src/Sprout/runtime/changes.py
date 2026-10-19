@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 
 from Sprout.events import Event, EventBus
 from Sprout.events.catalog import VERIFICATION_OVERRIDDEN
-from Sprout.execution.acceptance import local_evidence_applicability
+from Sprout.execution.acceptance import verification_evidence_applicability
 from Sprout.execution.apply import ApplyBroker
 from Sprout.execution.models import (
     ApplyResult,
@@ -151,14 +151,11 @@ class ChangeProposalService:
             )
         blocker = proposal_verification_blocker(proposal)
         verification = proposal.metadata.get("verification")
-        if self._local_acceptance or (
-            isinstance(verification, dict) and "local_executor" in verification
-        ):
-            applicability = (local_evidence_applicability(verification)
-                             if self._local_acceptance else "unknown")
-            if applicability != "match":
-                blocker = "; ".join(filter(None, (
-                    blocker, "Local acceptance executor " + applicability)))
+        applicability = verification_evidence_applicability(
+            verification, local_execution_available=self._local_acceptance)
+        if applicability != "local_match":
+            blocker = "; ".join(filter(None, (
+                blocker, "Verification evidence executor " + applicability)))
         forced = force or allow_failing_tests
         if forced and not override_reason.strip():
             return ApplyResult(

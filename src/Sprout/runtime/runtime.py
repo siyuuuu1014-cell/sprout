@@ -576,6 +576,7 @@ class Runtime:
             approvals=self._approvals,
             local_acceptance=(not isinstance(
                 self._orchestrator_backend, TemporalOrchestratorBackend)
+                and not getattr(self, "_isolated_coding_required", False)
                 if local_acceptance is None else local_acceptance),
         )
 
@@ -2221,18 +2222,20 @@ class Runtime:
         }
         local_context = (not isinstance(self._orchestrator_backend, TemporalOrchestratorBackend)
                          and not getattr(self, "_isolated_coding_required", False))
-        if local_context or (isinstance(verification, dict) and "local_executor" in verification):
-            from Sprout.execution.acceptance import local_evidence_applicability
+        from Sprout.execution.acceptance import verification_evidence_applicability
 
-            applicability = (
-                local_evidence_applicability(verification) if local_context else "unknown")
-            payload["historical_verification"] = report.to_payload()
-            payload["current_applicability"] = applicability
-            if applicability != "match":
-                payload.update(verified=False, status="incomplete",
-                               blocker="Local acceptance executor " + applicability,
-                               failure_codes=list(dict.fromkeys(
-                                   [*report.failure_codes, "local_executor_" + applicability])))
+        evidence_state = verification_evidence_applicability(
+            verification, local_execution_available=local_context)
+        # Preserve existing public match/mismatch/unknown values; evidence
+        # without a proven origin must be projected even on non-Local runtimes.
+        applicability = evidence_state.removeprefix("local_")
+        payload["historical_verification"] = report.to_payload()
+        payload["current_applicability"] = applicability
+        if evidence_state != "local_match":
+            payload.update(verified=False, status="incomplete",
+                           blocker="Verification evidence executor " + evidence_state,
+                           failure_codes=list(dict.fromkeys(
+                               [*report.failure_codes, "local_executor_" + applicability])))
         return payload
 
     async def read_trajectory(self, task_id: str) -> list[TrajectoryEvent]:

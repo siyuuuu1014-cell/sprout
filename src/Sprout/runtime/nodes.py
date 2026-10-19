@@ -28,6 +28,7 @@ from Sprout.execution.acceptance import (
     local_executor_binding,
     render_acceptance_demo,
     render_acceptance_tests,
+    verification_evidence_applicability,
 )
 from Sprout.execution.apply import ApplyBroker
 from Sprout.execution.change import ChangeProposalBuilder
@@ -1160,14 +1161,12 @@ class NodeExecutor:
             return {"status": "no_change_proposal"}
         proposal = proposals[0]
         verification = proposal.metadata.get("verification")
-        if self._local_acceptance or (
-            isinstance(verification, dict) and "local_executor" in verification
-        ):
-            applicability = (local_evidence_applicability(verification)
-                             if self._local_acceptance else "unknown")
-            if applicability != "match":
-                return {**self._acceptance_wait("local_executor_" + applicability),
-                        "applied": False}
+        applicability = verification_evidence_applicability(
+            verification, local_execution_available=self._local_acceptance)
+        if applicability != "local_match":
+            return {**self._acceptance_wait(
+                "local_executor_" + applicability.removeprefix("local_")),
+                "applied": False}
         if proposal.status is ChangeProposalStatus.APPLIED:
             if proposal.metadata.get("verification_override"):
                 raise RuntimeError("Change was force-applied; the task is not verified")

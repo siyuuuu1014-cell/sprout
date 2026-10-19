@@ -114,6 +114,27 @@ def local_evidence_applicability(verification: object) -> str:
     return local_executor_applicability(verification.get("local_executor"))
 
 
+def verification_evidence_applicability(
+    verification: object, *, local_execution_available: bool,
+) -> str:
+    """Judge frozen evidence, never infer its origin from current configuration.
+
+    Existing Local v1 bindings can be checked against the server environment.
+    No currently supported non-Local proposal record proves both provenance and
+    current applicability: a passed report, legacy fingerprint, backend name or
+    caller-written metadata is not such proof. Those records remain unknown;
+    this function deliberately has no trusted_nonlocal success path.
+
+    local_execution_available is a server wiring restriction only. True cannot
+    establish provenance; False prevents applying host identity to a worker.
+    This read-only function never upgrades or rewrites frozen records.
+    """
+    state = local_evidence_applicability(verification)
+    if state == "unknown" or not local_execution_available:
+        return "unknown"
+    return "local_" + state
+
+
 def _local_acceptance_main():
     """Trusted launcher: observe collection/call phases, never infer from logs.
 
