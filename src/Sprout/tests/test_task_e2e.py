@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+from scripts.ci_support.diagnostics import git_state, runtime_failure
 from Sprout.cli.app import app
 from Sprout.config.loader import default_settings
 from Sprout.gateway.project_gateway import ProjectGateway
@@ -163,6 +164,7 @@ def test_delete_approval_survives_restart_and_controls_commit(tmp_path, decision
     subprocess.run(["git", "commit", "-qm", "add obsolete"], cwd=repo,
                    check=True, capture_output=True)
     before = _commit_count(repo)
+    diagnostic_before = git_state(repo)
     model = DeletingModel(edits={"src/export.py": VALID_EXPORT})
 
     async def run():
@@ -196,6 +198,9 @@ def test_delete_approval_survives_restart_and_controls_commit(tmp_path, decision
             else:
                 await restarted.decide_approval(deletion.id, True, decided_by="operator")
                 final = await _drive(restarted, await restarted.get_task(task.id))
+                if final.status.value != "completed":
+                    await runtime_failure(restarted, task.id, repo, diagnostic_before,
+                                          "e2e_" + mutation + "_approve")
             return final
         finally:
             await restarted.stop()
@@ -295,6 +300,7 @@ def test_requirement_output_controls_whether_the_change_lands(tmp_path: Path, co
     """
     repo = _repo(tmp_path)
     before = _commit_count(repo)
+    diagnostic_before = git_state(repo)
     model = FakeModel(
         edits={"src/export.py": VALID_EXPORT if correct else
                "def export_users(users):\n    return ''\n"}
@@ -306,6 +312,9 @@ def test_requirement_output_controls_whether_the_change_lands(tmp_path: Path, co
         gateway = ProjectGateway(runtime, transport="cli", default_user="t")
         task = await gateway.create_task(workspace.id, REQUIREMENT)
         final = await _drive(runtime, task)
+        if correct and final.status.value != "completed":
+            await runtime_failure(runtime, task.id, repo, diagnostic_before,
+                                  "e2e_requirement_true")
         await runtime.stop()
         return final
 
@@ -407,6 +416,7 @@ def test_a_proposal_offers_only_the_agents_edits(tmp_path: Path) -> None:
     have committed them.
     """
     repo = _repo(tmp_path, gitignore=False)
+    diagnostic_before = git_state(repo)
     model = FakeModel(edits={"src/export.py": VALID_EXPORT})
 
     async def run():
@@ -416,6 +426,8 @@ def test_a_proposal_offers_only_the_agents_edits(tmp_path: Path) -> None:
         task = await gateway.create_task(workspace.id, REQUIREMENT)
         final = await _drive(runtime, task)
         proposals = await runtime.storage.metadata.list_change_proposals(task.id)
+        if final.status.value != "completed":
+            await runtime_failure(runtime, task.id, repo, diagnostic_before, "e2e_proposal")
         await runtime.stop()
         return final, proposals
 
@@ -486,6 +498,13 @@ def test_approving_a_withheld_command_wakes_the_parked_task(
             if record.task_id == task.id
         ]
         assert pending, "a withheld command must ask for approval"
+        # The CLI decision under test grants the bound Acceptance launcher.
+        # Ordinary manifest verification remains a separate, unchanged grant;
+        # explicitly approve that prerequisite without resuming the task.
+        ordinary = await runtime.authorize_task_process(task.id, ("pytest", "-q"))
+        assert ordinary.needs_approval
+        await runtime._approvals.decide(
+            ordinary.approval_id, True, decided_by="t", channel="cli")
         return task.id, pending[0].id
 
     task_id, approval_id = asyncio.run(park())

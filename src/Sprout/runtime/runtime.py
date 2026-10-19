@@ -566,7 +566,7 @@ class Runtime:
             raise RuntimeError("MetadataStore is not configured")
         return metadata
 
-    def _changes(self) -> ChangeProposalService:
+    def _changes(self, *, local_acceptance: bool | None = None) -> ChangeProposalService:
         """The change proposal state machine; built per call, it holds no state."""
         return ChangeProposalService(
             self._metadata_or_raise(),
@@ -574,6 +574,10 @@ class Runtime:
             self._apply_broker,
             events=self.events,
             approvals=self._approvals,
+            local_acceptance=(not isinstance(
+                self._orchestrator_backend, TemporalOrchestratorBackend)
+                and not getattr(self, "_isolated_coding_required", False)
+                if local_acceptance is None else local_acceptance),
         )
 
     # Node budgets come from configuration, not from the compiler's defaults:
@@ -621,6 +625,8 @@ class Runtime:
             isolated_coding_required=getattr(self, "_isolated_coding_required", False),
             coding_session_factory=getattr(self, "_isolated_coding_session_factory", None),
             coding_commands=getattr(self, "_isolated_coding_commands", None),
+            local_acceptance=not isinstance(
+                self._orchestrator_backend, TemporalOrchestratorBackend),
         )
 
     # -- assembly ---------------------------------------------------------
@@ -2188,6 +2194,7 @@ class Runtime:
         node_id = None
         if proposal is not None:
             report = proposal_verification_report(proposal)
+            verification = proposal.metadata.get("verification")
         else:
             nodes = await self.storage.metadata.list_execution_nodes(task_id)
             evaluation = None
@@ -2205,13 +2212,31 @@ class Runtime:
                 NodeExecutor._test_results_from(evaluation),
                 evaluation,
             )
-        return {
+            verification = evaluation
+        payload = {
             "task_id": task_id,
             "task_status": task.status.value,
             "proposal_id": proposal.id if proposal else None,
             "evaluation_node_id": node_id,
             **report.to_payload(),
         }
+        local_context = (not isinstance(self._orchestrator_backend, TemporalOrchestratorBackend)
+                         and not getattr(self, "_isolated_coding_required", False))
+        from Sprout.execution.acceptance import verification_evidence_applicability
+
+        evidence_state = verification_evidence_applicability(
+            verification, local_execution_available=local_context)
+        # Preserve existing public match/mismatch/unknown values; evidence
+        # without a proven origin must be projected even on non-Local runtimes.
+        applicability = evidence_state.removeprefix("local_")
+        payload["historical_verification"] = report.to_payload()
+        payload["current_applicability"] = applicability
+        if evidence_state != "local_match":
+            payload.update(verified=False, status="incomplete",
+                           blocker="Verification evidence executor " + evidence_state,
+                           failure_codes=list(dict.fromkeys(
+                               [*report.failure_codes, "local_executor_" + applicability])))
+        return payload
 
     async def read_trajectory(self, task_id: str) -> list[TrajectoryEvent]:
         recorder = JsonlTrajectoryRecorder(trajectory_path(self._trajectory_dir, task_id))
@@ -2842,6 +2867,11 @@ class Runtime:
             prepared = replace(workspace, manifest=manifest)
             read_plan = self._scanner.build_read_plan(prepared, task)
             executor = self._executor(metadata)
+            if isinstance(executor, NodeExecutor):
+                # External scheduler activities retain their own executor;
+                # never bind submission-host Python into a worker command.
+                executor._local_acceptance = False
+                executor._changes = self._changes(local_acceptance=False)
             recorder = JsonlTrajectoryRecorder(trajectory_path(self._trajectory_dir, task.id))
             await recorder.record(
                 TrajectoryEvent(

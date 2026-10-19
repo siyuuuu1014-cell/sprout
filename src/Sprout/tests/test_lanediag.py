@@ -261,7 +261,10 @@ def test_module_entry_point_exposes_storage(tmp_path) -> None:
     """
     env = os.environ.copy()
     env.pop("SPROUT_CONFIG", None)
-    env["PYTHONPATH"] = str(REPO_ROOT / "src")
+    # Preserve the baseline's process-local home/bootstrap in child interpreters.
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, (
+        str(REPO_ROOT / "src"), env.get("PYTHONPATH", ""),
+    )))
     env["TEMPORAL_AUTO_START"] = "false"
     proc = subprocess.run(
         [sys.executable, "-m", "Sprout", "--help"],
