@@ -23,12 +23,14 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 
 import pytest
 
 from Sprout.config.loader import default_settings
 from Sprout.execution.models import ChangeProposal
+from Sprout.gateway.identity import Principal
 from Sprout.intents import detect_task_hint
 from Sprout.llm.echo import EchoModel
 from Sprout.llm.messages import LLMResponse, LLMStreamEvent, ToolCall
@@ -84,6 +86,11 @@ def _runtime(tmp_path: Path):
     settings.storage.blobs_dir = str(tmp_path / "blobs")
     settings.security.audit.path = str(tmp_path / "audit.jsonl")
     runtime = create_runtime(settings)
+    # This fixture acts as the trusted embedding adapter. Labels in Message
+    # are not credentials; all original task/history assertions remain intact.
+    principal = Principal("u-1", source="cli")
+    runtime.handle_stream = partial(runtime.handle_stream, principal=principal)
+    runtime.grant_workspace_consent = partial(runtime.grant_workspace_consent, principal=principal)
     runtime.models.register(EchoModel(), default=True)
     return runtime
 
@@ -284,7 +291,7 @@ async def test_consent_is_single_use(tmp_path) -> None:
 async def test_consent_without_a_held_turn_is_an_error(tmp_path) -> None:
     """A session that never asked cannot be granted consent out of thin air."""
     runtime = _runtime(tmp_path)
-    with pytest.raises(LookupError):
+    with pytest.raises(PermissionError):
         await runtime.grant_workspace_consent("no-such-session", user_id="u-1")
     await runtime.stop()
 

@@ -40,6 +40,7 @@ def test_intent_table_is_single_source() -> None:
         "intent.approval.requested",
         "intent.memory.requested",
         "intent.evolution.requested",
+        "intent.strategy.requested",
     }
 
 

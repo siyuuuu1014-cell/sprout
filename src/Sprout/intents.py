@@ -7,6 +7,7 @@ and the event catalog. They live here once; callers derive their tables from
 
 from __future__ import annotations
 
+import re
 from enum import StrEnum
 
 from Sprout.events.catalog import (
@@ -14,6 +15,7 @@ from Sprout.events.catalog import (
     INTENT_CONVERSATION_REQUESTED,
     INTENT_EVOLUTION_REQUESTED,
     INTENT_MEMORY_REQUESTED,
+    INTENT_STRATEGY_REQUESTED,
     INTENT_TASK_REQUESTED,
     INTENT_TOOL_REQUESTED,
     INTENT_WORKSPACE_REQUESTED,
@@ -28,6 +30,7 @@ class Intent(StrEnum):
     APPROVAL = "approval"
     MEMORY = "memory"
     EVOLUTION = "evolution"
+    STRATEGY = "strategy"
 
 
 DEFAULT_INTENT = Intent.CONVERSATION
@@ -41,6 +44,7 @@ INTENT_EVENTS: dict[Intent, str] = {
     Intent.APPROVAL: INTENT_APPROVAL_REQUESTED,
     Intent.MEMORY: INTENT_MEMORY_REQUESTED,
     Intent.EVOLUTION: INTENT_EVOLUTION_REQUESTED,
+    Intent.STRATEGY: INTENT_STRATEGY_REQUESTED,
 }
 
 #: Substrings that cheaply identify a coding task without an LLM round-trip.
@@ -83,23 +87,108 @@ def intent_event(intent: Intent | str) -> str:
     return INTENT_EVENTS[normalize_intent(str(intent))]
 
 
-def detect_task_hint(text: str) -> bool:
-    """True when ``text`` looks like an explicit coding task (slash or keyword)."""
+class WriteIntentDisposition(StrEnum):
+    """Text admission evidence, distinct from model intents and authorization."""
+
+    EXPLICIT_WRITE = "explicit_write"
+    KNOWN_NONWRITE = "known_nonwrite"
+    UNKNOWN = "unknown"
+
+
+def write_intent_disposition(text: str) -> WriteIntentDisposition:
+    """Pure, conservative text judgment; UNKNOWN needs explicit human confirmation.
+
+    No metadata, model labels or workspace signals can turn a known non-command
+    into a write instruction. Unfamiliar wording is not a negative judgment.
+    """
     stripped = text.strip()
+    if not stripped:
+        return WriteIntentDisposition.KNOWN_NONWRITE
     if stripped == "/task" or stripped.startswith("/task "):
-        return True
+        return WriteIntentDisposition.EXPLICIT_WRITE
     lowered = stripped.casefold()
-    # A question about ability or permission ("can you write code?", "can you
-    # help me?") is not an instruction to change files. It must not trip the
-    # workspace-consent gate: that gate interrupts a conversation and asks for a
-    # directory, which is exactly wrong for a yes/no question.
-    if lowered.endswith(("吗", "么", "?", "？")):
-        if any(
-            phrase in lowered
-            for phrase in ("能帮我", "可以帮我", "能不能", "可以吗", "能吗")
+    # A hint is admission to a write task, not just topical classification.
+    # Ambiguous/mixed/quoted requests require a fresh explicit instruction.
+    if any(mark in lowered for mark in ('"', "“", "”", "‘", "’", "`")):
+        return WriteIntentDisposition.KNOWN_NONWRITE
+    if any(term in lowered for term in (
+        "不要", "不需要", "不是让", "先别", "别执行", "不执行", "不改", "仅分析",
+        "只分析", "只读", "解释", "讨论", "总结", "现状", "进度", "已经", "昨天",
+        "上次", "如果", "是否", "为什么", "以后", "完成了吗", "不实施", "未授权",
+    )):
+        return WriteIntentDisposition.KNOWN_NONWRITE
+    if re.search(
+        r"\b(don't|do not|not|never|without|only|quote|quoted|explain|discuss|review|"
+        r"status|yesterday|finished|already|if|maybe|later|why|whether)\b", lowered
+    ):
+        return WriteIntentDisposition.KNOWN_NONWRITE
+    question = lowered.endswith(("?", "？", "吗", "么"))
+    # A leading action word can also name the subject of a statement. Match
+    # subject/predicate structure, not global words such as "任务" or "未完成":
+    # "请修复尚未完成的登录问题" still has an imperative with a relative object.
+    request = re.match(r"^(?:(?:please|kindly)\s+|请(?:帮我)?|帮我)", lowered)
+    body = lowered[request.end():] if request else lowered
+    body = body.rstrip("。.!！ ?？")
+    subject = re.search(r"的(?:任务|工作|需求|计划|进展|状态|工单|记录|方案)(.*)$", body)
+    if subject:
+        predicate = subject[1].lstrip("，,:： ")
+        if predicate and subject[1].lstrip().startswith((":", "：")):
+            return WriteIntentDisposition.KNOWN_NONWRITE
+        if predicate and re.match(
+            r"(?:目前|当前|仍|还|尚|此前|之前|早先|曾|正在|处于|处在|剩余|是|已|完成|结束)",
+            predicate,
         ):
-            return False
-    return any(keyword in lowered for keyword in TASK_KEYWORDS)
+            return WriteIntentDisposition.KNOWN_NONWRITE
+        relative_object = re.match(
+            r"(?:修复|修改|重构|实现|新增|补充)(?:目前|当前)?"
+            r"(?:尚未|仍未|未完成|待完成|还在|仍在|正在)", body
+        )
+        if not predicate and not request and not relative_object:
+            return WriteIntentDisposition.KNOWN_NONWRITE
+    if re.search(
+        r"(?:目前|当前|仍然|仍|还|尚)(?:仍然|仍|还|尚)?"
+        r"(?:未|没(?:有)?|在|正在|处于|处在|已(?:经)?|是|完成|结束|开始|排队|暂停|取消|失败|成功)"
+        r"[^的，。！？]*$", body
+    ) or re.search(r"(?:可能|也许|或许)(?:需要|要|会|得|可以|应当|应该)[^的，。！？]*$", body):
+        return WriteIntentDisposition.KNOWN_NONWRITE
+    if re.search(
+        r"\b(?:task|work|ticket|request|plan|progress)\s+"
+        r"(?:is|are|was|were|has|have|remains?|stays?)\b", body
+    ) or re.match(r"^(?:fix|refactor|implement|modify)\s+(?:for|of|is|was|remains|has)\b", body):
+        return WriteIntentDisposition.KNOWN_NONWRITE
+    if re.match(r"^(?:implementation|refactoring|modification|creation|addition)\s+(?:of|for)\b",
+                body):
+        return WriteIntentDisposition.KNOWN_NONWRITE
+    if re.search(r":\s*(?:pending|queued|paused|completed|unfinished)$", body):
+        return WriteIntentDisposition.KNOWN_NONWRITE
+    finite = re.search(r"\b(?:is|are|was|were|has been|have been|remains?)\b", body)
+    if finite and not re.search(
+        r"\b(?:that|which|who|whose|so|because|when)\b", body[:finite.start()]
+    ):
+        return WriteIntentDisposition.KNOWN_NONWRITE
+    if not request and re.search(r"\b(?:task|ticket|request|plan|progress)$", body):
+        return WriteIntentDisposition.KNOWN_NONWRITE
+    if question:
+        return WriteIntentDisposition.UNKNOWN
+    if re.match(r"^(?:请)?帮我|^请", lowered) and any(
+        keyword in lowered for keyword in TASK_KEYWORDS
+    ):
+        return WriteIntentDisposition.EXPLICIT_WRITE
+    # Require an imperative, not an arbitrary keyword buried in narration.
+    imperative = re.match(
+        r"^(?:(?:please|kindly)\s+|请(?:帮我)?|帮我)?(?:"
+        + "|".join(re.escape(keyword) + (r"n?\b" if keyword.endswith(" a")
+                                       else r"\b" if keyword.isascii() else "")
+                   for keyword in TASK_KEYWORDS)
+        + r")", lowered
+    )
+    return (WriteIntentDisposition.EXPLICIT_WRITE if imperative
+            else WriteIntentDisposition.UNKNOWN)
+
+
+def detect_task_hint(text: str) -> bool:
+    """Compatible bool fast path; UNKNOWN is not permission to create a Task."""
+    return write_intent_disposition(text) is WriteIntentDisposition.EXPLICIT_WRITE
 
 
 __all__ = [
@@ -107,7 +196,9 @@ __all__ = [
     "INTENT_EVENTS",
     "TASK_KEYWORDS",
     "Intent",
+    "WriteIntentDisposition",
     "detect_task_hint",
     "intent_event",
     "normalize_intent",
+    "write_intent_disposition",
 ]

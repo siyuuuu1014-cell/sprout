@@ -7,7 +7,7 @@ directly. It converts gateway input into Tasks and returns a GatewayResponse.
 from __future__ import annotations
 
 from Sprout.events import AUTH_ROLES_DISCARDED, Event
-from Sprout.gateway.identity import discarded_roles
+from Sprout.gateway.identity import Principal, discarded_roles
 from Sprout.gateway.task_actions import TaskActions
 from Sprout.gateway.task_adapter import (
     GatewayRequest,
@@ -67,8 +67,13 @@ class RuntimeGateway:
         )
         return await self.execute(request)
 
-    async def handle_message(self, message: Message) -> GatewayResponse:
-        outbound = await self._runtime.handle(message)
+    async def handle_message(
+        self, message: Message, *, principal: Principal | None = None, foreground: bool = False
+    ) -> GatewayResponse:
+        if foreground:
+            outbound = await self._runtime.handle(message, principal=principal, foreground=True)
+        else:
+            outbound = await self._runtime.handle(message, principal=principal)
         return GatewayResponse(
             task_id=outbound.session_id or "",
             status="completed",
@@ -80,6 +85,6 @@ class RuntimeGateway:
             },
         )
 
-    async def handle_stream(self, message: Message):
-        async for chunk in self._runtime.handle_stream(message):
+    async def handle_stream(self, message: Message, *, principal: Principal | None = None):
+        async for chunk in self._runtime.handle_stream(message, principal=principal):
             yield chunk

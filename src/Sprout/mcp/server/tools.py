@@ -115,7 +115,11 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
 
 
 def register_tools(server: Any, runtime: Runtime) -> None:
+    from Sprout.gateway.identity import Principal
     from Sprout.message.models import Message
+
+    # This server exposes one configured MCP operator, not caller-selected users.
+    principal = Principal(user_id="mcp-client", source="mcp_client")
 
     @server.tool(
         name="sprout_message",
@@ -128,7 +132,7 @@ def register_tools(server: Any, runtime: Runtime) -> None:
             user_id="mcp-client",
             session_id=session_id,
         )
-        reply = await runtime.handle(msg)
+        reply = await runtime.handle(msg, principal=principal)
         return reply.content
 
     @server.tool(
@@ -136,7 +140,9 @@ def register_tools(server: Any, runtime: Runtime) -> None:
         description="Create a new conversation session and return its id.",
     )
     async def sprout_session_create(user_id: str = "mcp-client") -> str:
-        session = await runtime.create_session(user_id)
+        if user_id != principal.user_id:
+            raise PermissionError("MCP session user selection is not supported")
+        session = await runtime.create_session(principal.user_id)
         return session.id
 
     @server.tool(
@@ -144,7 +150,7 @@ def register_tools(server: Any, runtime: Runtime) -> None:
         description="Return the stored turns of a session, oldest first.",
     )
     async def sprout_session_history(session_id: str, limit: int = 20) -> str:
-        turns = await runtime.history(session_id, limit=limit)
+        turns = await runtime.history(session_id, limit=limit, principal=principal)
         if not turns:
             return f"No history for session {session_id}."
         lines = [f"{turn.role}: {turn.content}" for turn in turns]

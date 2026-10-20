@@ -24,15 +24,8 @@ from Sprout.events import (
     AGENT_COMPLETED,
     AGENT_FAILED,
     AGENT_STARTED,
-    INTENT_APPROVAL_REQUESTED,
-    INTENT_CONVERSATION_REQUESTED,
-    INTENT_EVOLUTION_REQUESTED,
-    INTENT_MEMORY_REQUESTED,
     INTENT_RECOGNIZED,
-    INTENT_STRATEGY_REQUESTED,
     INTENT_TASK_REQUESTED,
-    INTENT_TOOL_REQUESTED,
-    INTENT_WORKSPACE_REQUESTED,
     MESSAGE_PERSISTED,
     MESSAGE_RECEIVED,
     MESSAGE_SENT,
@@ -59,7 +52,14 @@ from Sprout.execution.network_broker import NetworkBroker
 from Sprout.execution.process_broker import ProcessBroker
 from Sprout.execution.sandbox_tool import SandboxReadTool
 from Sprout.gateway.identity import Principal
-from Sprout.intents import Intent, detect_task_hint, intent_event
+from Sprout.intents import (
+    INTENT_EVENTS,
+    Intent,
+    WriteIntentDisposition,
+    detect_task_hint,
+    intent_event,
+    write_intent_disposition,
+)
 from Sprout.llm.language import detect_language
 from Sprout.llm.messages import LLMMessage
 from Sprout.message.attachment import Attachment
@@ -93,7 +93,7 @@ from Sprout.skills.resolver import SkillResolver
 from Sprout.storage.contracts.knowledge import KnowledgeItem
 from Sprout.storage.contracts.metadata import MetadataStore
 from Sprout.storage.embeddings import HashingEmbedder
-from Sprout.storage.lanes import CONTEXT_SNAPSHOTS_NS
+from Sprout.storage.lanes import CONTEXT_SNAPSHOTS_NS, SixLaneFanout
 from Sprout.task.models import (
     DelegationScope,
     Task,
@@ -114,16 +114,7 @@ logger = logging.getLogger("Sprout.runtime")
 
 _DEFAULT_TRAJECTORY_DIR = Path.home() / ".sprout" / "data" / "trajectory"
 
-_INTENT_EVENTS: dict[str, str] = {
-    "conversation": INTENT_CONVERSATION_REQUESTED,
-    "task": INTENT_TASK_REQUESTED,
-    "workspace": INTENT_WORKSPACE_REQUESTED,
-    "tool": INTENT_TOOL_REQUESTED,
-    "approval": INTENT_APPROVAL_REQUESTED,
-    "memory": INTENT_MEMORY_REQUESTED,
-    "evolution": INTENT_EVOLUTION_REQUESTED,
-    "strategy": INTENT_STRATEGY_REQUESTED,
-}
+_INTENT_EVENTS: dict[str, str] = {str(intent): event for intent, event in INTENT_EVENTS.items()}
 _PROJECT_ANALYZE_TERMS = (
     "scan project",
     "analyze project",
@@ -455,9 +446,8 @@ class Runtime:
         self._router: AgentRouter | None = None
         self._started = False
         self._worker_stop_requested = False
-        #: Inbound message ids whose workspace consent has already been
-        #: answered. Consent is one task, and one answer: without this a second
-        #: "yes" would queue the same instruction again under a second task.
+        #: Compatibility-only observation; never authorizes or prevents a claim.
+        #: Durable authority resides in WorkspaceConsentStore, not this set.
         self._consumed_consents: set[str] = set()
 
     def _register_skill_tools(self) -> None:
@@ -733,7 +723,11 @@ class Runtime:
         await worker.stop()
 
     # -- online path ---------------------------------------------------------
-    async def handle(self, message: Message) -> OutboundMessage:
+    async def handle(
+        self, message: Message, *, principal: Principal | None = None,
+        foreground: bool = False,
+        _resume_calls: list | None = None,
+    ) -> OutboundMessage:
         """Run one online turn. Middleware -> session -> router -> context -> agent."""
         if self._router is None:
             raise RuntimeError("No agent router configured")
@@ -745,8 +739,13 @@ class Runtime:
                 message.id,
             )
         )
+        message = self._entry_message(message, principal)
+        if _resume_calls is not None:
+            message = replace(
+                message, metadata={**message.metadata, "resume_tool_calls": _resume_calls}
+            )
         message = await self.middleware.before(message)
-        session = await self._sessions.resolve(message)
+        session = await self._sessions.resolve(message, principal=principal)
         context = await self._contexts.build(
             message=message,
             session=session,
@@ -762,7 +761,9 @@ class Runtime:
         # only exist once a task is compiled — so an explicit "write me a file"
         # was answered by an agent that could not do it, and nothing said why.
         # Now it asks which directory instead of degrading.
-        handled = await self._dispatch_task_intent(message, context, session)
+        handled = await self._dispatch_task_intent(
+            message, context, session, principal=principal, foreground=foreground
+        )
         if handled is not None:
             outbound, held = handled
             if held is not None:
@@ -816,7 +817,34 @@ class Runtime:
         )
         return await self.middleware.after(message, outbound)
 
-    async def _handle_task(self, message: Message, session) -> OutboundMessage:
+    @staticmethod
+    def _entry_message(message: Message, principal: Principal | None) -> Message:
+        """Embedding arguments are trusted; message payload/metadata never are.
+
+        Transport adapters must resolve the principal themselves and must not
+        deserialize these keyword arguments from external input.
+        """
+        reserved = {
+            "intent", "intent_name", "intent_event", "intent_confidence", "trigger_event",
+            "origin_channel", "foreground_task", "workspace_consent", "execution_mode",
+            "resume_tool_calls", "pending_tool_calls", "roles", "role", "authenticated",
+            "permissions", "allowed_actions", "delegation_scope",
+            "entry_principal_v1", WORKSPACE_CONSENT_KEY, "proposed_workspace_root",
+        }
+        return replace(
+            message,
+            user_id=principal.user_id if principal else "anonymous",
+            channel=(
+                {"mcp_client": "mcp"}.get(principal.source, principal.source)
+                if principal and principal.source else "automation"
+            ),
+            metadata={key: value for key, value in message.metadata.items() if key not in reserved},
+        )
+
+    async def _handle_task(
+        self, message: Message, session, *, principal: Principal | None = None,
+        foreground: bool = False,
+    ) -> OutboundMessage:
         """Queue a coding task for background execution and ack immediately.
 
         Callers reach this when the message carries a workspace id. A task
@@ -837,11 +865,13 @@ class Runtime:
         # The surface the operator used, not the one the resume happens to run
         # on. A consented task resumes over an internal message, and taking the
         # source from there filed every such task as ``unknown``.
-        source = str(message.metadata.get("origin_channel") or message.channel or "")
+        # No caller-selected channel or metadata can turn unattended input into
+        # an interactive approval source. Unresolved embeddings are unattended.
+        source = principal.source if principal is not None else "automation"
         task = await self.create_task(
             workspace_id,
             message.content,
-            actor=Principal(user_id=message.user_id or "anonymous", source=source),
+            actor=Principal(user_id=principal.user_id if principal else "anonymous", source=source),
             source=source,
             # Recorded so a later turn can report this task back to the session
             # that asked for it. Without it a parked task belongs to no
@@ -855,7 +885,7 @@ class Runtime:
                 ),
             },
         )
-        if message.metadata.get("foreground_task"):
+        if foreground:
             result = await self.execute(task)
             return OutboundMessage(
                 content="",
@@ -976,7 +1006,8 @@ class Runtime:
         return detect_task_hint(message.content)
 
     async def _dispatch_task_intent(
-        self, message: Message, context, session
+        self, message: Message, context, session, *, principal: Principal | None = None,
+        foreground: bool = False,
     ) -> tuple[OutboundMessage, Message | None] | None:
         """Handle a coding intent, or return ``None`` to run the turn normally.
 
@@ -997,6 +1028,8 @@ class Runtime:
         :meth:`_workspace_request_from_agent`, runs after the agent and handles
         the case this gate cannot see.
         """
+        if not detect_task_hint(message.content or ""):
+            return None
         if self._asks_for_workspace(message, context, session):
             held, outbound = await self._request_workspace(message, session)
             return outbound, held
@@ -1006,7 +1039,9 @@ class Runtime:
         if explicit:
             # The message names its workspace: the resume from a consent grant,
             # or a caller that bound one deliberately. Already an instruction.
-            return await self._handle_task(message, session), None
+            return await self._handle_task(
+                message, session, principal=principal, foreground=foreground
+            ), None
         # A workspace the operator consented to earlier in this session. Without
         # this the session only stopped *asking*; the coding intent still fell
         # through to the conversation path, where the agent has no write tools —
@@ -1029,7 +1064,9 @@ class Runtime:
             message,
             metadata={**dict(message.metadata), "workspace_id": workspace_id},
         )
-        return await self._handle_task(message, session), None
+        return await self._handle_task(
+            message, session, principal=principal, foreground=foreground
+        ), None
 
     async def _workspace_request_from_agent(
         self, result: AgentResult, message: Message, session
@@ -1048,6 +1085,8 @@ class Runtime:
         re-asking would loop.
         """
         if not result.metadata.get(WORKSPACE_REQUESTED_KEY):
+            return None
+        if write_intent_disposition(message.content) is WriteIntentDisposition.KNOWN_NONWRITE:
             return None
         if str(message.metadata.get("workspace_id") or ""):
             return None
@@ -1123,6 +1162,18 @@ class Runtime:
                 "origin_channel": message.channel,
             },
         )
+        confirmation = (
+            "还不能确定你是否要求写入。请明确确认：是否将下面保存的原始输入作为编码任务执行，"
+            f"并以 {proposed} 作为本次任务的工作区？\n\n原始输入：\n{message.content}\n\n"
+            "只有明确同意才会打开工作区并编排此任务；修改落地仍需后续验证与审批。"
+            if write_intent_disposition(message.content) is WriteIntentDisposition.UNKNOWN
+            else (
+                "这是一个编码任务，但当前会话没有绑定工作区，所以我暂时不能动手"
+                "（这个会话里的 agent 没有写文件的工具）。\n\n"
+                f"是否以 {proposed} 作为本次任务的工作区？\n"
+                "同意后改动会先做在 git 沙箱副本里，落地到你的目录之前还会再问你一次。"
+            )
+        )
         await self.events.publish(
             Event(
                 INTENT_TASK_REQUESTED,
@@ -1136,12 +1187,7 @@ class Runtime:
             )
         )
         return held, OutboundMessage(
-            content=(
-                "这是一个编码任务，但当前会话没有绑定工作区，所以我暂时不能动手"
-                "（这个会话里的 agent 没有写文件的工具）。\n\n"
-                f"是否以 {proposed} 作为本次任务的工作区？\n"
-                "同意后改动会先做在 git 沙箱副本里，落地到你的目录之前还会再问你一次。"
-            ),
+            content=confirmation,
             channel=message.channel,
             session_id=session.id,
             correlation_id=message.id,
@@ -1198,10 +1244,20 @@ class Runtime:
             metadata = dict(envelope.get("message_metadata") or {})
             if not metadata.get(WORKSPACE_CONSENT_KEY):
                 continue
-            if str(envelope.get("message_id") or "") in self._consumed_consents:
-                return None, None
             return turn, metadata
         return None, None
+
+    def _workspace_consent_store(self):
+        # The existing fan-out exposes its authoritative store publicly. Claims
+        # are not derived writes and must not fan out or swallow store errors.
+        store = self._session_store
+        if isinstance(store, SixLaneFanout):
+            store = store.authority
+        if not all(callable(getattr(store, name, None)) for name in (
+            "issue_workspace_consent", "claim_workspace_consent",
+        )):
+            raise LookupError("Backend lacks durable workspace consent capability")
+        return store
 
     async def grant_workspace_consent(
         self,
@@ -1209,6 +1265,8 @@ class Runtime:
         *,
         root: str | Path | None = None,
         user_id: str = "anonymous",
+        principal: Principal | None = None,
+        foreground: bool = False,
     ) -> OutboundMessage:
         """Record consent for the instruction held by :meth:`_request_workspace`.
 
@@ -1219,17 +1277,26 @@ class Runtime:
         Single-task by construction: the held turn is consumed once, and the
         workspace id it produces rides only the resumed message. Answering
         again is an error, not a second task.
+
+        This separate trusted-adapter action is affirmative human confirmation
+        of the saved instruction, never an automatic response to a model flag.
         """
+        owned = await self._sessions.require_owner(session_id, principal)
+        original = self._sessions.frozen_principal(owned)
         held, metadata = await self._held_workspace_consent(session_id)
         if held is None or metadata is None:
             raise LookupError(f"No pending workspace consent for session {session_id!r}")
+        if write_intent_disposition(held.content) is WriteIntentDisposition.KNOWN_NONWRITE:
+            raise LookupError("Held instruction is not a coding request; issue a fresh instruction")
+        store = self._workspace_consent_store()
+        if await store.claim_workspace_consent(owned, held, str(uuid4())) is not True:
+            raise LookupError("Consent unavailable or already claimed; issue a fresh instruction")
         proposed = str(metadata.get("proposed_workspace_root") or "")
         workspace = await self.open_workspace(
             root if root is not None else Path(proposed or Path.cwd())
         )
-        # Marked consumed before the task is queued: a second answer must fail
-        # even if queueing the first one is slow.
-        self._consumed_consents.add(str(dict(held.metadata or {}).get("message_id") or ""))
+        # The durable claim remains consumed even if open/bind/create/submit
+        # raises. Never release it or infer Task success from consumption.
         session = await self._session_store.get_session(session_id)
         if session is None:
             raise LookupError(f"Unknown session: {session_id!r}")
@@ -1241,7 +1308,7 @@ class Runtime:
             Message(
                 content=held.content,
                 channel="internal",
-                user_id=user_id,
+                user_id=original.user_id,
                 session_id=session_id,
                 metadata={
                     "workspace_id": workspace.id,
@@ -1258,6 +1325,8 @@ class Runtime:
                 },
             ),
             session,
+            principal=original,
+            foreground=foreground and original.source == "cli",
         )
 
     async def _recognize_intent(self, message: Message, context):
@@ -1265,9 +1334,7 @@ class Runtime:
         intent = str(classification.get("intent") or "conversation")
         if intent not in _INTENT_EVENTS:
             intent = "conversation"
-        trigger_event = str(classification.get("trigger_event") or _INTENT_EVENTS[intent])
-        if trigger_event not in _INTENT_EVENTS.values():
-            trigger_event = _INTENT_EVENTS[intent]
+        trigger_event = _INTENT_EVENTS[intent]
         confidence = _clamp_float(classification.get("confidence"), default=0.5)
         payload = {
             "intent": intent,
@@ -1319,17 +1386,6 @@ class Runtime:
         return enriched, context
 
     async def _classify_intent_with_llm(self, message: Message, context) -> dict[str, Any]:
-        explicit = message.metadata.get("intent") or message.metadata.get("intent_name")
-        if isinstance(explicit, str) and explicit:
-            intent = explicit.strip()
-            return {
-                "intent": intent,
-                "trigger_event": message.metadata.get("intent_event")
-                or _INTENT_EVENTS.get(intent, f"intent.{intent}.requested"),
-                "confidence": message.metadata.get("intent_confidence", 1.0),
-                "reason": "metadata override",
-            }
-
         # Cheap task hint before spending an LLM call: an explicit coding task
         # ("修复…", "/task …") is already decidable from the text alone.
         if detect_task_hint(message.content or ""):
@@ -1444,16 +1500,7 @@ class Runtime:
             "recent_conversation": recent,
             "similar_context_from_vector_db": similar_context,
         }
-        allowed = {
-            "conversation": INTENT_CONVERSATION_REQUESTED,
-            "task": INTENT_TASK_REQUESTED,
-            "workspace": INTENT_WORKSPACE_REQUESTED,
-            "tool": INTENT_TOOL_REQUESTED,
-            "approval": INTENT_APPROVAL_REQUESTED,
-            "memory": INTENT_MEMORY_REQUESTED,
-            "evolution": INTENT_EVOLUTION_REQUESTED,
-            "strategy": INTENT_STRATEGY_REQUESTED,
-        }
+        allowed = _INTENT_EVENTS
         return (
             "Choose exactly one intent from this JSON object, where the value is "
             "the event to trigger:\n"
@@ -1463,7 +1510,9 @@ class Runtime:
             f"Input:\n{json.dumps(context_payload, ensure_ascii=False, default=str)}"
         )
 
-    async def handle_stream(self, message: Message):
+    async def handle_stream(
+        self, message: Message, *, principal: Principal | None = None, foreground: bool = False
+    ):
         """Run one online turn and stream the agent's text chunks."""
         if self._router is None:
             raise RuntimeError("No agent router configured")
@@ -1475,8 +1524,9 @@ class Runtime:
                 message.id,
             )
         )
+        message = self._entry_message(message, principal)
         message = await self.middleware.before(message)
-        session = await self._sessions.resolve(message)
+        session = await self._sessions.resolve(message, principal=principal)
         context = await self._contexts.build(
             message=message,
             session=session,
@@ -1489,7 +1539,9 @@ class Runtime:
         # the CLI REPL never reached the coding graph even when a workspace was
         # present — the ask-for-workspace fix would have been unreachable from
         # the one surface a user types into.
-        handled = await self._dispatch_task_intent(message, context, session)
+        handled = await self._dispatch_task_intent(
+            message, context, session, principal=principal, foreground=foreground
+        )
         if handled is not None:
             outbound, held = handled
             yield StreamChunk(content=outbound.content)
@@ -1620,12 +1672,15 @@ class Runtime:
         *,
         user_id: str = "anonymous",
         content: str = "Continue",
+        principal: Principal | None = None,
     ) -> OutboundMessage:
         """Resume a turn that paused on an approval.
 
         Looks up the latest assistant turn that carried ``pending_tool_calls``
         and re-enters the online path with those calls attached.
         """
+        owned = await self._sessions.require_owner(session_id, principal)
+        original = self._sessions.frozen_principal(owned)
         pending = None
         for turn in reversed(await self.history(session_id, limit=50)):
             if turn.role != "assistant":
@@ -1638,12 +1693,12 @@ class Runtime:
             raise LookupError(f"No pending approval found for session {session_id!r}")
         message = Message(
             content=content,
-            channel="internal",
-            user_id=user_id,
+            channel=original.source,
+            user_id=original.user_id,
             session_id=session_id,
             metadata={"resume_tool_calls": pending},
         )
-        return await self.handle(message)
+        return await self.handle(message, principal=original, _resume_calls=pending)
 
     async def resume_pending_task(
         self,
@@ -1651,8 +1706,11 @@ class Runtime:
         *,
         user_id: str = "anonymous",
         response_language: str = "",
+        principal: Principal | None = None,
     ) -> OutboundMessage:
         """Resume approved pending tool calls without appending a new user turn."""
+        owned = await self._sessions.require_owner(session_id, principal)
+        original = self._sessions.frozen_principal(owned)
         if self._router is None:
             raise RuntimeError("No agent router configured")
         pending = None
@@ -1667,8 +1725,8 @@ class Runtime:
             raise LookupError(f"No pending approval found for session {session_id!r}")
         message = Message(
             content="",
-            channel="internal",
-            user_id=user_id,
+            channel=original.source,
+            user_id=original.user_id,
             session_id=session_id,
             metadata={
                 "resume_tool_calls": pending,
@@ -1676,7 +1734,7 @@ class Runtime:
             },
         )
         message = await self.middleware.before(message)
-        session = await self._sessions.resolve(message)
+        session = await self._sessions.resolve(message, principal=principal)
         context = await self._contexts.build(
             message=message,
             session=session,
@@ -1747,6 +1805,17 @@ class Runtime:
             session.id, "assistant", assistant_body, metadata=assistant_envelope_dict
         )
         await self._session_store.append_turn(user_turn)
+        if message.metadata.get(WORKSPACE_CONSENT_KEY) is True:
+            # Only this freshly persisted server-held turn can be issued. Old
+            # history is never scanned to create eligibility. A crash between
+            # append and issue leaves an unclaimable turn, not an inferred grant.
+            try:
+                consent_store = self._workspace_consent_store()
+            except LookupError:
+                consent_store = None  # Ordinary unsupported conversations still persist.
+            if consent_store is not None:
+                if await consent_store.issue_workspace_consent(session, user_turn) is not True:
+                    raise LookupError("Could not issue durable workspace consent")
         await Runtime._persist_attachments(self, user_turn, message)
         await self._session_store.append_turn(assistant_turn)
         stored = list(await self._session_store.recent_turns(session.id, limit=2))
@@ -1873,7 +1942,16 @@ class Runtime:
         await self.events.publish(Event(SESSION_CREATED, {"session_id": session.id}, session.id))
         return session
 
-    async def history(self, session_id: str, limit: int = 50) -> list[Turn]:
+    async def history(
+        self, session_id: str, limit: int = 50, *, principal: Principal | None = None
+    ) -> list[Turn]:
+        """Trusted embedding read; adapters must supply their resolved principal.
+
+        Without a principal this retains the privileged in-process inspection
+        API. It must not be exposed as a remote identity-free history endpoint.
+        """
+        if principal is not None:
+            await self._sessions.require_owner(session_id, principal)
         return list(await self._session_store.recent_turns(session_id, limit=limit))
 
     async def get_session(self, session_id: str) -> Session | None:
@@ -2973,9 +3051,16 @@ class Runtime:
     async def _resume_session_after_approval(self, record: ApprovalRecord) -> None:
         """Continue a chat turn that parked on this approval's pending tool calls."""
         try:
+            session = await self._session_store.get_session(record.session_id)
+            if session is None:
+                raise PermissionError("Session unavailable")
+            original = self._sessions.frozen_principal(session)
+            if record.requested_by != original.user_id:
+                raise PermissionError("Approval session identity mismatch")
             await self.resume_pending_task(
                 record.session_id,
-                user_id=record.requested_by or "approval",
+                user_id=original.user_id,
+                principal=original,
             )
         except LookupError as exc:
             # Another channel may have already resumed the same parked turn.

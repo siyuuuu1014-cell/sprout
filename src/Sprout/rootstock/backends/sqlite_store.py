@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from datetime import UTC, datetime
+from hashlib import sha256
 from typing import Any
 
 from Sprout.message.attachment import Attachment
@@ -53,6 +54,45 @@ CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(
 """
 )
 
+# Additive v1 domain table: no historical records are issued/backfilled.
+CONSENT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS workspace_consents_v1 (
+    session_id TEXT NOT NULL,
+    held_turn_id TEXT NOT NULL,
+    version INTEGER NOT NULL CHECK(version=1),
+    snapshot_json TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('pending','claimed')),
+    claimant TEXT,
+    issued_at TEXT NOT NULL,
+    claimed_at TEXT,
+    PRIMARY KEY(session_id, held_turn_id),
+    CHECK((state='pending' AND claimant IS NULL AND claimed_at IS NULL)
+       OR (state='claimed' AND claimant IS NOT NULL AND claimed_at IS NOT NULL))
+);
+"""
+
+
+def _consent_snapshot(session: Session, turn: Turn) -> str:
+    """Only authority records, never message metadata, supply owner/source."""
+    principal = session.metadata.get("entry_principal_v1")
+    envelope = turn.metadata
+    if (not isinstance(principal, dict)
+            or set(principal) != {"user_id", "source", "authenticated"}
+            or not session.user_id or principal.get("user_id") != session.user_id
+            or not isinstance(principal.get("source"), str) or not principal["source"]
+            or type(principal.get("authenticated")) is not bool
+            or turn.session_id != session.id or turn.role != "user"
+            or envelope.get("user_id") != session.user_id
+            or envelope.get("channel") != {"mcp_client": "mcp"}.get(
+                principal["source"], principal["source"])
+            or envelope.get("message_metadata", {}).get("workspace_consent_required") is not True
+            or envelope.get("blob_uri") or turn.content_blob_uri):
+        raise ValueError("Consent authority snapshot unavailable")
+    return json.dumps({"version": 1, "session_id": session.id, "held_turn_id": turn.id,
+                       "owner": session.user_id, "principal": principal,
+                       "content_sha256": sha256(turn.content.encode()).hexdigest(),
+                       "envelope": envelope}, sort_keys=True, ensure_ascii=False)
+
 
 def _row_to_turn(row) -> Turn:
     return row_to_turn(row)
@@ -71,6 +111,7 @@ class SqliteSessionStore:
         from Sprout.memory.outbox import migrate_outbox
 
         migrate_outbox(db)
+        db.executescript(CONSENT_SCHEMA)
 
     @property
     def database(self) -> SqliteDatabase:
@@ -128,6 +169,62 @@ class SqliteSessionStore:
         from Sprout.memory.outbox import append_turn_with_outbox
 
         await append_turn_with_outbox(self._db, turn)
+
+    async def _consent_authority(self, session: Session, turn: Turn):
+        snapshot = _consent_snapshot(session, turn)
+        row = await self._db.fetchone(
+            "SELECT s.metadata_json AS session_json, t.metadata_json AS turn_json "
+            "FROM sessions s JOIN turns t ON t.session_id=s.id "
+            "WHERE s.id=? AND s.user_id=? AND t.id=? AND t.role='user' AND t.content=?",
+            (session.id, session.user_id, turn.id, turn.content),
+        )
+        if row is None:
+            return None
+        live_session = Session(session.id, session.user_id,
+                               metadata=json.loads(row["session_json"]))
+        live_turn = Turn(session.id, "user", turn.content, id=turn.id,
+                         metadata=json.loads(row["turn_json"]))
+        if _consent_snapshot(live_session, live_turn) != snapshot:
+            return None
+        return snapshot, row["session_json"], row["turn_json"]
+
+    async def issue_workspace_consent(self, session: Session, turn: Turn) -> bool:
+        """Trusted server operation; never issue by scanning legacy history."""
+        authority = await self._consent_authority(session, turn)
+        if authority is None:
+            return False
+        snapshot, session_json, turn_json = authority
+        changed = await self._db.execute(
+            "INSERT OR IGNORE INTO workspace_consents_v1 "
+            "(session_id,held_turn_id,version,snapshot_json,state,issued_at) "
+            "SELECT ?,?,1,?,'pending',? WHERE EXISTS "
+            "(SELECT 1 FROM sessions s JOIN turns t ON t.session_id=s.id "
+            "WHERE s.id=? AND s.user_id=? AND s.metadata_json=? "
+            "AND t.id=? AND t.role='user' AND t.content=? AND t.metadata_json=?)",
+            (session.id, turn.id, snapshot, datetime.now(UTC).isoformat(),
+             session.id, session.user_id, session_json, turn.id, turn.content, turn_json),
+        )
+        return changed == 1
+
+    async def claim_workspace_consent(self, session: Session, turn: Turn, claimant: str) -> bool:
+        """Single durable pending->claimed transition. No release/timeout/retry."""
+        if not claimant:
+            raise ValueError("Consent claimant required")
+        authority = await self._consent_authority(session, turn)
+        if authority is None:
+            return False
+        snapshot, session_json, turn_json = authority
+        changed = await self._db.execute(
+            "UPDATE workspace_consents_v1 SET state='claimed',claimant=?,claimed_at=? "
+            "WHERE session_id=? AND held_turn_id=? AND version=1 "
+            "AND state='pending' AND snapshot_json=? AND EXISTS "
+            "(SELECT 1 FROM sessions s JOIN turns t ON t.session_id=s.id "
+            "WHERE s.id=? AND s.user_id=? AND s.metadata_json=? "
+            "AND t.id=? AND t.role='user' AND t.content=? AND t.metadata_json=?)",
+            (claimant, datetime.now(UTC).isoformat(), session.id, turn.id, snapshot,
+             session.id, session.user_id, session_json, turn.id, turn.content, turn_json),
+        )
+        return changed == 1
 
     async def save_attachment(
         self,

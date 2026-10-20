@@ -13,6 +13,21 @@ def acceptance_test_path(task_id: str) -> str:
     return f"tests/test_sprout_acceptance_{sha256(task_id.encode()).hexdigest()[:16]}.py"
 
 
+def _literal_line(line: str) -> str:
+    # Literal input/output values may be indivisible; suppress only real long lines.
+    return line + "  # noqa: E501" if len(line) > 100 else line
+
+
+def _public_call_lines(case) -> list[str]:
+    lines = []
+    arguments = f"*{case.args!r}" if case.args else ""
+    if case.kwargs:
+        lines.append(_literal_line(f"    kwargs = {case.kwargs!r}"))
+        arguments += (", " if arguments else "") + "**kwargs"
+    lines.append(_literal_line(f"    actual = target({arguments})"))
+    return lines
+
+
 def render_acceptance_tests(spec: AcceptanceSpec) -> str:
     lines = [
         '"""Requirement input/output cases generated before implementation."""',
@@ -25,10 +40,10 @@ def render_acceptance_tests(spec: AcceptanceSpec) -> str:
         lines.extend([
             f"def test_{case.id}():",
             f"    target = importlib.import_module({module!r}).{function}",
-            f"    actual = target(*{case.args!r}, **{case.kwargs!r})  # noqa: E501",
+            *_public_call_lines(case),
             "    if inspect.isawaitable(actual):",
             "        actual = asyncio.run(actual)",
-            f"    assert actual == {case.expected_output!r}  # noqa: E501", "",
+            _literal_line(f"    assert actual == {case.expected_output!r}"), "",
         ])
     return "\n".join(lines)
 
@@ -321,10 +336,10 @@ def render_acceptance_demo(spec: AcceptanceSpec) -> str:
         "sys.path.insert(0, str(Path(__file__).resolve().parents[1]))", "",
         "def main():",
         f"    target = importlib.import_module({module!r}).{function}",
-        f"    actual = target(*{case.args!r}, **{case.kwargs!r})  # noqa: E501",
+        *_public_call_lines(case),
         "    if inspect.isawaitable(actual):",
         "        actual = asyncio.run(actual)",
-        f"    assert actual == {case.expected_output!r}  # noqa: E501",
+        _literal_line(f"    assert actual == {case.expected_output!r}"),
         "    print(json.dumps(actual, ensure_ascii=False))", "",
         "if __name__ == '__main__':", "    main()", "",
     ])

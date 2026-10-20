@@ -10,7 +10,7 @@ from starlette.responses import JSONResponse, StreamingResponse
 from Sprout.gateway.transport_gateways import WebGateway
 from Sprout.message.models import Message
 
-from ..auth import caller_user_id, principal_of
+from ..auth import WebAuth, caller_user_id, principal_of
 
 if TYPE_CHECKING:
     from starlette.requests import Request
@@ -39,7 +39,11 @@ def create_chat_routes(runtime: Runtime) -> list:
             session_id=data.get("session_id"),
         )
         try:
-            response = await WebGateway(runtime).handle_message(message)
+            response = await WebGateway(runtime).handle_message(
+                message, principal=principal_of(request) or WebAuth().anonymous_principal()
+            )
+        except PermissionError:
+            return JSONResponse({"error": "session unavailable"}, status_code=404)
         except Exception as exc:  # noqa: BLE001 - surface a clean 500
             return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=500)
         return JSONResponse(
@@ -60,7 +64,10 @@ def create_chat_routes(runtime: Runtime) -> list:
         owner_error = await _ownership_error(runtime, request, session_id)
         if owner_error is not None:
             return owner_error
-        turns = await runtime.history(session_id, limit=limit)
+        turns = await runtime.history(
+            session_id, limit=limit,
+            principal=principal_of(request) or WebAuth().anonymous_principal(),
+        )
         return JSONResponse(
             {
                 "session_id": session_id,
@@ -94,7 +101,10 @@ def create_chat_routes(runtime: Runtime) -> list:
                     request, str(data.get("user_id") or "web-user")
                 ),
                 content=content,
+                principal=principal_of(request) or WebAuth().anonymous_principal(),
             )
+        except PermissionError:
+            return JSONResponse({"error": "session unavailable"}, status_code=404)
         except Exception as exc:  # noqa: BLE001 - surface a clean error
             return JSONResponse(
                 {"error": f"{type(exc).__name__}: {exc}"},
@@ -120,6 +130,11 @@ def create_chat_routes(runtime: Runtime) -> list:
                 status_code=400,
             )
 
+        if data.get("session_id"):
+            owner_error = await _ownership_error(runtime, request, data["session_id"])
+            if owner_error is not None:
+                return owner_error
+
         async def events():
             def sse(payload):
                 return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
@@ -133,7 +148,9 @@ def create_chat_routes(runtime: Runtime) -> list:
                     ),
                     session_id=data.get("session_id"),
                 )
-                async for chunk in WebGateway(runtime).handle_stream(message):
+                async for chunk in WebGateway(runtime).handle_stream(
+                    message, principal=principal_of(request) or WebAuth().anonymous_principal()
+                ):
                     if chunk.error is not None:
                         yield sse({"type": "error", "message": chunk.error})
                         return
@@ -184,12 +201,10 @@ async def _ownership_error(
     to authenticated callers, so the unauthenticated loopback default keeps
     working.
     """
-    principal = principal_of(request)
-    if principal is None or not principal.authenticated:
-        return None
+    principal = principal_of(request) or WebAuth().anonymous_principal()
     session = await runtime.get_session(session_id)
     if session is None:
         return JSONResponse({"error": "session not found"}, status_code=404)
-    if session.user_id and session.user_id != principal.user_id:
+    if not session.user_id or session.user_id != principal.user_id:
         return JSONResponse({"error": "session not found"}, status_code=404)
     return None

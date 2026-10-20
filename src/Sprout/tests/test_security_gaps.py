@@ -226,6 +226,9 @@ class _UnusedClient:
 
 
 class _StubStateStore:
+    async def get_sync_buf(self) -> str:
+        return ""
+
     def __init__(self) -> None:
         self.tokens: dict[str, str] = {}
 
@@ -251,7 +254,7 @@ def _gateway(
     return WeixinIlinkGateway(
         None,  # type: ignore[arg-type]  # a rejected sender never reaches runtime
         client=_UnusedClient(),  # type: ignore[arg-type]
-        account=WeixinIlinkAccount(token="t"),
+        account=WeixinIlinkAccount(token="t", account_id="test-bot"),
         state_store=_StubStateStore(),  # type: ignore[arg-type]
         allowed_users=allowed_users,
         **kwargs,
@@ -291,11 +294,12 @@ async def test_an_unconfigured_gateway_ignores_every_sender() -> None:
 
 @pytest.mark.asyncio
 async def test_only_the_literal_open_policy_admits_a_stranger() -> None:
+    from Sprout.tests.test_r02_ilink_identity_boundary import polled
     admitted: list[str] = []
     gateway = _gateway(dm_policy="open")
     _record_admissions(gateway, admitted)
 
-    result = await gateway.handle_inbound(_inbound("stranger"))
+    result = await polled(gateway, _inbound("stranger"))
 
     assert admitted == ["stranger"]
     assert "ignored" not in result
@@ -303,6 +307,7 @@ async def test_only_the_literal_open_policy_admits_a_stranger() -> None:
 
 @pytest.mark.asyncio
 async def test_a_mistyped_admission_policy_falls_back_to_the_allowlist() -> None:
+    from Sprout.tests.test_r02_ilink_identity_boundary import polled
     """A typo must not widen access, and must not shut the gateway either."""
     admitted: list[str] = []
     gateway = _gateway(dm_policy="opne", allowed_users=("friend",))
@@ -314,7 +319,7 @@ async def test_a_mistyped_admission_policy_falls_back_to_the_allowlist() -> None
     }
     assert admitted == []
 
-    assert "ignored" not in await gateway.handle_inbound(
+    assert "ignored" not in await polled(gateway,
         _inbound("friend", message_id="m2")
     )
     assert admitted == ["friend"]

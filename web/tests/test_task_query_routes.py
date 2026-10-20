@@ -78,11 +78,11 @@ def test_foreign_identity_parameters_and_invalid_observation():
     headers = {"Authorization": "Bearer test-token", "X-Sprout-User": "other"}
     with client:
         response = client.get(f"/api/project/tasks/{task.id}/report", headers=headers)
-        assert response.status_code == 403
+        assert response.status_code == 400  # Legacy identity-selection header refused.
         rpc = client.post("/api/rpc", headers=headers, json={
             "id": 1, "method": "task.report", "params": {
                 "task_id": task.id, "principal": {"user_id": "web-user"}}})
-        assert rpc.json()["error"]["code"] == "FORBIDDEN"
+        assert rpc.status_code == 400
         runtime.get_task_submissions.assert_not_called()
         headers.pop("X-Sprout-User")
         assert client.get(f"/api/project/tasks/{task.id}/observe?wait_seconds=nan",

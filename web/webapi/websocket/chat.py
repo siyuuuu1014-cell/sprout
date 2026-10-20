@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 from Sprout.message.converter import outbound_to_dict
 from Sprout.message.models import Message
 
-from ..auth import caller_user_id
+from ..auth import WebAuth, caller_user_id, principal_of
 
 if TYPE_CHECKING:
     from starlette.websockets import WebSocket
@@ -42,7 +42,10 @@ def create_ws_chat_endpoint(runtime: Runtime):
                 )
                 if data.get("stream"):
                     try:
-                        async for chunk in runtime.handle_stream(message):
+                        async for chunk in runtime.handle_stream(
+                            message,
+                            principal=principal_of(websocket) or WebAuth().anonymous_principal(),
+                        ):
                             if chunk.error is not None:
                                 await websocket.send_json(
                                     {"type": "error", "message": chunk.error}
@@ -65,7 +68,10 @@ def create_ws_chat_endpoint(runtime: Runtime):
                         )
                     continue
                 try:
-                    outbound = await runtime.handle(message)
+                    outbound = await runtime.handle(
+                        message,
+                        principal=principal_of(websocket) or WebAuth().anonymous_principal(),
+                    )
                 except Exception as exc:  # noqa: BLE001 - keep the socket alive
                     await websocket.send_json({"error": f"{type(exc).__name__}: {exc}"})
                     continue

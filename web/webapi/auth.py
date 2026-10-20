@@ -18,9 +18,9 @@ Rules:
   opposite shape — asking for authentication and then silently running without it
   — and that is exactly the failure this avoids.
 
-The principal resolved here carries ``authenticated=True`` and is built from the
-server side, never from the request body: a caller cannot name the ``user_id``
-whose sessions and memory it wants.
+The shared token authenticates one operator, not independent people. Both modes
+use a fixed server identity. Legacy user-selection headers are rejected when
+authentication is enabled; historical labelled sessions are not reassigned.
 """
 
 from __future__ import annotations
@@ -38,8 +38,7 @@ from Sprout.gateway.identity import Principal
 if TYPE_CHECKING:
     from Sprout.config.settings import SecuritySettings
 
-#: Optional header letting one shared token stand for several people. Absent, the
-#: whole surface runs as :data:`DEFAULT_WEB_USER`.
+#: Legacy identity-selection header. No longer an authorization input.
 USER_HEADER = "X-Sprout-User"
 
 DEFAULT_WEB_USER = "web-user"
@@ -91,17 +90,20 @@ class WebAuth:
             presented.encode("utf-8"), expected.encode("utf-8")
         ):
             return (401, "Invalid or missing API token")
+        if USER_HEADER in headers:
+            return (
+                400,
+                "X-Sprout-User is no longer supported: the shared token identifies "
+                "one fixed operator. Remove this header; historical labelled "
+                "sessions are not automatically reassigned.",
+            )
         return None
 
     def principal_for(self, headers: Headers) -> Principal:
-        """The authenticated caller, derived on the server side."""
-        # Header values are not trusted as an identity in the authorization
-        # sense — they only split one operator's token into labelled sessions.
-        claimed = (headers.get(USER_HEADER, "") or "").strip()
-        user_id = claimed or DEFAULT_WEB_USER
+        """Fixed operator after token validation, never a header-selected user."""
         return Principal(
-            user_id=user_id,
-            display_name=user_id,
+            user_id=DEFAULT_WEB_USER,
+            display_name=DEFAULT_WEB_USER,
             authenticated=True,
             source="web",
         )
@@ -160,15 +162,14 @@ def principal_of(request: Any) -> Principal | None:
 def caller_user_id(request: Any, fallback: str = DEFAULT_WEB_USER) -> str:
     """The ``user_id`` for session/memory scoping.
 
-    An authenticated principal wins over anything in the body: identity comes
-    from the entry-point adapter, not from the caller (AUTHZ §2.1). The body is
-    only consulted when authentication is off, so local development keeps
-    working.
+    A resolved authenticated principal wins. With authentication off (or no
+    middleware), use the fixed local operator, never a body/header fallback.
+    ``fallback`` remains accepted for source compatibility, but is not trusted.
     """
     principal = principal_of(request)
     if principal is not None and principal.authenticated:
         return principal.user_id
-    return fallback
+    return DEFAULT_WEB_USER
 
 
 def warn_if_exposed(host: str, auth: WebAuth, logger: Any) -> None:

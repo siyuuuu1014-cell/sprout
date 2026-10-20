@@ -42,11 +42,19 @@ class CLIGateway:
             )
         )
 
-    async def handle_message(self, message: Message) -> GatewayResponse:
-        return await self._gateway.handle_message(message)
+    async def handle_message(
+        self, message: Message, *, foreground: bool = False
+    ) -> GatewayResponse:
+        from Sprout.gateway.local_identity import current_cli_principal
+
+        return await self._gateway.handle_message(
+            message, principal=current_cli_principal(), foreground=foreground
+        )
 
     async def handle_stream(self, message: Message):
-        async for chunk in self._gateway.handle_stream(message):
+        from Sprout.gateway.local_identity import current_cli_principal
+
+        async for chunk in self._gateway.handle_stream(message, principal=current_cli_principal()):
             yield chunk
 
 
@@ -83,11 +91,13 @@ class WebGateway:
             )
         )
 
-    async def handle_message(self, message: Message) -> GatewayResponse:
-        return await self._gateway.handle_message(message)
+    async def handle_message(
+        self, message: Message, *, principal: Principal | None = None
+    ) -> GatewayResponse:
+        return await self._gateway.handle_message(message, principal=principal)
 
-    async def handle_stream(self, message: Message):
-        async for chunk in self._gateway.handle_stream(message):
+    async def handle_stream(self, message: Message, *, principal: Principal | None = None):
+        async for chunk in self._gateway.handle_stream(message, principal=principal):
             yield chunk
 
 

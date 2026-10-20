@@ -16,11 +16,13 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from weakref import WeakKeyDictionary
 
 import httpx
 
@@ -38,6 +40,22 @@ DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com"
 CHANNEL_VERSION = "2.2.0"
 ILINK_APP_ID = "bot"
 CLIENT_VERSION_INT = (2 << 16) | (2 << 8) | 0
+_STATE_ACCOUNT_OWNERS: WeakKeyDictionary = WeakKeyDictionary()
+
+
+def validate_account_id(value: str) -> str:
+    """Preserve a real account ID verbatim, or reject before state access."""
+    if (
+        not isinstance(value, str)
+        or not re.fullmatch(r"[A-Za-z0-9_@-][A-Za-z0-9_@.-]{0,127}", value)
+        or value.endswith(".")
+        or value.split(".", 1)[0].upper() in {
+            "CON", "PRN", "AUX", "NUL",
+            *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10)),
+        }
+    ):
+        raise ValueError("A nonempty, safe iLink account ID is required; legacy state is unchanged")
+    return value
 
 LONG_POLL_TIMEOUT = 35.0
 API_TIMEOUT = 15.0
@@ -381,6 +399,7 @@ class WeixinIlinkGateway:
         state_store: WeixinIlinkStateStore | None = None,
         dedup_store: _InMemoryDedupStore | None = None,
     ) -> None:
+        self._account_id = validate_account_id(account.account_id)
         self._runtime = runtime
         self._gateway = RuntimeGateway(runtime, transport="weixin_ilink")
         self._client = client
@@ -391,10 +410,35 @@ class WeixinIlinkGateway:
         self._warn_about_admission()
         self._router = router or WeixinIlinkRouter()
         self._state_store = state_store or WeixinIlinkStateStore()
+        previous = _STATE_ACCOUNT_OWNERS.get(self._state_store)
+        backend = getattr(self._state_store, "_store", None)
+        if (
+            (previous is not None and previous != self._account_id)
+            or (backend is not None and backend._path.name != f"{self._account_id}.json")
+        ):
+            raise ValueError("Ambiguous iLink account state binding; state left unchanged")
+        _STATE_ACCOUNT_OWNERS[self._state_store] = self._account_id
         self._dedup = dedup_store or _InMemoryDedupStore(dedup_ttl_seconds)
         self._sync_buf = ""
         self._sync_buf_loaded = False
         self._background_tasks: set[asyncio.Task[None]] = set()
+        # Only successful responses of this instance's configured client mint
+        # receipts. Object identity plus a value snapshot prevents DTO forgery,
+        # mutation and reuse outside the synchronous dispatch lifetime.
+        self._poll_receipts: dict[int, tuple[WeixinIlinkInbound, tuple, Principal]] = {}
+
+    @staticmethod
+    def _inbound_identity(message: WeixinIlinkInbound) -> tuple:
+        return (message.from_user_id, message.text, message.message_id, message.context_token)
+
+    def _poll_principal(self, message: WeixinIlinkInbound) -> Principal:
+        receipt = self._poll_receipts.get(id(message))
+        if (
+            receipt is None or receipt[0] is not message
+            or receipt[1] != self._inbound_identity(message)
+        ):
+            raise PermissionError("Trusted iLink poll receipt required")
+        return receipt[2]
 
     def _warn_about_admission(self) -> None:
         """Say out loud whom this gateway admits (audit R10).
@@ -424,6 +468,8 @@ class WeixinIlinkGateway:
             self._sync_buf = await self._state_store.get_sync_buf()
             self._sync_buf_loaded = True
         update = await self._client.get_updates(self._sync_buf)
+        if not isinstance(update, dict) or update.get("ret") != 0:
+            raise PermissionError("iLink polling did not return a successful response")
         next_sync_buf = (
             _first_str(update, "get_updates_buf")
             or _first_str(update, "next_sync_buf")
@@ -434,8 +480,20 @@ class WeixinIlinkGateway:
             await self._state_store.set_sync_buf(next_sync_buf)
         results = []
         for message in self.parse_updates(update):
-            result = await self.handle_inbound(message)
-            results.append(result)
+            if self._dm_policy != "open" and message.from_user_id not in self._allowed_users:
+                results.append(await self.handle_inbound(message))
+                continue
+            identity = json.dumps([self._account_id, message.from_user_id], separators=(",", ":"))
+            principal = Principal(
+                user_id="ilink:v1:" + hashlib.sha256(identity.encode("utf-8")).hexdigest(),
+                source="weixin_ilink", authenticated=False,
+            )
+            self._poll_receipts[id(message)] = (message, self._inbound_identity(message), principal)
+            try:
+                result = await self.handle_inbound(message)
+                results.append(result)
+            finally:
+                self._poll_receipts.pop(id(message), None)
         return {"update": update, "results": results}
 
     async def run_forever(self) -> None:
@@ -463,6 +521,8 @@ class WeixinIlinkGateway:
         # mistyped policy cannot silently widen access (audit R10).
         if self._dm_policy != "open" and peer not in self._allowed_users:
             return {"ok": True, "ignored": "not_allowed"}
+
+        self._poll_principal(message)
 
         key = message.message_id or self._message_key(message)
         if not await self._dedup.acquire(key):
@@ -500,6 +560,7 @@ class WeixinIlinkGateway:
         instruction: str,
         context_token: str,
     ) -> dict[str, Any]:
+        principal = self._poll_principal(message)
         peer = message.from_user_id
         session_id = await self._state_store.get_session_id(peer)
         metadata = {"transport": "weixin_ilink"}
@@ -512,7 +573,8 @@ class WeixinIlinkGateway:
                 user_id=peer,
                 session_id=session_id or None,
                 metadata=metadata,
-            )
+            ),
+            principal=principal,
         )
         new_session_id = response.metadata.get("session_id") or session_id
         if new_session_id:
@@ -534,6 +596,7 @@ class WeixinIlinkGateway:
         *,
         workspace_id: str,
     ) -> dict[str, Any]:
+        principal = self._poll_principal(message)
         peer = message.from_user_id
         if not instruction:
             reply = "请补充任务指令，例如：/task 修复 README 中的链接"
@@ -549,7 +612,7 @@ class WeixinIlinkGateway:
         task = await self._runtime.create_task(
             target_workspace,
             instruction,
-            actor=Principal(user_id=peer),
+            actor=principal,
             source="weixin_ilink",
             message_id=message.message_id,
             delegation_scope=DelegationScope(

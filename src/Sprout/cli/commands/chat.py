@@ -45,6 +45,7 @@ from Sprout.cli.i18n import language_name as _language_name
 from Sprout.cli.i18n import set_language as _set_cli_language
 from Sprout.cli.i18n import supported_languages as _supported_languages
 from Sprout.gateway.identity import Principal
+from Sprout.gateway.local_identity import current_cli_principal
 from Sprout.llm.messages import Usage
 from Sprout.message.models import Message
 from Sprout.security.redact import Redactor
@@ -275,7 +276,8 @@ async def _chat(runtime, settings, *, message: str | None, session: str | None, 
                             "foreground_task": True,
                             **({"workspace_id": workspace_id} if workspace_id else {}),
                         },
-                    )
+                    ),
+                    foreground=True,
                 )
                 _render_cli_markdown(reply.content)
                 _print_reply_meta(reply.metadata)
@@ -576,7 +578,9 @@ async def _repl(
                 refresh_per_second=12,
                 vertical_overflow="crop",
             ) as live:
-                async for chunk in runtime.handle_stream(stream_message):
+                async for chunk in runtime.handle_stream(
+                    stream_message, principal=current_cli_principal(), foreground=True
+                ):
                     if chunk.error is not None:
                         response_error = chunk.error
                         break
@@ -593,7 +597,9 @@ async def _repl(
                         reply_metadata = dict(chunk.outbound.metadata)
         else:
             typer.echo(ui.muted(_L("  正在生成…", "  Generating…")))
-            async for chunk in runtime.handle_stream(stream_message):
+            async for chunk in runtime.handle_stream(
+                stream_message, principal=current_cli_principal(), foreground=True
+            ):
                 if chunk.error is not None:
                     response_error = chunk.error
                     break
@@ -824,6 +830,7 @@ async def _handle_cli_approval_prompt(
                 session_id,
                 user_id=user,
                 response_language=_current_cli_language(),
+                principal=current_cli_principal(),
             )
         except LookupError as exc:
             # A broker/event callback may have resumed the task while the CLI
@@ -949,7 +956,8 @@ async def _handle_cli_workspace_consent(
         return True
     try:
         outbound = await runtime.grant_workspace_consent(
-            session_id, root=proposed, user_id=user
+            session_id, root=proposed, user_id=user,
+            principal=current_cli_principal(), foreground=True,
         )
     except LookupError as exc:
         typer.echo(ui.warning(_workspace_consent_text("expired", error=str(exc))))

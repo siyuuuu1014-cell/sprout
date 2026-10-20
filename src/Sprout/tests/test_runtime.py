@@ -8,6 +8,7 @@ from Sprout.agent.executor import ActionExecutor
 from Sprout.agent.loop import AgentLoop
 from Sprout.context.builder import ContextBuilder
 from Sprout.events.types import AGENT_COMPLETED, MESSAGE_SENT
+from Sprout.gateway.identity import Principal
 from Sprout.llm.messages import LLMResponse, ToolCall
 from Sprout.llm.registry import ModelRegistry
 from Sprout.message.models import Message, OutboundMessage
@@ -27,7 +28,9 @@ async def test_runtime_handles_turn_and_persists_history() -> None:
     runtime, _ = build_runtime()
     await runtime.start()
 
-    reply = await runtime.handle(Message("hello", channel="cli", user_id="u-1"))
+    reply = await runtime.handle(
+        Message("hello", channel="cli", user_id="u-1"), principal=Principal("u-1", source="cli")
+    )
 
     assert reply.content == "Echo: hello"
     assert reply.channel == "cli"
@@ -42,10 +45,13 @@ async def test_runtime_handles_turn_and_persists_history() -> None:
 async def test_resume_pending_requires_previous_approval() -> None:
     runtime, _ = build_runtime()
     await runtime.start()
-    session = await runtime.create_session("u-1")
+    first = await runtime.handle(Message("hello"), principal=Principal("u-1", source="cli"))
+    session = await runtime.get_session(first.session_id)
 
     with pytest.raises(LookupError):
-        await runtime.resume_pending(session.id, user_id="u-1")
+        await runtime.resume_pending(
+            session.id, user_id="u-1", principal=Principal("u-1", source="cli")
+        )
 
     await runtime.stop()
 
@@ -81,7 +87,10 @@ async def test_resume_pending_task_continues_without_new_user_turn() -> None:
     )
     await runtime.start()
 
-    first = await runtime.handle(Message("run the risky tool", channel="cli", user_id="u-1"))
+    first = await runtime.handle(
+        Message("run the risky tool", channel="cli", user_id="u-1"),
+        principal=Principal("u-1", source="cli"),
+    )
     assert first.metadata["approval_required"] is True
     assert tool.seen == []
 
@@ -90,7 +99,9 @@ async def test_resume_pending_task_continues_without_new_user_turn() -> None:
     assert pending[0].session_id == first.session_id
     await approvals.decide(pending[0].id, True, decided_by="u-1")
 
-    resumed = await runtime.resume_pending_task(first.session_id, user_id="u-1")
+    resumed = await runtime.resume_pending_task(
+        first.session_id, user_id="u-1", principal=Principal("u-1", source="cli")
+    )
 
     assert resumed.content == "done after approval"
     assert tool.seen == [{"text": "resume"}]
@@ -133,7 +144,10 @@ async def test_decide_approval_resumes_chat_session() -> None:
     )
     await runtime.start()
 
-    first = await runtime.handle(Message("run risky", channel="cli", user_id="u-1"))
+    first = await runtime.handle(
+        Message("run risky", channel="cli", user_id="u-1"),
+        principal=Principal("u-1", source="cli"),
+    )
     pending = await approvals.pending()
 
     decided = await runtime.decide_approval(
@@ -180,7 +194,8 @@ async def test_streaming_approval_returns_metadata_without_legacy_text() -> None
     chunks = [
         chunk
         async for chunk in runtime.handle_stream(
-            Message("run risky tool", channel="cli", user_id="u-1")
+            Message("run risky tool", channel="cli", user_id="u-1"),
+            principal=Principal("u-1", source="cli"),
         )
     ]
 
