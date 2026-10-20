@@ -74,6 +74,15 @@ def public_summary(output: Path, summary: dict) -> None:
     path = output / "public-diagnostics"
     path.mkdir(exist_ok=True)
     (path / "baseline.json").write_text(json.dumps(public, indent=2), encoding="utf-8")
+    if (output / "l1.xml").is_file():
+        if __package__:
+            from .ci_support.junit_failures import failure_summary
+        else:
+            from ci_support.junit_failures import failure_summary
+
+        (path / "l1-failures.json").write_text(
+            json.dumps(failure_summary(output / "l1.xml", ROOT), indent=2), encoding="utf-8",
+        )
 
 
 def snapshot(destination: Path) -> None:
