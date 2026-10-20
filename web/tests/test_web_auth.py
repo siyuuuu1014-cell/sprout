@@ -145,9 +145,8 @@ def test_caller_user_id_prefers_the_authenticated_principal() -> None:
     anonymous = Principal(user_id="web-user", authenticated=False, source="web")
 
     assert caller_user_id(_FakeRequest(authenticated), "victim") == "operator"
-    # With authentication off the body is still honoured, so local development
-    # keeps working.
-    assert caller_user_id(_FakeRequest(anonymous), "someone") == "someone"
+    # R02 intentionally removes body-selected identities in local mode too.
+    assert caller_user_id(_FakeRequest(anonymous), "someone") == "web-user"
 
 
 def test_session_ownership_is_enforced_for_authenticated_callers(
@@ -158,18 +157,17 @@ def test_session_ownership_is_enforced_for_authenticated_callers(
         created = client.post(
             "/api/chat",
             json={"message": "hi", "user_id": "attacker"},
-            headers=_auth_headers("operator"),
+            headers=_auth_headers(),
         )
         assert created.status_code == 200
         session_id = created.json()["session_id"]
 
-        # The body's user_id was ignored: the session belongs to the caller the
-        # server authenticated, not to the name in the payload.
+        # Legacy label switching is explicitly rejected, not an isolation claim.
         assert client.get(
             f"/api/sessions/{session_id}/history", headers=_auth_headers("attacker")
-        ).status_code == 404
+        ).status_code == 400
         assert client.get(
-            f"/api/sessions/{session_id}/history", headers=_auth_headers("operator")
+            f"/api/sessions/{session_id}/history", headers=_auth_headers()
         ).status_code == 200
 
 
@@ -187,6 +185,26 @@ def test_web_auth_without_a_token_rejects_with_service_unavailable() -> None:
     assert rejection is not None
     assert rejection[0] == 503
     assert TOKEN_ENV in rejection[1]
+
+
+@pytest.mark.parametrize("label", ["alice", "bob", ""])
+def test_shared_token_rejects_identity_selection(label: str) -> None:
+    auth = WebAuth(enabled=True, token=TOKEN)
+    headers = Headers({"authorization": f"Bearer {TOKEN}", "X-Sprout-User": label})
+    rejection = auth.rejection(headers)
+    assert rejection is not None
+    assert rejection[0] == 400
+    assert TOKEN not in rejection[1]
+    # Even an internal direct call cannot turn the label into an identity.
+    principal = auth.principal_for(headers)
+    assert principal.user_id == "web-user"
+    assert principal.roles == ()
+    assert principal.authenticated
+
+
+def test_unauthenticated_identity_ignores_body_fallback() -> None:
+    assert caller_user_id(_FakeRequest(None), "alice") == "web-user"
+    assert caller_user_id(_FakeRequest(WebAuth().anonymous_principal()), "bob") == "web-user"
 
 
 def test_storage_status_masks_dsns_too(

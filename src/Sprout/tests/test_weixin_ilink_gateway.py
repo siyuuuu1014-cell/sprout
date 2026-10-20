@@ -17,6 +17,7 @@ from Sprout.gateway.channels.weixin_ilink import (
 )
 from Sprout.message.models import OutboundMessage
 from Sprout.task.models import Task, TaskResult, TaskStatus
+from Sprout.tests.test_r02_ilink_identity_boundary import polled
 
 
 class _FakeResult:
@@ -64,7 +65,8 @@ class _ConversationRuntime:
     def __init__(self) -> None:
         self.messages = []
 
-    async def handle(self, message):
+    async def handle(self, message, *, principal=None):
+        assert principal is not None and not principal.authenticated
         self.messages.append(message)
         return OutboundMessage(
             content="hello from SEMA",
@@ -192,7 +194,7 @@ def test_gateway_handles_dm_and_sends_reply() -> None:
             message_id="client-1",
             context_token="ctx-1",
         )
-        result = await gateway.handle_inbound(inbound)
+        result = await polled(gateway, inbound)
         assert result["ok"] is True
         assert result["task_id"] == ""
         assert result["session_id"] == "sess-1"
@@ -222,8 +224,8 @@ def test_gateway_deduplicates_redelivered_message() -> None:
             text="hello",
             message_id="client-1",
         )
-        first = await gateway.handle_inbound(inbound)
-        second = await gateway.handle_inbound(inbound)
+        first = await polled(gateway, inbound)
+        second = await polled(gateway, inbound)
         assert first["ok"] is True
         assert second["ignored"] == "duplicate"
 
@@ -260,7 +262,7 @@ def test_gateway_task_prefix_uses_project_execution() -> None:
             default_workspace_id="workspace-1",
             dm_policy="open",
         )
-        result = await gateway.handle_inbound(
+        result = await polled(gateway,
             WeixinIlinkInbound(
                 from_user_id="user-1",
                 text="/task explain this project",
@@ -293,14 +295,14 @@ def test_gateway_reuses_conversation_session() -> None:
             account=WeixinIlinkAccount(token="token-1", account_id="bot-1"),
             dm_policy="open",
         )
-        await gateway.handle_inbound(
+        await polled(gateway,
             WeixinIlinkInbound(
                 from_user_id="user-1",
                 text="hello",
                 message_id="client-1",
             )
         )
-        await gateway.handle_inbound(
+        await polled(gateway,
             WeixinIlinkInbound(
                 from_user_id="user-1",
                 text="hello again",

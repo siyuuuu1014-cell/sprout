@@ -58,7 +58,8 @@ async def test_pending_approval_can_be_approved_over_http(runtime, database) -> 
         assert decided.status_code == 200
         body = decided.json()
         assert body["status"] == "approved"
-        assert body["decided_by"] == "reviewer"
+        # R02: body labels cannot choose the authorized decision identity.
+        assert body["decided_by"] == "web-user"
 
         # A second decision on the same record is a conflict, not a new grant.
         again = client.post(f"/api/approvals/{record.id}/decide", json={"approve": False})

@@ -84,8 +84,7 @@ def test_chat_rejects_invalid_bodies(runtime, database) -> None:
 def test_history_of_unknown_session_is_empty(runtime, database) -> None:
     with _client(runtime, database) as client:
         response = client.get("/api/sessions/nope/history")
-    assert response.status_code == 200
-    assert response.json()["turns"] == []
+    assert response.status_code == 404  # Missing/foreign sessions are indistinguishable.
 
 
 # -- project layer ----------------------------------------------------------------

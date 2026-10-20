@@ -149,3 +149,19 @@ class SessionStore(Protocol):
     async def count_sessions(self) -> int: ...
 
     async def count_turns(self) -> int: ...
+
+
+class WorkspaceConsentStore(Protocol):
+    """Optional v1 authority capability, not required for ordinary conversations.
+
+    Issue only after the server persists a new held Turn. Claims are permanent,
+    atomic across connections, and bind the exact Session/Turn snapshot. False
+    or an unknown/exceptional outcome never authorizes workspace or task effects.
+    Unsupported backends must not emulate this with read-then-write or locks.
+    """
+
+    async def issue_workspace_consent(self, session: Session, turn: Turn) -> bool: ...
+
+    async def claim_workspace_consent(
+        self, session: Session, turn: Turn, claimant: str,
+    ) -> bool: ...

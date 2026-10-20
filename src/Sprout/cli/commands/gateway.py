@@ -21,6 +21,7 @@ from Sprout.gateway.channels.weixin_ilink import (
     WeixinIlinkClient,
     WeixinIlinkGateway,
     WeixinIlinkStateStore,
+    validate_account_id,
 )
 
 app = typer.Typer(help="Run external messaging channel gateways.", no_args_is_help=True)
@@ -608,11 +609,25 @@ async def _run_weixin_ilink(
 ) -> None:
     from Sprout.runtime.lifecycle import managed
 
+    account_id = validate_account_id(account.account_id)
+    # Keep existing paths/JSON, but reject aliasing rather than normalize an ID
+    # or follow a state-file link into another account's directory.
+    for directory in (context_path.parent / "state", context_path):
+        target = directory / f"{account_id}.json"
+        if (
+            directory.is_symlink() or directory.is_junction()
+            or target.is_symlink() or target.is_junction()
+        ):
+            raise ValueError("Ambiguous iLink account state path; state left unchanged")
+        if directory.is_dir() and any(
+            item.name.casefold() == target.name.casefold() and item.name != target.name
+            for item in directory.iterdir()
+        ):
+            raise ValueError("Conflicting iLink account state filename; state left unchanged")
     client = WeixinIlinkClient(
         token=account.token,
         base_url=account.base_url,
     )
-    account_id = account.account_id or "account"
     state_store = WeixinIlinkStateStore(
         context_path.parent / "state" / f"{account_id}.json",
         legacy_context_path=context_path / f"{account_id}.json",

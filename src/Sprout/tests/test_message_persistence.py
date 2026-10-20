@@ -75,7 +75,9 @@ async def test_handle_persists_envelope_on_authority_turns() -> None:
     runtime, _ = build_runtime()
     message = Message("hello", channel="cli", user_id="u-1", metadata={"k": "v"})
 
-    reply = await runtime.handle(message)
+    from Sprout.gateway.identity import Principal
+
+    reply = await runtime.handle(message, principal=Principal("u-1", source="cli"))
     turns = await runtime.history(reply.session_id)
 
     assert [turn.role for turn in turns] == ["user", "assistant"]
