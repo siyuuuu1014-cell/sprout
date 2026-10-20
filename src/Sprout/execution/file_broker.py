@@ -14,11 +14,13 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from Sprout.execution.file_access import FileBoundaryError, file_operation
 from Sprout.execution.models import FileResult, SandboxRef
 from Sprout.execution.policy_emit import emit_policy_decision
-from Sprout.security.access import AccessDecision, ActionRequest, ActionType
+from Sprout.security.access import AccessDecision, ActionRequest, ActionType, PolicyDecision
 from Sprout.security.engine import PolicyEngine
 from Sprout.task.models import DelegationScope
+from Sprout.task.paths import bound_scope_path, scope_path
 from Sprout.workspace.classifier import classify, is_device_namespace
 from Sprout.workspace.models import ResourceKind, ResourceRef
 
@@ -45,10 +47,59 @@ class FileBroker:
 
     def _classify(self, target: Path, sandbox: SandboxRef) -> ResourceKind:
         return classify(
-            target,
-            workspace_root=sandbox.root,
+            target.relative_to(self._root(sandbox)).as_posix(),
             overrides=self._classify_overrides,
         )
+
+    @staticmethod
+    def _root(sandbox: SandboxRef) -> Path:
+        parsed = scope_path(str(sandbox.root))
+        if parsed is None or not parsed.anchor:
+            raise FileBoundaryError("explicit_absolute_root_required")
+        return Path(parsed.text())
+
+    async def _access(
+        self, sandbox, target, request, operation, *, approved=False, preflight=False,
+        content="", newline=None,
+    ):
+        """Reauthorize the pinned resource just before data access/effects.
+
+        The async policy event is preserved; a final decision emits the same
+        event contract after the worker finishes. No caller can supply approved
+        through the public API: delete obtains it from authorize_delete only.
+        """
+        final = []
+
+        def authorize():
+            decision = self._policy.decide(request)
+            if not request.scope.permits(request.action.value, request.resource.path):
+                expired = request.scope.is_expired()
+                decision = PolicyDecision(
+                    AccessDecision.DENY, "DelegationScope expired or outside resource boundary",
+                    matched_rules=("scope:expired" if expired else "scope:denied",),
+                )
+            final.append(decision)
+            allowed = ({AccessDecision.SANDBOX_ONLY} if operation == "write" else
+                       {AccessDecision.ALLOW, AccessDecision.ALLOW_REDACTED}
+                       if request.action is ActionType.FILE_READ else {AccessDecision.ALLOW})
+            if (request.action is ActionType.FILE_DELETE and (approved or preflight)):
+                allowed.add(AccessDecision.REQUIRE_APPROVAL)
+            if decision.decision not in allowed:
+                raise FileBoundaryError("authorization_changed_or_denied")
+
+        try:
+            value = await asyncio.to_thread(
+                file_operation, self._root(sandbox), target, operation, authorize,
+                content=content, newline=newline,
+            )
+            return True, value
+        except (OSError, ValueError) as exc:
+            # Never return guessed content or retry with ordinary pathname I/O.
+            code = str(exc) if isinstance(exc, FileBoundaryError) else type(exc).__name__
+            return False, f"Secure file access refused ({code})"
+        finally:
+            if final:
+                await emit_policy_decision(self._events, request, final[-1])
 
     async def write_text(
         self,
@@ -73,7 +124,9 @@ class FileBroker:
                 path=target.as_posix(),
                 kind=kind,
             ),
-            scope=scope if scope is not None else DelegationScope(),
+            scope=(scope if scope is not None else DelegationScope()).bind_paths(
+                str(self._root(sandbox)),
+            ),
         )
         decision = self._policy.decide(request)
         await emit_policy_decision(self._events, request, decision)
@@ -85,9 +138,10 @@ class FileBroker:
                 resource_kind=kind.value,
             )
 
-        await asyncio.to_thread(self._write, target, content,
-                                **({"newline": newline} if newline is not None else {}))
-        return FileResult(path=str(relative_path), wrote=True, resource_kind=kind.value)
+        ok, value = await self._access(sandbox, target, request, "write",
+                                       content=content, newline=newline)
+        return FileResult(path=str(relative_path), wrote=ok, resource_kind=kind.value,
+                          reason="" if ok else value)
 
     async def read_text(
         self,
@@ -110,7 +164,9 @@ class FileBroker:
                 path=target.as_posix(),
                 kind=kind,
             ),
-            scope=scope if scope is not None else DelegationScope(),
+            scope=(scope if scope is not None else DelegationScope()).bind_paths(
+                str(self._root(sandbox)),
+            ),
         )
         decision = self._policy.decide(request)
         await emit_policy_decision(self._events, request, decision)
@@ -122,12 +178,13 @@ class FileBroker:
                 resource_kind=kind.value,
             )
 
-        content = await asyncio.to_thread(self._read, target)
+        ok, content = await self._access(sandbox, target, request, "read")
         return FileResult(
             path=str(relative_path),
-            wrote=True,
+            wrote=ok,
             resource_kind=kind.value,
-            content=content,
+            content=content if ok else "",
+            reason="" if ok else content,
         )
 
     async def exists(
@@ -142,7 +199,20 @@ class FileBroker:
         target = self._safe_target(sandbox, relative_path)
         if target is None:
             return False
-        return await asyncio.to_thread(Path.exists, target)
+        kind = self._classify(target, sandbox)
+        request = ActionRequest(
+            task_id=task_id, action=ActionType.FILE_READ,
+            resource=ResourceRef(workspace_id=sandbox.id, path=target.as_posix(), kind=kind),
+            scope=(scope if scope is not None else DelegationScope()).bind_paths(
+                str(self._root(sandbox)),
+            ),
+        )
+        decision = self._policy.decide(request)
+        await emit_policy_decision(self._events, request, decision)
+        if decision.decision not in {AccessDecision.ALLOW, AccessDecision.ALLOW_REDACTED}:
+            return False
+        ok, value = await self._access(sandbox, target, request, "exists")
+        return ok and bool(value)
 
     async def delete(
         self,
@@ -167,8 +237,23 @@ class FileBroker:
         target = self._safe_target(sandbox, relative_path)
         if target is None:
             return FileResult(path=str(relative_path), wrote=False, reason="Path escapes sandbox")
-        await asyncio.to_thread(self._delete, target)
-        return result
+        request = ActionRequest(
+            task_id=task_id, action=ActionType.FILE_DELETE,
+            resource=ResourceRef(workspace_id=sandbox.id, path=target.as_posix(),
+                                 kind=self._classify(target, sandbox)),
+            scope=(scope if scope is not None else DelegationScope()).bind_paths(
+                str(self._root(sandbox)),
+            ),
+        )
+        approved = False
+        if self._approvals is not None and self._approvals.asks_a_human(source):
+            approved = await self._approvals.is_approved(
+                "file_delete", {"path": target.as_posix(), "sandbox_id": sandbox.id},
+                task_id=task_id, source=source, requested_by=requested_by,
+                resource_scope=sandbox.id,
+            )
+        ok, value = await self._access(sandbox, target, request, "delete", approved=approved)
+        return result if ok else FileResult(path=str(relative_path), wrote=False, reason=value)
 
     async def authorize_delete(
         self,
@@ -193,10 +278,17 @@ class FileBroker:
                 path=target.as_posix(),
                 kind=kind,
             ),
-            scope=scope if scope is not None else DelegationScope(),
+            scope=(scope if scope is not None else DelegationScope()).bind_paths(
+                str(self._root(sandbox)),
+            ),
         )
         decision = self._policy.decide(request)
         await emit_policy_decision(self._events, request, decision)
+        if decision.decision in {AccessDecision.ALLOW, AccessDecision.REQUIRE_APPROVAL}:
+            ok, value = await self._access(sandbox, target, request, "probe", preflight=True)
+            if not ok:
+                return FileResult(path=str(relative_path), wrote=False, reason=value,
+                                  resource_kind=kind.value)
         if decision.decision is AccessDecision.REQUIRE_APPROVAL and self._approvals is not None:
             args = {"path": target.as_posix(), "sandbox_id": sandbox.id}
             if self._approvals.asks_a_human(source):
@@ -237,31 +329,16 @@ class FileBroker:
 
     @staticmethod
     def _safe_target(sandbox: SandboxRef, relative_path: str | Path) -> Path | None:
-        """Resolve a sandbox-relative path, refusing device-namespace input first."""
+        """Lexical preflight only. Actual identity is established by secure open."""
         if is_device_namespace(relative_path):
             return None
-        root = Path(sandbox.root).resolve()
-        target = (root / relative_path).resolve()
-        try:
-            target.relative_to(root)
-        except ValueError:
+        root = scope_path(str(sandbox.root))
+        bound = bound_scope_path(str(relative_path), str(sandbox.root))
+        target = scope_path(bound) if bound is not None else None
+        if root is None or not root.anchor or target is None or not root.contains(target):
             return None
-        return target
-
-    @staticmethod
-    def _write(path: Path, content: str, *, newline: str | None = None) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8", newline=newline)
-
-    @staticmethod
-    def _read(path: Path) -> str:
-        try:
-            return path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            return ""
-        except OSError as exc:
-            return f"read failed: {exc}"
-
-    @staticmethod
-    def _delete(path: Path) -> None:
-        path.unlink(missing_ok=True)
+        # Remote shares are lexical Scope inputs, not an implicitly trusted I/O
+        # backend. Reject before any resolver or native open could contact SMB.
+        if root.anchor.startswith("//"):
+            return None
+        return Path(target.text())
