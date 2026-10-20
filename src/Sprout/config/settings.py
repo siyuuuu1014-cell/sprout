@@ -31,6 +31,8 @@ class RuntimeSettings:
     agent_timeout_seconds: float = 300.0
     evaluation_timeout_seconds: float = 600.0
     evaluation_attempts: int = 2
+    intent_semantics_enabled: bool = True
+    intent_semantics_timeout_seconds: float = 5.0
 
 
 @dataclass(slots=True)

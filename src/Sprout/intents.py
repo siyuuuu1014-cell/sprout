@@ -191,6 +191,58 @@ def detect_task_hint(text: str) -> bool:
     return write_intent_disposition(text) is WriteIntentDisposition.EXPLICIT_WRITE
 
 
+def needs_intent_clarification(text: str) -> bool:
+    """Ask only about concrete inspect/modify ambiguity, not all UNKNOWN text.
+
+    Model confidence is not evidence of permission. Explicit commands, read-only
+    requests, narration and greetings retain their established routing.
+    """
+    value = text.strip().casefold()
+    disposition = write_intent_disposition(value)
+    if value == "/task" or value.startswith("/task "):
+        return False
+    # A choice between inspect and modify is not an imperative to modify,
+    # even when a leading "帮我" also contains an action keyword.
+    alternatives = re.search(
+        r"(?:分析|检查|看看|inspect).*?(?:还是|或者|\bor\b).*?(?:修改|修复|modify|fix)", value,
+    )
+    # In this construction "还是" is a choice connector, not the "还/是"
+    # status predicate understood by the legacy narrative guard. Reuse that
+    # guard on an equivalent connector; quoted/negated narration stays nonwrite.
+    alternative_disposition = write_intent_disposition(value.replace("还是", "或者"))
+    if alternatives and alternative_disposition is not WriteIntentDisposition.KNOWN_NONWRITE:
+        return True
+    if disposition is not WriteIntentDisposition.UNKNOWN:
+        return False
+    inspect = re.search(
+        r"看看|看一下|看下|过一下|处理一下|处理下|\b(?:look at|take a look at|check out)\b", value,
+    )
+    target = re.search(
+        r"项目|代码|功能|登录|接口|模块|缓存|bug|\b(?:project|code|login|feature|module|cache)\b",
+        value,
+    )
+    return bool(inspect and target)
+
+
+def clarification_answer(text: str) -> str | None:
+    """Exact choices only: generic assent is never a write selection.
+
+    None denotes a new topic; 'unclear' keeps the pending question open.
+    These are intent choices, not workspace, tool or Apply authorizations.
+    """
+    value = text.strip().casefold().rstrip("。.!！?？ ")
+    choices = {
+        "read": {"只分析", "仅分析", "只检查", "只检查bug", "检查bug", "提出优化建议",
+                 "只给建议", "analyze only", "analyse only", "inspect only", "read only"},
+        "write": {"直接修改", "修改代码", "直接修改代码", "直接修复", "modify the code",
+                  "modify directly", "fix it", "make changes"},
+        "cancel": {"先别做了", "取消", "不做了", "cancel", "stop", "never mind"},
+        "chat": {"我只是问问", "只是问问", "just asking"},
+        "unclear": {"好的", "嗯", "是的", "好", "可以", "yes", "ok", "okay", "sure"},
+    }
+    return next((choice for choice, values in choices.items() if value in values), None)
+
+
 __all__ = [
     "DEFAULT_INTENT",
     "INTENT_EVENTS",
@@ -198,6 +250,8 @@ __all__ = [
     "Intent",
     "WriteIntentDisposition",
     "detect_task_hint",
+    "needs_intent_clarification",
+    "clarification_answer",
     "intent_event",
     "normalize_intent",
     "write_intent_disposition",

@@ -71,6 +71,12 @@ from Sprout.orchestration.terminal import TemporalOrchestratorBackend
 from Sprout.registry.base import Registry
 from Sprout.rootstock.contract import SessionStore
 from Sprout.runtime.changes import ChangeProposalService
+from Sprout.runtime.clarification import (
+    clarified_instruction,
+    route_clarification,
+    route_semantic_clarification,
+)
+from Sprout.runtime.intent_analysis import PROTOCOL, parse_analysis, response_example
 from Sprout.runtime.locks import WorkspaceLockManager
 from Sprout.runtime.middleware import LoggingMiddleware, MiddlewareChain
 from Sprout.runtime.nodes import NodeExecutor
@@ -746,13 +752,28 @@ class Runtime:
             )
         message = await self.middleware.before(message)
         session = await self._sessions.resolve(message, principal=principal)
+        classification: dict[str, Any] = {}
+        clarification = await route_clarification(
+            self, message, session, principal, classification=classification,
+        )
+        if clarification is not None:
+            return await self.middleware.after(message, clarification)
         context = await self._contexts.build(
             message=message,
             session=session,
             tools=self.tools.list(),
             skills=self.skills.list(),
         )
-        message, context = await self._recognize_intent(message, context)
+        if not classification:
+            classification = await self._classify_intent_with_llm(message, context)
+        clarification = await route_semantic_clarification(
+            self, message, session, principal, classification,
+        )
+        if clarification is not None:
+            return await self.middleware.after(message, clarification)
+        message, context = await self._recognize_intent(
+            message, context, classification=classification,
+        )
 
         # A recognised task intent is queued for background execution and acked
         # immediately; it never runs inline. A task intent *without* a workspace
@@ -830,6 +851,8 @@ class Runtime:
             "resume_tool_calls", "pending_tool_calls", "roles", "role", "authenticated",
             "permissions", "allowed_actions", "delegation_scope",
             "entry_principal_v1", WORKSPACE_CONSENT_KEY, "proposed_workspace_root",
+            "intent_clarification_v1", "clarification_id", "clarification_original",
+            "clarification_required", "clarification_resolution", "confirmed",
         }
         return replace(
             message,
@@ -1286,7 +1309,8 @@ class Runtime:
         held, metadata = await self._held_workspace_consent(session_id)
         if held is None or metadata is None:
             raise LookupError(f"No pending workspace consent for session {session_id!r}")
-        if write_intent_disposition(held.content) is WriteIntentDisposition.KNOWN_NONWRITE:
+        instruction = await clarified_instruction(self, owned, held, metadata)
+        if write_intent_disposition(instruction) is WriteIntentDisposition.KNOWN_NONWRITE:
             raise LookupError("Held instruction is not a coding request; issue a fresh instruction")
         store = self._workspace_consent_store()
         if await store.claim_workspace_consent(owned, held, str(uuid4())) is not True:
@@ -1306,7 +1330,7 @@ class Runtime:
         session = await self._session_store.get_session(session_id) or session
         return await self._handle_task(
             Message(
-                content=held.content,
+                content=instruction,
                 channel="internal",
                 user_id=original.user_id,
                 session_id=session_id,
@@ -1329,8 +1353,9 @@ class Runtime:
             foreground=foreground and original.source == "cli",
         )
 
-    async def _recognize_intent(self, message: Message, context):
-        classification = await self._classify_intent_with_llm(message, context)
+    async def _recognize_intent(self, message: Message, context, *, classification=None):
+        if classification is None:
+            classification = await self._classify_intent_with_llm(message, context)
         intent = str(classification.get("intent") or "conversation")
         if intent not in _INTENT_EVENTS:
             intent = "conversation"
@@ -1385,10 +1410,12 @@ class Runtime:
         )
         return enriched, context
 
-    async def _classify_intent_with_llm(self, message: Message, context) -> dict[str, Any]:
+    async def _classify_intent_with_llm(
+        self, message: Message, context, *, pending_question: str | None = None,
+    ) -> dict[str, Any]:
         # Cheap task hint before spending an LLM call: an explicit coding task
         # ("修复…", "/task …") is already decidable from the text alone.
-        if detect_task_hint(message.content or ""):
+        if pending_question is None and detect_task_hint(message.content or ""):
             return {
                 "intent": Intent.TASK.value,
                 "trigger_event": intent_event(Intent.TASK),
@@ -1396,22 +1423,54 @@ class Runtime:
                 "reason": "task_hint",
             }
 
-        similar_context = await self._similar_context_for_intent(message)
-        prompt = self._intent_prompt(message, context, similar_context=similar_context)
+        settings = self._settings.runtime if self._settings else None
+        enabled = settings.intent_semantics_enabled if settings else True
+        timeout = settings.intent_semantics_timeout_seconds if settings else 5.0
+        if pending_question is not None and not enabled:
+            return {"intent": "conversation", "confidence": 0.0, "reason": "semantics_disabled"}
+        similar_context = ([] if pending_question else
+                           await self._similar_context_for_intent(message))
+        prompt = self._intent_prompt(
+            message, context, similar_context=similar_context, pending_question=pending_question,
+        )
+        started = asyncio.get_running_loop().time()
+        outcome = "ok"
+        calls = 0
         try:
-            response = await self.models.default().chat(
-                [
-                    LLMMessage.system(
-                        "Classify the user's intent for SEAM Sprout event routing. "
-                        "Return only compact JSON."
-                    ),
-                    LLMMessage.user(prompt),
-                ],
-                tools=(),
-            )
+            async with asyncio.timeout(max(0.01, min(float(timeout), 30.0))):
+                model = self.models.default()
+                calls = 1
+                response = await model.chat(
+                    [
+                        LLMMessage.system(
+                            "Classify the user's intent for SEAM Sprout event routing. "
+                            "Return only compact JSON.\n" + (PROTOCOL if enabled else
+                            "Return exactly three top-level fields: intent, confidence, reason.")
+                        ),
+                        LLMMessage.user(prompt),
+                    ],
+                    tools=(),
+                )
+            parsed = parse_analysis(response.text) if enabled and not response.tool_calls else None
+            if parsed is not None:
+                return {**parsed, "reason": "semantic_routing_only"}
+            outcome = "invalid_or_legacy_response"
+            # A legacy intent is still a routing hint, never semantic/write
+            # evidence. Discard arbitrary model fields, including tool calls.
+            legacy = _parse_intent_json(response.text)
+            intent = legacy.get("intent")
+            return {"intent": intent if intent in _INTENT_EVENTS else "conversation",
+                    "confidence": _clamp_float(legacy.get("confidence"), default=0.0),
+                    "reason": "legacy_routing_only"}
+        except TimeoutError:
+            outcome = "timeout"
+            return {"intent": "conversation", "confidence": 0.0, "reason": "llm_timeout"}
         except Exception:
+            outcome = "model_error"
             return {"intent": "conversation", "confidence": 0.0, "reason": "llm_error"}
-        return _parse_intent_json(response.text)
+        finally:
+            logger.info("intent_analysis calls=%d fallback=%s latency_ms=%d", calls, outcome,
+                        int((asyncio.get_running_loop().time() - started) * 1000))
 
     async def _similar_context_for_intent(self, message: Message) -> list[dict[str, Any]]:
         hits: list[dict[str, Any]] = []
@@ -1482,8 +1541,8 @@ class Runtime:
         context,
         *,
         similar_context: list[dict[str, Any]],
+        pending_question: str | None = None,
     ) -> str:
-        memory_meta = context.memory.metadata if hasattr(context.memory, "metadata") else {}
         recent = []
         for item in list(context.memory)[-6:]:
             role = getattr(item, "role", "")
@@ -1493,21 +1552,28 @@ class Runtime:
         context_payload = {
             "message": message.content,
             "channel": message.channel,
-            "user_id": message.user_id,
-            "message_metadata": dict(message.metadata),
-            "context_metadata": dict(context.metadata),
-            "memory": memory_meta,
+            # Authority, credentials and arbitrary caller metadata are not
+            # classification inputs. Recent text is bounded, owned context.
             "recent_conversation": recent,
-            "similar_context_from_vector_db": similar_context,
+            "similar_context_from_vector_db": [
+                {key: item[key] for key in
+                 ("score", "context_weight", "detail_level", "distilled_text") if key in item}
+                for item in similar_context[:5]
+            ],
+            **({"pending_question": pending_question[:500]} if pending_question else {}),
         }
         allowed = _INTENT_EVENTS
+        serialized = Redactor().redact(
+            json.dumps(context_payload, ensure_ascii=False, default=str),
+        ).text
+        enabled = self._settings.runtime.intent_semantics_enabled if self._settings else True
         return (
             "Choose exactly one intent from this JSON object, where the value is "
             "the event to trigger:\n"
             f"{json.dumps(allowed, ensure_ascii=False)}\n\n"
             "Use the current message plus context/recent conversation. Return JSON "
-            'like {"intent":"task","confidence":0.87,"reason":"..."}.\n\n'
-            f"Input:\n{json.dumps(context_payload, ensure_ascii=False, default=str)}"
+            f"like {response_example(enabled)}.\n\n"
+            f"Input:\n{serialized}"
         )
 
     async def handle_stream(
@@ -1527,13 +1593,34 @@ class Runtime:
         message = self._entry_message(message, principal)
         message = await self.middleware.before(message)
         session = await self._sessions.resolve(message, principal=principal)
+        classification: dict[str, Any] = {}
+        clarification = await route_clarification(
+            self, message, session, principal, classification=classification,
+        )
+        if clarification is not None:
+            clarification = await self.middleware.after(message, clarification)
+            yield StreamChunk(content=clarification.content)
+            yield StreamChunk(outbound=clarification)
+            return
         context = await self._contexts.build(
             message=message,
             session=session,
             tools=self.tools.list(),
             skills=self.skills.list(),
         )
-        message, context = await self._recognize_intent(message, context)
+        if not classification:
+            classification = await self._classify_intent_with_llm(message, context)
+        clarification = await route_semantic_clarification(
+            self, message, session, principal, classification,
+        )
+        if clarification is not None:
+            clarification = await self.middleware.after(message, clarification)
+            yield StreamChunk(content=clarification.content)
+            yield StreamChunk(outbound=clarification)
+            return
+        message, context = await self._recognize_intent(
+            message, context, classification=classification,
+        )
 
         # Same dispatch as ``handle``. This path had no task branch at all, so
         # the CLI REPL never reached the coding graph even when a workspace was
@@ -1787,7 +1874,7 @@ class Runtime:
         offloaded = {**envelope, "blob_uri": uri, "content_bytes": size}
         return content[:TURN_PREVIEW_CHARS], offloaded
 
-    async def _persist_turns(self, session: Session, message: Message, result: AgentResult) -> None:
+    async def _persist_turns(self, session: Session, message: Message, result: AgentResult) -> Turn:
         """Append the user and assistant turns with their full envelopes.
 
         This is the only authority write point of the online path (P1): the
@@ -1827,6 +1914,7 @@ class Runtime:
             payload["turn_ids"] = [user_turn.id, assistant_turn.id]
             payload["seqs"] = [user_turn.seq, assistant_turn.seq]
         await self.events.publish(Event(MESSAGE_PERSISTED, payload, message.id))
+        return user_turn
 
     @staticmethod
     async def _persist_attachments(runtime: Runtime, turn: Turn, message: Message) -> None:
@@ -1937,8 +2025,18 @@ class Runtime:
             },
         )
 
-    async def create_session(self, user_id: str, *, session_id: str | None = None) -> Session:
-        session = await self._sessions.create(user_id, session_id=session_id)
+    async def create_session(
+        self, user_id: str, *, session_id: str | None = None, principal: Principal | None = None,
+    ) -> Session:
+        if principal is not None:
+            if principal.user_id != user_id or not principal.source:
+                raise PermissionError("Session creation identity unavailable")
+            session = await self._sessions.resolve(
+                Message("", session_id=session_id), principal=principal,
+            )
+        else:
+            # Preserve the trusted embedding API; never upgrade old records.
+            session = await self._sessions.create(user_id, session_id=session_id)
         await self.events.publish(Event(SESSION_CREATED, {"session_id": session.id}, session.id))
         return session
 

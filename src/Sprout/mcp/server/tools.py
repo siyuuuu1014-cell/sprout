@@ -142,7 +142,7 @@ def register_tools(server: Any, runtime: Runtime) -> None:
     async def sprout_session_create(user_id: str = "mcp-client") -> str:
         if user_id != principal.user_id:
             raise PermissionError("MCP session user selection is not supported")
-        session = await runtime.create_session(principal.user_id)
+        session = await runtime.create_session(principal.user_id, principal=principal)
         return session.id
 
     @server.tool(
