@@ -256,6 +256,10 @@ async def test_reauthorize_after_directory_creation_before_next_effect(
             return result
 
         monkeypatch.setattr(os, "mkdir", mkdir)
+        # The wrapper forwards the native dir_fd contract unchanged. Declare
+        # only capabilities actually supported by that original function.
+        if original in os.supports_dir_fd:
+            monkeypatch.setattr(os, "supports_dir_fd", os.supports_dir_fd | {mkdir})
     result = await FileBroker(policy).write_text(
         SandboxRef("s", "test", tmp_path), "new/nested/target.py", "changed",
     )
@@ -304,6 +308,12 @@ def test_revoke_after_leaf_inspection_before_data_effect(
             return result
 
         monkeypatch.setattr(os, "stat", info)
+        if original in os.supports_dir_fd:
+            monkeypatch.setattr(os, "supports_dir_fd", os.supports_dir_fd | {info})
+        if original in os.supports_follow_symlinks:
+            monkeypatch.setattr(
+                os, "supports_follow_symlinks", os.supports_follow_symlinks | {info},
+            )
     else:
         original = os.fstat
 

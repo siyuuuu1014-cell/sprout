@@ -203,9 +203,12 @@ async def test_runtime_capture_uses_read_only_queries_and_filters_task(tmp_path,
 
 
 def test_public_baseline_aggregates_do_not_copy_raw_junit_or_logs(tmp_path):
+    private_path = "/home/private-user/history.sqlite"
     (tmp_path / "l1.xml").write_text(
         '<testsuites><testsuite tests="2" failures="1" errors="0" skipped="0">'
-        f'<testcase name="{SECRET}"><failure>{BODY}</failure></testcase>'
+        f'<testcase name="{SECRET}" file="{private_path}">'
+        f'<failure message="{SECRET}">{BODY} {private_path}</failure>'
+        f'<system-out>{SECRET}</system-out><system-err>{BODY}</system-err></testcase>'
         "</testsuite></testsuites>"
     )
     (tmp_path / "raw.log").write_text(SECRET + BODY)
@@ -232,7 +235,20 @@ def test_public_baseline_aggregates_do_not_copy_raw_junit_or_logs(tmp_path):
         },
     )
     public = tmp_path / "public-diagnostics"
-    assert [path.name for path in public.iterdir()] == ["baseline.json"]
+    assert {path.name for path in public.iterdir()} == {"baseline.json", "l1-failures.json"}
+    for path in public.iterdir():
+        projected = path.read_text()
+        assert SECRET not in projected and BODY not in projected
+        assert private_path not in projected
+        assert all(raw not in projected for raw in (
+            "<testsuite", "<failure", "system-out", "system-err",
+        ))
+    failures = json.loads((public / "l1-failures.json").read_text())
+    assert failures["counts"] == {"tests": 2, "failures": 1, "errors": 0}
+    assert failures["cases"] == [{
+        "test_id": None, "case_ordinal": None, "source": None,
+        "exception_class": None, "category": "test_failed",
+    }]
     text = (public / "baseline.json").read_text()
     assert SECRET not in text and BODY not in text
     assert json.loads(text)["tests"]["l1"]["failures"] == 1
