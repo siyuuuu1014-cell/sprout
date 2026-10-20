@@ -71,6 +71,90 @@ CREATE TABLE IF NOT EXISTS workspace_consents_v1 (
 );
 """
 
+# Separate domain: selecting a goal never grants workspace or tool authority.
+# Additive schema; no old turns are adopted or issued clarification eligibility.
+CLARIFICATION_SCHEMA = """
+CREATE TABLE IF NOT EXISTS intent_clarifications_v1 (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    original_message_id TEXT NOT NULL,
+    version INTEGER NOT NULL CHECK(version=1),
+    snapshot_json TEXT NOT NULL,
+    question TEXT NOT NULL,
+    choices_json TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN
+        ('pending','resolved','cancelled','superseded','expired')),
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    resolution TEXT,
+    answer_message_id TEXT,
+    answer_sha256 TEXT,
+    resolved_at TEXT,
+    UNIQUE(session_id, original_message_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS intent_clarification_pending_v1
+    ON intent_clarifications_v1(session_id) WHERE state='pending';
+CREATE UNIQUE INDEX IF NOT EXISTS intent_clarification_answer_message_v1
+    ON intent_clarifications_v1(answer_message_id) WHERE answer_message_id IS NOT NULL;
+-- Deny-only receipts survive deletion of private session bodies.
+CREATE TABLE IF NOT EXISTS intent_clarification_receipts_v1 (
+    message_id TEXT PRIMARY KEY,
+    clarification_id TEXT NOT NULL,
+    claimed_at TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS intent_clarification_receipt_guard_v1
+BEFORE UPDATE OF answer_message_id ON intent_clarifications_v1
+WHEN NEW.answer_message_id IS NOT NULL AND EXISTS (
+    SELECT 1 FROM intent_clarification_receipts_v1 WHERE message_id=NEW.answer_message_id
+)
+BEGIN
+    SELECT RAISE(IGNORE);
+END;
+CREATE TRIGGER IF NOT EXISTS intent_clarification_receipt_record_v1
+AFTER UPDATE OF answer_message_id ON intent_clarifications_v1
+WHEN NEW.answer_message_id IS NOT NULL
+BEGIN
+    INSERT INTO intent_clarification_receipts_v1(message_id,clarification_id,claimed_at)
+    VALUES(NEW.answer_message_id,NEW.id,NEW.resolved_at);
+END;
+"""
+
+# A resolved write owns the hand-off until its exact frozen Workspace Consent
+# is permanently claimed. Missing/unknown hand-off evidence remains blocking.
+# Parameters: session ID twice. No current backend or caller metadata is proof.
+_CLARIFICATION_OPERATION_PENDING = """
+EXISTS (SELECT 1 FROM workspace_consents_v1 w WHERE w.session_id=? AND w.state='pending')
+OR EXISTS (
+    SELECT 1 FROM intent_clarifications_v1 c
+    WHERE c.session_id=? AND c.state='resolved' AND c.resolution='write'
+    AND NOT EXISTS (
+        SELECT 1 FROM workspace_consents_v1 w
+        WHERE w.session_id=c.session_id AND w.state='claimed'
+        AND json_extract(w.snapshot_json,
+            '$.envelope.message_metadata.intent_clarification_v1')=c.id
+        AND json_extract(w.snapshot_json,'$.envelope.message_id')=c.answer_message_id
+    )
+)
+"""
+
+
+def _clarification_snapshot(session: Session, turn: Turn) -> str:
+    from Sprout.session.manager import SessionManager
+
+    principal = SessionManager.frozen_principal(session)
+    if (not session.user_id or turn.session_id != session.id or turn.role != "user"
+            or turn.metadata.get("user_id") != session.user_id
+            or turn.metadata.get("channel") != {"mcp_client": "mcp"}.get(
+                principal.source, principal.source)
+            or turn.content_blob_uri or turn.metadata.get("blob_uri")):
+        raise ValueError("Clarification authority snapshot unavailable")
+    return json.dumps({
+        "version": 1, "session_id": session.id, "owner": session.user_id,
+        "principal": session.metadata["entry_principal_v1"], "turn_id": turn.id,
+        "request": turn.content, "content_sha256": sha256(turn.content.encode()).hexdigest(),
+        "envelope": turn.metadata,
+    }, sort_keys=True, ensure_ascii=False)
+
 
 def _consent_snapshot(session: Session, turn: Turn) -> str:
     """Only authority records, never message metadata, supply owner/source."""
@@ -112,6 +196,7 @@ class SqliteSessionStore:
 
         migrate_outbox(db)
         db.executescript(CONSENT_SCHEMA)
+        db.executescript(CLARIFICATION_SCHEMA)
 
     @property
     def database(self) -> SqliteDatabase:
@@ -226,6 +311,108 @@ class SqliteSessionStore:
         )
         return changed == 1
 
+    async def _clarification_authority(self, session: Session, turn_id: str):
+        row = await self._db.fetchone(
+            "SELECT s.metadata_json AS session_json, t.* "
+            "FROM sessions s JOIN turns t ON t.session_id=s.id "
+            "WHERE s.id=? AND s.user_id=? AND t.id=?",
+            (session.id, session.user_id, turn_id),
+        )
+        if row is None:
+            return None
+        live = Session(session.id, session.user_id, metadata=json.loads(row["session_json"]))
+        if live.metadata.get("entry_principal_v1") != session.metadata.get("entry_principal_v1"):
+            return None
+        turn = row_to_turn(row)
+        return _clarification_snapshot(live, turn), row["session_json"], row["metadata_json"]
+
+    async def issue_intent_clarification(
+        self, session: Session, turn: Turn, question: str, expires_at: str,
+        *, choices: tuple[str, ...] = ("read", "write", "chat", "cancel"),
+    ) -> bool:
+        if (not choices or len(set(choices)) != len(choices)
+                or not set(choices) <= {"read", "write", "chat", "cancel"}):
+            raise ValueError("Unsupported clarification choices")
+        snapshot = _clarification_snapshot(session, turn)
+        authority = await self._clarification_authority(session, turn.id)
+        if authority is None or authority[0] != snapshot:
+            return False
+        _, session_json, turn_json = authority
+        changed = await self._db.execute(
+            "INSERT OR IGNORE INTO intent_clarifications_v1 "
+            "(id,session_id,original_message_id,version,snapshot_json,question,choices_json,"
+            "state,created_at,expires_at) SELECT ?,?,?,1,?,?,?,'pending',?,? "
+            "WHERE EXISTS (SELECT 1 FROM sessions s JOIN turns t ON t.session_id=s.id "
+            "WHERE s.id=? AND s.user_id=? AND s.metadata_json=? AND t.id=? "
+            "AND t.content=? AND t.metadata_json=?) AND NOT ("
+            + _CLARIFICATION_OPERATION_PENDING + ")",
+            (turn.id, session.id, turn.metadata["message_id"], snapshot, question,
+             json.dumps(choices),
+             datetime.now(UTC).isoformat(), expires_at, session.id, session.user_id,
+             session_json, turn.id, turn.content, turn_json, session.id, session.id),
+        )
+        return changed == 1
+
+    async def get_intent_clarification(
+        self, session_id: str, record_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        row = await self._db.fetchone(
+            "SELECT * FROM intent_clarifications_v1 WHERE session_id=? "
+            + ("AND id=?" if record_id is not None else "ORDER BY rowid DESC LIMIT 1"),
+            (session_id, record_id) if record_id is not None else (session_id,),
+        )
+        return dict(row) if row is not None else None
+
+    async def has_consumed_clarification_message(self, message_id: str) -> bool:
+        return bool(await self._db.scalar(
+            "SELECT EXISTS(SELECT 1 FROM intent_clarification_receipts_v1 WHERE message_id=? "
+            "UNION ALL SELECT 1 FROM intent_clarifications_v1 WHERE answer_message_id=?)",
+            (message_id, message_id),
+        ))
+
+    async def has_pending_clarification_operation(self, session_id: str) -> bool:
+        return bool(await self._db.scalar(
+            "SELECT " + _CLARIFICATION_OPERATION_PENDING, (session_id, session_id),
+        ))
+
+    async def resolve_intent_clarification(
+        self, session: Session, record_id: str, message_id: str, answer: str, choice: str,
+    ) -> bool:
+        if choice not in {"read", "write", "chat", "cancel", "superseded", "expired"}:
+            raise ValueError("Unknown clarification resolution")
+        row = await self._db.fetchone(
+            "SELECT * FROM intent_clarifications_v1 WHERE id=? AND session_id=?",
+            (record_id, session.id),
+        )
+        if row is None or not message_id:
+            return False
+        authority = await self._clarification_authority(session, record_id)
+        if authority is None or authority[0] != row["snapshot_json"]:
+            return False
+        snapshot, session_json, turn_json = authority
+        state = {"cancel": "cancelled", "superseded": "superseded", "expired": "expired"}.get(
+            choice, "resolved"
+        )
+        now = datetime.now(UTC).isoformat()
+        changed = await self._db.execute(
+            "UPDATE OR IGNORE intent_clarifications_v1 SET state=?,resolution=?,"
+            "answer_message_id=?,"
+            "answer_sha256=?,resolved_at=? WHERE id=? AND session_id=? AND state='pending' "
+            "AND snapshot_json=? AND (expires_at>? OR ?='expired') AND EXISTS "
+            "(SELECT 1 FROM sessions s JOIN turns t ON t.session_id=s.id "
+            "WHERE s.id=? AND s.user_id=? AND s.metadata_json=? AND t.id=? "
+            "AND t.content=? AND t.metadata_json=?) "
+            "AND (? IN ('superseded','expired') OR EXISTS "
+            "(SELECT 1 FROM json_each(choices_json) WHERE value=?)) "
+            "AND (?!='write' OR NOT ("
+            + _CLARIFICATION_OPERATION_PENDING + "))",
+            (state, choice, message_id, sha256(answer.encode()).hexdigest(), now,
+             record_id, session.id, snapshot, now, choice, session.id, session.user_id,
+             session_json, record_id, json.loads(snapshot)["request"], turn_json,
+             choice, choice, choice, session.id, session.id),
+        )
+        return changed == 1
+
     async def save_attachment(
         self,
         attachment: Attachment,
@@ -330,6 +517,12 @@ class SqliteSessionStore:
         ) or 0)
         await self._db.execute_batch(
             [
+                ("INSERT OR IGNORE INTO intent_clarification_receipts_v1 "
+                 "(message_id,clarification_id,claimed_at) "
+                 "SELECT answer_message_id,id,COALESCE(resolved_at,created_at) "
+                 "FROM intent_clarifications_v1 "
+                 "WHERE session_id=? AND answer_message_id IS NOT NULL", (session_id,)),
+                ("DELETE FROM intent_clarifications_v1 WHERE session_id = ?", (session_id,)),
                 (
                     "DELETE FROM attachments WHERE message_id IN "
                     "(SELECT id FROM turns WHERE session_id = ?)",

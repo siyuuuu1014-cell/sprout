@@ -165,3 +165,28 @@ class WorkspaceConsentStore(Protocol):
     async def claim_workspace_consent(
         self, session: Session, turn: Turn, claimant: str,
     ) -> bool: ...
+
+
+class IntentClarificationStore(Protocol):
+    """Optional v1 capability. Durable at-most-once resolution, not execution.
+
+    Unsupported stores must fail closed; no history-based issuance/backfill.
+    Records bind a persisted original Turn and immutable owner/source snapshot.
+    """
+
+    async def issue_intent_clarification(
+        self, session: Session, turn: Turn, question: str, expires_at: str,
+        *, choices: tuple[str, ...] = ("read", "write", "chat", "cancel"),
+    ) -> bool: ...
+
+    async def get_intent_clarification(
+        self, session_id: str, record_id: str | None = None,
+    ) -> dict[str, Any] | None: ...
+
+    async def has_consumed_clarification_message(self, message_id: str) -> bool: ...
+
+    async def has_pending_clarification_operation(self, session_id: str) -> bool: ...
+
+    async def resolve_intent_clarification(
+        self, session: Session, record_id: str, message_id: str, answer: str, choice: str,
+    ) -> bool: ...
