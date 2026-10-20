@@ -526,10 +526,15 @@ class SqliteMetadataStore:
             "source": task.actor.source,
         }
         scope = {
+            "version": 1,
             "allowed_actions": sorted(task.delegation_scope.allowed_actions),
             "denied_actions": sorted(task.delegation_scope.denied_actions),
             "allowed_paths": list(task.delegation_scope.allowed_paths),
             "denied_paths": list(task.delegation_scope.denied_paths),
+            "expires_at": (task.delegation_scope.expires_at.isoformat()
+                           if task.delegation_scope.expires_at is not None else None),
+            "max_depth": task.delegation_scope.max_depth,
+            "issued_by": task.delegation_scope.issued_by,
         }
         budget = {
             "max_tokens": task.budget.max_tokens,
@@ -578,7 +583,37 @@ class SqliteMetadataStore:
     @staticmethod
     def _row_to_task(row: Any) -> Task:
         actor = _json_loads(row["actor_json"], {})
-        scope = _json_loads(row["delegation_scope_json"], {})
+        try:
+            scope = json.loads(row["delegation_scope_json"])
+            if not isinstance(scope, dict) or type(scope.get("version", 0)) is not int:
+                raise ValueError("Invalid Scope version")
+            if scope.get("version", 0) not in {0, 1}:
+                raise ValueError("Unsupported Scope version")
+            if scope.get("version") == 1 and not {
+                "allowed_actions", "denied_actions", "allowed_paths", "denied_paths",
+                "expires_at", "max_depth", "issued_by",
+            } <= set(scope):
+                raise ValueError("Incomplete Scope record")
+            for name in ("allowed_actions", "denied_actions", "allowed_paths", "denied_paths"):
+                values = scope.get(name, [])
+                if not isinstance(values, list) or any(not isinstance(v, str) for v in values):
+                    raise ValueError("Invalid Scope collection")
+            expiry = scope.get("expires_at")
+            depth = scope.get("max_depth", 0)
+            if type(depth) is not int or depth < 0:
+                raise ValueError("Invalid Scope depth")
+            if not isinstance(scope.get("issued_by", ""), str):
+                raise ValueError("Invalid Scope issuer")
+            restored_scope = DelegationScope(
+                allowed_actions=frozenset(scope.get("allowed_actions", ())),
+                denied_actions=frozenset(scope.get("denied_actions", ())),
+                allowed_paths=tuple(scope.get("allowed_paths", ())),
+                denied_paths=tuple(scope.get("denied_paths", ())),
+                expires_at=datetime.fromisoformat(expiry) if expiry is not None else None,
+                max_depth=depth, issued_by=scope.get("issued_by", ""),
+            )
+        except (ValueError, TypeError):
+            restored_scope = DelegationScope(denied_paths=("",))
         budget = _json_loads(row["budget_json"], {})
         phases = _json_loads(row["phases_json"], [])
         from Sprout.task.models import Phase
@@ -596,12 +631,7 @@ class SqliteMetadataStore:
             ),
             source=row["source"],
             status=TaskStatus(row["status"]),
-            delegation_scope=DelegationScope(
-                allowed_actions=frozenset(scope.get("allowed_actions", ())),
-                denied_actions=frozenset(scope.get("denied_actions", ())),
-                allowed_paths=tuple(scope.get("allowed_paths", ())),
-                denied_paths=tuple(scope.get("denied_paths", ())),
-            ),
+            delegation_scope=restored_scope,
             budget=TaskBudget(**budget),
             phases=tuple(Phase(value) for value in phases),
             metadata=dict(_json_loads(row["metadata_json"], {})),

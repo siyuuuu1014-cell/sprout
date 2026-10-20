@@ -14,6 +14,7 @@ from typing import Any
 from uuid import uuid4
 
 from Sprout.gateway.identity import Principal
+from Sprout.task.paths import bound_scope_path, scope_path
 
 
 class TaskStatus(StrEnum):
@@ -109,43 +110,75 @@ class DelegationScope:
     def is_expired(self, now: datetime | None = None) -> bool:
         if self.expires_at is None:
             return False
+        if not isinstance(self.expires_at, datetime) or self.expires_at.tzinfo is None:
+            return True
+        if now is not None and (not isinstance(now, datetime) or now.tzinfo is None):
+            return True
         return (now or datetime.now(UTC)) >= self.expires_at
 
     def permits(self, action: str, path: str = "", *, now: datetime | None = None) -> bool:
+        if not isinstance(action, str) or not action.strip() or not isinstance(path, str):
+            return False
         if self.is_expired(now):
             return False
         if action in self.denied_actions:
             return False
         if self.allowed_actions and action not in self.allowed_actions:
             return False
-        if self.denied_paths and any(path.startswith(prefix) for prefix in self.denied_paths):
+        if "" in self.denied_paths:  # Legacy deny-all sentinel, understood by old readers too.
             return False
-        if self.allowed_paths and not any(path.startswith(prefix) for prefix in self.allowed_paths):
+        allowed = [scope_path(prefix) for prefix in self.allowed_paths]
+        denied = [scope_path(prefix) for prefix in self.denied_paths]
+        if any(item is None for item in (*allowed, *denied)):
+            return False
+        if not allowed and not denied:
+            return True
+        target = scope_path(path)
+        if target is None:
+            return False
+        if any(item.contains(target) for item in denied):
+            return False
+        if allowed and not any(item.contains(target) for item in allowed):
             return False
         return True
 
+    def bind_paths(self, root: str) -> DelegationScope:
+        """Broker-only context binding; never infer a base from caller metadata."""
+        from dataclasses import replace
+
+        allowed = [bound_scope_path(p, root) for p in self.allowed_paths]
+        denied = [bound_scope_path(p, root) if p else "" for p in self.denied_paths]
+        if any(p is None for p in (*allowed, *denied)):
+            return replace(self, denied_paths=("",))
+        return replace(self, allowed_paths=tuple(allowed), denied_paths=tuple(denied))
+
     def can_delegate(self) -> bool:
-        return self.max_depth > 0
+        return type(self.max_depth) is int and self.max_depth > 0 and not self.is_expired()
 
     def narrow(self, other: DelegationScope, *, issued_by: str = "") -> DelegationScope:
         """Intersect two scopes; the result is never broader than either one.
 
-        A path restriction can be unsatisfiable: ``allowed_paths=("/a",)`` and
+        A path or action restriction can be unsatisfiable. For example,
+        ``allowed_paths=("/a",)`` and
         ``("/b",)`` permit no common path. That overlap cannot be written as an
         empty ``allowed_paths`` — empty already means "unrestricted" — so it is
         expressed as ``denied_paths=("",)``, the empty prefix that ``permits``
-        matches against every path. Writing it the other way round would have
+        matches against every path, including pathless actions. Disjoint action
+        grants use this same backwards-readable deny-all representation.
+        Writing it the other way round would have
         silently turned "these two grants exclude each other" into "no limit at
         all".
         """
         both_restrict_paths = bool(self.allowed_paths and other.allowed_paths)
         allowed_paths = _intersect_prefixes(self.allowed_paths, other.allowed_paths)
-        denied_paths = tuple({*self.denied_paths, *other.denied_paths})
-        if both_restrict_paths and not allowed_paths:
+        allowed_actions = _intersect_allowed(self.allowed_actions, other.allowed_actions)
+        denied_paths = tuple(dict.fromkeys((*self.denied_paths, *other.denied_paths)))
+        if ((both_restrict_paths and not allowed_paths)
+                or (self.allowed_actions and other.allowed_actions and not allowed_actions)):
             # No shared subtree: deny everything rather than drop the limit.
             denied_paths = (*denied_paths, "")
         return DelegationScope(
-            allowed_actions=_intersect_allowed(self.allowed_actions, other.allowed_actions),
+            allowed_actions=allowed_actions,
             denied_actions=self.denied_actions | other.denied_actions,
             allowed_paths=allowed_paths,
             denied_paths=denied_paths,
@@ -177,6 +210,10 @@ def _intersect_prefixes(left: tuple[str, ...], right: tuple[str, ...]) -> tuple[
     Returning ``left`` or ``right`` outright when the other is empty is correct
     — an empty list means "unrestricted", so the constraint is the other side's.
     """
+    # Invalid restrictions deny in permits(). Never discard one while narrowing:
+    # retaining it preserves fail-closed semantics even alongside valid prefixes.
+    if any(scope_path(prefix) is None for prefix in (*left, *right)):
+        return tuple(dict.fromkeys((*left, *right)))
     if not left:
         return right
     if not right:
@@ -184,15 +221,19 @@ def _intersect_prefixes(left: tuple[str, ...], right: tuple[str, ...]) -> tuple[
     kept: list[str] = []
     for outer in left:
         for inner in right:
-            if outer.startswith(inner):
+            left_path, right_path = scope_path(outer), scope_path(inner)
+            if right_path.contains(left_path):
                 # ``inner`` is the broader prefix; ``outer`` is the overlap.
                 kept.append(outer)
-            elif inner.startswith(outer):
+            elif left_path.contains(right_path):
                 kept.append(inner)
     return tuple(dict.fromkeys(kept))
 
 
 def _earliest(left: datetime | None, right: datetime | None) -> datetime | None:
+    if any(value is not None and (not isinstance(value, datetime) or value.tzinfo is None)
+           for value in (left, right)):
+        return datetime.min.replace(tzinfo=UTC)
     if left is None:
         return right
     if right is None:
@@ -201,7 +242,7 @@ def _earliest(left: datetime | None, right: datetime | None) -> datetime | None:
 
 
 def _clamp_depth(left: int, right: int) -> int:
-    if left <= 0 or right <= 0:
+    if type(left) is not int or type(right) is not int or left <= 0 or right <= 0:
         return 0
     return min(left, right) - 1
 
