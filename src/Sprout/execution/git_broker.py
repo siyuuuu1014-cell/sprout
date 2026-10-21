@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from Sprout.execution import git_s1
 from Sprout.execution.git_env import git_args, git_env
 from Sprout.execution.models import GitResult
 from Sprout.execution.policy_emit import emit_policy_decision
@@ -45,8 +46,7 @@ class GitBroker:
         decision = await self._decide(workspace, ActionType.GIT_STATUS, {}, "", scope)
         if decision is not AccessDecision.ALLOW:
             return GitResult(action="status", allowed=False, reason=decision.value)
-        output = await self._run(workspace, "status", "--porcelain")
-        return GitResult(action="status", output=output)
+        return await git_s1.run_read(workspace, "status", scope)
 
     async def diff(
         self, workspace: Workspace, *, scope: DelegationScope | None = None
@@ -54,10 +54,7 @@ class GitBroker:
         decision = await self._decide(workspace, ActionType.GIT_DIFF, {}, "", scope)
         if decision is not AccessDecision.ALLOW:
             return GitResult(action="diff", allowed=False, reason=decision.value)
-        return GitResult(
-            action="diff",
-            output=await self._run(workspace, "diff", "--no-color", "--no-ext-diff"),
-        )
+        return await git_s1.run_read(workspace, "diff", scope)
 
     async def log(self, workspace: Workspace, limit: int = 20) -> GitResult:
         decision = await self._decide(workspace, ActionType.GIT_LOG, {"limit": limit})
