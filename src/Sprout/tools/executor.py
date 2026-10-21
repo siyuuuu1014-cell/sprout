@@ -105,6 +105,11 @@ class ToolExecutor:
             task_id, source = bound.task_id, bound.source
             requested_by, resource_scope = bound.requested_by, bound.resource_scope
 
+        from Sprout.mcp.adapter.tool import MCPTool, _authorized_mcp_call, _classification
+
+        is_mcp = isinstance(tool, MCPTool)
+        if is_mcp:
+            arguments = deepcopy(dict(arguments))
         decision = self.policy.decide_for_spec(tool.spec)
 
         # A read-only command is granted without asking. This runs *after* the
@@ -154,17 +159,31 @@ class ToolExecutor:
                 matched_rules=(*decision.matched_rules, "capability:git_write:retired"),
             )
 
+        mcp_binding = _classification(tool) if is_mcp else None
+        unclassified_mcp = is_mcp and mcp_binding is None and decision.decision in {
+            AccessDecision.ALLOW, AccessDecision.REQUIRE_APPROVAL,
+        }
+        if unclassified_mcp:
+            decision = replace(
+                decision, decision=AccessDecision.DENY,
+                reason="MCP operation has no current trusted risk classification",
+                matched_rules=(*decision.matched_rules, "mcp:unclassified"),
+            )
+
         await self._audit(name, task_id, source, decision.decision.value, decision.reason)
 
         if decision.decision not in {AccessDecision.ALLOW, AccessDecision.REQUIRE_APPROVAL}:
             await self._publish(TOOL_DENIED, {
-                "tool": name, "reason": "capability_retired" if retired else "policy",
+                "tool": name, "reason": ("capability_retired" if retired else
+                                         "mcp_unclassified" if unclassified_mcp else "policy"),
             })
-            if retired:
+            if retired or unclassified_mcp:
                 return ToolResult.denied(decision.reason)
             return ToolResult.denied(f"Tool {name} is denied by the security policy")
 
         approval_granted = False
+        approval_arguments = ({"mcp_classification_v1": mcp_binding, "arguments": arguments}
+                              if is_mcp else arguments)
         if decision.decision is AccessDecision.REQUIRE_APPROVAL:
             if self.approvals is None:
                 await self._publish(TOOL_DENIED, {"tool": name, "reason": "no-approval-manager"})
@@ -185,7 +204,7 @@ class ToolExecutor:
                 )
             approval_granted = await self.approvals.is_approved(
                 name,
-                arguments,
+                approval_arguments,
                 task_id=task_id,
                 session_id=session_id,
                 requested_by=requested_by,
@@ -195,7 +214,7 @@ class ToolExecutor:
             if not approval_granted:
                 record = await self.approvals.request(
                     name,
-                    arguments,
+                    approval_arguments,
                     task_id=task_id,
                     requested_by=requested_by,
                     resource_scope=resource_scope,
@@ -227,6 +246,11 @@ class ToolExecutor:
                 )
                 if binding is not None:
                     handoff = _approved_cli_call(tool._process_broker, self.approvals, binding)
+            if is_mcp:
+                handoff = _authorized_mcp_call(
+                    tool, contextual, (task_id, session_id, source, requested_by, resource_scope),
+                    mcp_binding,
+                )
             with handoff:
                 result = await tool.invoke(contextual)
         except ToolExecutionUnconfirmed:
