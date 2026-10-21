@@ -86,6 +86,13 @@ class ApplyBroker:
         if not patch:
             return ApplyResult(proposal_id=proposal.id, applied=True, reason="No diff to apply")
 
+        files = tuple(proposal.files_changed)
+        if not files:
+            return ApplyResult(
+                proposal_id=proposal.id, applied=False,
+                reason="Non-empty patch requires explicit files_changed",
+            )
+
         patch_path = self._write_patch(proposal.id, patch)
         try:
             # ``git apply`` is all-or-nothing for a single patch, but preflight
@@ -112,13 +119,9 @@ class ApplyBroker:
                     reason=detail or "git apply failed",
                 )
 
-            files = tuple(proposal.files_changed)
-            if files:
-                code, _, stderr = await self._git(
-                    workspace, "add", "--", *files
-                )
-            else:
-                code, _, stderr = await self._git(workspace, "add", "-A")
+            code, _, stderr = await self._git(
+                workspace, "add", "--", *files
+            )
             if code != 0:
                 await self._undo(workspace, patch_path, files)
                 return ApplyResult(
