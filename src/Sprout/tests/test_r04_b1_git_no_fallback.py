@@ -1,4 +1,4 @@
-"""B1 dispatch contracts; every final process/Git effect is mocked."""
+"""B1 zero-fallback contracts; B3 retires the three former write delegations."""
 
 import ast
 import asyncio
@@ -63,7 +63,7 @@ async def test_missing_or_noncallable_capability_refuses(tmp_path, tool, operati
     broker = SimpleNamespace(**({} if capability == "absent" else {operation: capability}))
     result = await tool(git_broker=broker).invoke(arguments(tmp_path, operation))
     assert not result.ok
-    assert "capability" in result.to_text()
+    assert ("retired" if tool is GitWriteTool else "capability") in result.to_text()
 
 
 @pytest.mark.parametrize("tool,operation", DELEGATED)
@@ -79,6 +79,13 @@ async def test_supported_delegates_once_without_retry(tmp_path, tool, operation,
         method.return_value = GitResult(action=operation, allowed=outcome == "allow",
                                         output="mock", reason=outcome)
     instance = tool(git_broker=SimpleNamespace(**{operation: method}))
+    if tool is GitWriteTool:
+        # B3 strengthens the old write contract: even an available/allowing or
+        # erroring broker is never consulted. Inspect still delegates as in B1.
+        result = await instance.invoke(arguments(tmp_path, operation))
+        assert not result.ok and "retired" in result.to_text()
+        method.assert_not_called()
+        return
     if outcome in errors:
         with pytest.raises(errors[outcome]):
             await instance.invoke(arguments(tmp_path, operation))

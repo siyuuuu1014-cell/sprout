@@ -816,33 +816,9 @@ class GitWriteTool:
             return ToolResult.failure(
                 f"Invalid operation; expected one of: {', '.join(sorted(self._OPERATIONS))}"
             )
-        repo = str(arguments.get("repo") or ".")
-        if self._git_broker is None:
-            return ToolResult.denied("GitBroker is required; host Git fallback is disabled")
-        if operation not in {"add", "commit", "pull"}:
-            return ToolResult.denied(f"Git operation '{operation}' is not supported by this tool")
-        method = getattr(self._git_broker, operation, None)
-        if not callable(method):
-            return ToolResult.denied(f"GitBroker capability '{operation}' is unavailable")
-        if operation in {"add", "commit", "pull"}:
-            workspace = _workspace_for(repo)
-            files = tuple(
-                item for item in arguments.get("files", []) if isinstance(item, str)
-            )
-            if operation == "add":
-                result = await method(workspace, files)
-            elif operation == "pull":
-                result = await method(workspace)
-            elif operation == "commit":
-                message = arguments.get("message")
-                if not isinstance(message, str) or not message.strip():
-                    return ToolResult.failure("'message' is required for git commit")
-                result = await method(
-                    workspace,
-                    message,
-                    files=files,
-                )
-            return _git_result_to_tool_result(result)
+        return ToolResult.denied(
+            "Generic GitWriteTool capability retired; GitBroker write operations are not supported"
+        )
 
 
 async def _run_git(args: list[str]) -> ToolResult:

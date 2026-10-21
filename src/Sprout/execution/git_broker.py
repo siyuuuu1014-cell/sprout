@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from Sprout.execution import git_s1
-from Sprout.execution.git_env import git_args, git_env
 from Sprout.execution.models import GitResult
 from Sprout.execution.policy_emit import emit_policy_decision
-from Sprout.execution.proc import run_capture
-from Sprout.security.access import AccessDecision, ActionRequest, ActionType
+from Sprout.security.access import AccessDecision, ActionRequest, ActionType, PolicyDecision
 from Sprout.security.approval import ApprovalManager
 from Sprout.security.engine import PolicyEngine
 from Sprout.task.models import DelegationScope
@@ -18,16 +17,17 @@ from Sprout.workspace.models import ResourceKind, ResourceRef, Workspace
 if TYPE_CHECKING:
     from Sprout.events import EventBus
 
-#: The tool that exposes these operations to the model. Approvals are requested
-#: and stored under the *tool* name by :class:`~Sprout.tools.executor.ToolExecutor`,
-#: so the broker has to consume them under the same name. Checking with
-#: ``ActionType.GIT_COMMIT.value`` (``git.commit``) instead never matched,
-#: silently turning the broker's gate into "always refuse, even when approved".
+#: Legacy API constant, not authority to revive retired generic operations.
 GIT_WRITE_TOOL = "git_write"
 
 
+async def run_capture(*args: object, **kwargs: object) -> tuple[int, str, str]:
+    """Legacy module symbol retained for observers; no longer an I/O executor."""
+    raise RuntimeError("Generic Git execution is retired")
+
+
 class GitBroker:
-    """Executes read-only and approved Git state changes."""
+    """S1-gated reads and explicit refusal of retired generic capabilities."""
 
     def __init__(
         self,
@@ -57,30 +57,13 @@ class GitBroker:
         return await git_s1.run_read(workspace, "diff", scope)
 
     async def log(self, workspace: Workspace, limit: int = 20) -> GitResult:
-        decision = await self._decide(workspace, ActionType.GIT_LOG, {"limit": limit})
-        if decision is not AccessDecision.ALLOW:
-            return GitResult(action="log", allowed=False, reason=decision.value)
-        return GitResult(
-            action="log",
-            output=await self._run(workspace, "log", "--oneline", "-n", str(limit)),
-        )
+        return await self._refuse(workspace, ActionType.GIT_LOG, {"limit": limit})
 
     async def branch(self, workspace: Workspace) -> GitResult:
-        decision = await self._decide(workspace, ActionType.GIT_BRANCH, {})
-        if decision is not AccessDecision.ALLOW:
-            return GitResult(action="branch", allowed=False, reason=decision.value)
-        return GitResult(
-            action="branch",
-            output=await self._run(workspace, "branch", "--all", "-vv"),
-        )
+        return await self._refuse(workspace, ActionType.GIT_BRANCH, {})
 
     async def add(self, workspace: Workspace, files: tuple[str, ...] = ()) -> GitResult:
-        arguments = {"files": list(files)}
-        decision = await self._decide(workspace, ActionType.GIT_ADD, arguments)
-        if decision is not AccessDecision.ALLOW:
-            return GitResult(action="add", allowed=False, reason=decision.value)
-        await self._run(workspace, "add", *(files or ("-A",)))
-        return GitResult(action="add")
+        return await self._refuse(workspace, ActionType.GIT_ADD, {"files": list(files)})
 
     async def commit(
         self,
@@ -92,23 +75,7 @@ class GitBroker:
         scope: DelegationScope | None = None,
     ) -> GitResult:
         arguments = {"message": message, "files": list(files)}
-        decision = await self._decide(workspace, ActionType.GIT_COMMIT, arguments, task_id, scope)
-        if decision is AccessDecision.REQUIRE_APPROVAL:
-            if self._approvals is None or not await self._approvals.is_approved(
-                GIT_WRITE_TOOL,
-                arguments,
-                task_id=task_id,
-            ):
-                return GitResult(
-                    action="commit",
-                    allowed=False,
-                    reason="Git commit requires approval",
-                )
-        elif decision is not AccessDecision.ALLOW:
-            return GitResult(action="commit", allowed=False, reason=decision.value)
-        await self._run(workspace, "add", *(files or ("-A",)))
-        output = await self._run(workspace, "commit", "-m", message)
-        return GitResult(action="commit", output=output)
+        return await self._refuse(workspace, ActionType.GIT_COMMIT, arguments, task_id, scope)
 
     async def push(
         self,
@@ -120,20 +87,7 @@ class GitBroker:
         scope: DelegationScope | None = None,
     ) -> GitResult:
         arguments = {"remote": remote, "branch": branch}
-        decision = await self._decide(workspace, ActionType.GIT_PUSH, arguments, task_id, scope)
-        if decision is AccessDecision.REQUIRE_APPROVAL:
-            if self._approvals is None or not await self._approvals.is_approved(
-                GIT_WRITE_TOOL,
-                arguments,
-                task_id=task_id,
-            ):
-                return GitResult(action="push", allowed=False, reason="Git push requires approval")
-        elif decision is not AccessDecision.ALLOW:
-            return GitResult(action="push", allowed=False, reason=decision.value)
-        args = ["push", remote]
-        if branch:
-            args.append(branch)
-        return GitResult(action="push", output=await self._run(workspace, *args))
+        return await self._refuse(workspace, ActionType.GIT_PUSH, arguments, task_id, scope)
 
     async def pull(
         self,
@@ -144,20 +98,15 @@ class GitBroker:
         task_id: str = "",
     ) -> GitResult:
         arguments = {"remote": remote, "branch": branch}
-        decision = await self._decide(workspace, ActionType.GIT_PULL, arguments, task_id)
-        if decision is AccessDecision.REQUIRE_APPROVAL:
-            if self._approvals is None or not await self._approvals.is_approved(
-                GIT_WRITE_TOOL,
-                arguments,
-                task_id=task_id,
-            ):
-                return GitResult(action="pull", allowed=False, reason="Git pull requires approval")
-        elif decision is not AccessDecision.ALLOW:
-            return GitResult(action="pull", allowed=False, reason=decision.value)
-        args = ["pull", "--ff-only", remote]
-        if branch:
-            args.append(branch)
-        return GitResult(action="pull", output=await self._run(workspace, *args))
+        return await self._refuse(workspace, ActionType.GIT_PULL, arguments, task_id)
+
+    async def _refuse(
+        self, workspace: Workspace, action: ActionType, arguments: dict,
+        task_id: str = "", scope: DelegationScope | None = None,
+    ) -> GitResult:
+        decision = await self._decision(workspace, action, arguments, task_id, scope, retired=True)
+        return GitResult(action=action.value.removeprefix("git."), allowed=False,
+                         reason=decision.reason or decision.decision.value)
 
     async def _decide(
         self,
@@ -167,6 +116,12 @@ class GitBroker:
         task_id: str = "",
         scope: DelegationScope | None = None,
     ) -> AccessDecision:
+        return (await self._decision(workspace, action, arguments, task_id, scope)).decision
+
+    async def _decision(
+        self, workspace: Workspace, action: ActionType, arguments: dict,
+        task_id: str = "", scope: DelegationScope | None = None, *, retired: bool = False,
+    ) -> PolicyDecision:
         resource = ResourceRef(
             workspace_id=workspace.id,
             path=str(workspace.root),
@@ -180,17 +135,15 @@ class GitBroker:
             scope=scope if scope is not None else DelegationScope(),
         )
         decision = self._policy.decide(request)
+        if retired and decision.decision in {AccessDecision.ALLOW, AccessDecision.REQUIRE_APPROVAL}:
+            decision = replace(
+                decision, decision=AccessDecision.DENY,
+                reason="Generic GitBroker capability retired",
+                matched_rules=(*decision.matched_rules, "capability:git:retired"),
+            )
         await emit_policy_decision(self._events, request, decision)
-        return decision.decision
+        return decision
 
     @staticmethod
     async def _run(workspace: Workspace, *args: str) -> str:
-        code, stdout, stderr = await run_capture(
-            "git",
-            *git_args("-C", str(workspace.root), *args),
-            env=git_env(),
-        )
-        if code != 0:
-            detail = stderr.strip()
-            raise RuntimeError(detail or f"git command failed with code {code}")
-        return stdout
+        raise RuntimeError("Generic Git execution is retired")

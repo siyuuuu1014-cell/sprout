@@ -142,10 +142,26 @@ class ToolExecutor:
             matched_rules=(*boundary.matched_rules, *decision.matched_rules),
         )
 
+        from Sprout.tools.system_tools import GitWriteTool
+
+        retired = type(tool) is GitWriteTool and decision.decision in {
+            AccessDecision.ALLOW, AccessDecision.REQUIRE_APPROVAL,
+        }
+        if retired:
+            decision = replace(
+                decision, decision=AccessDecision.DENY,
+                reason="Generic GitWriteTool capability retired",
+                matched_rules=(*decision.matched_rules, "capability:git_write:retired"),
+            )
+
         await self._audit(name, task_id, source, decision.decision.value, decision.reason)
 
         if decision.decision not in {AccessDecision.ALLOW, AccessDecision.REQUIRE_APPROVAL}:
-            await self._publish(TOOL_DENIED, {"tool": name, "reason": "policy"})
+            await self._publish(TOOL_DENIED, {
+                "tool": name, "reason": "capability_retired" if retired else "policy",
+            })
+            if retired:
+                return ToolResult.denied(decision.reason)
             return ToolResult.denied(f"Tool {name} is denied by the security policy")
 
         approval_granted = False
