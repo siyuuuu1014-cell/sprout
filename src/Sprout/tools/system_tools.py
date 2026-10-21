@@ -422,6 +422,10 @@ class CliRunTool:
                 "Working directory is outside the allowed roots: "
                 + ", ".join(str(root) for root in self._allowed_roots)
             )
+        if self._process_broker is None:
+            return ToolResult.denied(
+                "CLI execution requires ProcessBroker; host fallback is disabled"
+            )
         timeout = _as_number(arguments.get("timeout"), default=30.0, minimum=0.1)
         executable = shutil.which(command)
         if not executable:
@@ -440,23 +444,8 @@ class CliRunTool:
         # environment handed every API key in the process to a subprocess that
         # a single approval had unlocked.
         env = self._secrets.child_env(base_env=os.environ, extra=extra_env)
-        if self._process_broker is not None:
-            return await self._run_via_broker(
-                executable, args, cwd, env, timeout, arguments.get(_CONTEXT_KEY)
-            )
-        try:
-            returncode, stdout, stderr = await _run_command(
-                executable, args, cwd=str(cwd), env=env, timeout=timeout
-            )
-        except TimeoutError:
-            return ToolResult.failure(f"Command timed out after {timeout}s")
-        output = _clip(stdout)
-        if stderr.strip():
-            output += "\n[stderr]\n" + _clip(stderr)
-        if returncode == 0:
-            return ToolResult.success(output, data={"returncode": returncode})
-        return ToolResult.failure(
-            f"Command exited with code {returncode}\n{output}",
+        return await self._run_via_broker(
+            executable, args, cwd, env, timeout, arguments.get(_CONTEXT_KEY)
         )
 
     async def _run_via_broker(
