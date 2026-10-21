@@ -38,6 +38,7 @@ from Sprout.security.commands import CommandRegistry
 from Sprout.security.engine import PolicyEngine
 from Sprout.security.secret_broker import SecretBroker
 from Sprout.task.models import DelegationScope
+from Sprout.tools.context_keys import _cli_process_binding, _consume_cli_approval
 from Sprout.workspace.models import ResourceKind, ResourceRef, Workspace
 
 if TYPE_CHECKING:
@@ -168,6 +169,18 @@ class ProcessBroker:
         allowlisted = bool(tags["allowlisted_command"])
         self._record_allowlist(command_tuple, allowlisted, command_origin, task_id)
         if decision.decision is not AccessDecision.ALLOW:
+            # Only the exact plain CLI execution shape can consume a CLI grant;
+            # extra secret injection, alternate scope/actor or preflight cannot.
+            cli_binding = None
+            if (not secret_names and not required_env and scope is None and actor is None
+                    and not known_command and command_origin == "caller"
+                    and not preflight_only and max_output_bytes is None
+                    and Path(workspace.root).resolve() == cwd_path.resolve()):
+                cli_binding = _cli_process_binding(
+                    command_tuple, cwd_path, env, timeout_seconds,
+                    task_id, session_id, source, requested_by, resource_scope,
+                    workspace.id, workspace.kind.value,
+                )
             blocked = await self._withheld(
                 command_tuple,
                 decision,
@@ -179,6 +192,7 @@ class ProcessBroker:
                 source=source,
                 allowlisted=allowlisted,
                 upstream_approval_granted=upstream_approval_granted,
+                cli_binding=cli_binding,
             )
             if blocked is not None:
                 return blocked
@@ -265,6 +279,7 @@ class ProcessBroker:
         source: str,
         allowlisted: bool,
         upstream_approval_granted: bool = False,
+        cli_binding: tuple | None = None,
     ) -> ProcessResult | None:
         """Handle a non-ALLOW decision: park on approval, refuse, or proceed.
 
@@ -289,27 +304,20 @@ class ProcessBroker:
         )
         if decision.decision is not AccessDecision.REQUIRE_APPROVAL:
             return withheld
-        # ``ToolExecutor`` has already granted this exact CLI invocation. Its
-        # internal context is injected server-side and is never part of the
-        # user arguments, so the broker can honor it without asking twice.
-        # A DENY is handled above and can never be relaxed here.
+        # The legacy bool is attribution only, never approval evidence. DENY
+        # was handled above. Source policy precedes any upstream handoff.
         context = self._acceptance_context.get()
-        if upstream_approval_granted and context is None:
+        if self._approvals is not None and not self._approvals.asks_a_human(source):
+            # Unattended source: no human decision can arrive. Check before
+            # consuming any CLI handoff, including otherwise valid ones.
+            return replace(withheld, error=f"{decision.reason} (source {source!r} is unattended, "
+                           f"mode: {self._approvals.mode_for(source).value})")
+        if context is None and _consume_cli_approval(self, self._approvals, cli_binding):
             return None
         if self._approvals is None:
             return replace(
                 withheld,
                 error=f"{decision.reason} (no approval manager is configured)",
-            )
-        if not self._approvals.asks_a_human(source):
-            # Unattended source: no decision can arrive, so fail closed rather
-            # than park a task nobody will ever answer.
-            return replace(
-                withheld,
-                error=(
-                    f"{decision.reason} (source {source!r} is unattended, "
-                    f"mode: {self._approvals.mode_for(source).value})"
-                ),
             )
         # Task-scoped, not command-scoped: the approval arguments deliberately
         # carry no command, so one grant covers a whole verification round.

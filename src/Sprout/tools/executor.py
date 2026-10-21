@@ -16,6 +16,8 @@ wired, the call is denied rather than executed.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import nullcontext
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
@@ -31,7 +33,12 @@ from Sprout.security.approval import ApprovalManager
 from Sprout.security.layered_policy import LayeredPolicyEngine
 from Sprout.security.policy import Decision, SecurityPolicy
 from Sprout.security.protocol import PolicyEngineProtocol
-from Sprout.tools.context_keys import CONTEXT_KEY, CONTEXT_TOOLS, NodeToolInvocationContext
+from Sprout.tools.context_keys import (
+    CONTEXT_KEY,
+    CONTEXT_TOOLS,
+    NodeToolInvocationContext,
+    _approved_cli_call,
+)
 from Sprout.tools.registry import ToolRegistry
 from Sprout.tools.result import ToolExecutionUnconfirmed, ToolResult
 
@@ -80,6 +87,10 @@ class ToolExecutor:
         source: str = "interactive",
         resource_scope: str = "",
     ) -> ToolResult:
+        # Freeze CLI input before any policy/approval awaits; the caller cannot
+        # mutate the approved argv/env while the grant is being consumed.
+        if name == "cli_tool_run":
+            arguments = deepcopy(dict(arguments))
         try:
             tool = self._resolve(name)
         except KeyError:
@@ -189,8 +200,19 @@ class ToolExecutor:
                 source,
                 requested_by,
                 approval_granted=approval_granted,
+                resource_scope=resource_scope,
             )
-            result = await tool.invoke(contextual)
+            from Sprout.tools.system_tools import CliRunTool
+
+            handoff = nullcontext()
+            if approval_granted and type(tool) is CliRunTool:
+                binding = tool._approval_binding(
+                    contextual, task_id, session_id, source, requested_by, resource_scope,
+                )
+                if binding is not None:
+                    handoff = _approved_cli_call(tool._process_broker, self.approvals, binding)
+            with handoff:
+                result = await tool.invoke(contextual)
         except ToolExecutionUnconfirmed:
             await self._publish(TOOL_EXECUTED, {"tool": name, "ok": False,
                                                 "execution_unconfirmed": True})
@@ -235,6 +257,7 @@ class ToolExecutor:
         requested_by: str,
         *,
         approval_granted: bool = False,
+        resource_scope: str = "",
     ) -> Mapping[str, Any]:
         """Attach the calling context a tool cannot otherwise see.
 
@@ -261,6 +284,7 @@ class ToolExecutor:
                 "source": source,
                 "requested_by": requested_by,
                 "approval_granted": approval_granted,
+                "resource_scope": resource_scope,
             },
         }
 

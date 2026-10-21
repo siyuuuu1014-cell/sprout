@@ -23,6 +23,7 @@ import httpx
 from Sprout.security.net_guard import NetworkGuard
 from Sprout.security.secret_broker import SecretBroker
 from Sprout.tools.context_keys import CONTEXT_KEY as _CONTEXT_KEY
+from Sprout.tools.context_keys import _cli_process_binding
 from Sprout.tools.result import ToolResult
 from Sprout.tools.spec import ToolSpec
 
@@ -406,7 +407,8 @@ class CliRunTool:
         self._allowed_roots = tuple(Path(root).resolve() for root in roots)
         self._process_broker = process_broker
 
-    async def invoke(self, arguments: Mapping[str, Any]) -> ToolResult:
+    def _prepare_invocation(self, arguments):
+        """Resolve a CLI subject without spawning; also pins the approval handoff."""
         command = arguments.get("command")
         if not isinstance(command, str) or not command.strip():
             return ToolResult.failure("Argument 'command' must be a non-empty string")
@@ -444,6 +446,24 @@ class CliRunTool:
         # environment handed every API key in the process to a subprocess that
         # a single approval had unlocked.
         env = self._secrets.child_env(base_env=os.environ, extra=extra_env)
+        return executable, list(args), cwd, env, timeout
+
+    def _approval_binding(self, arguments, task_id, session_id, source, requested_by,
+                          resource_scope):
+        prepared = self._prepare_invocation(arguments)
+        if isinstance(prepared, ToolResult):
+            return None
+        executable, args, cwd, env, timeout = prepared
+        workspace = _workspace_for(cwd)
+        return _cli_process_binding((executable, *args), cwd, env, timeout,
+                                    task_id, session_id, source, requested_by, resource_scope,
+                                    workspace.id, workspace.kind.value)
+
+    async def invoke(self, arguments: Mapping[str, Any]) -> ToolResult:
+        prepared = self._prepare_invocation(arguments)
+        if isinstance(prepared, ToolResult):
+            return prepared
+        executable, args, cwd, env, timeout = prepared
         return await self._run_via_broker(
             executable, args, cwd, env, timeout, arguments.get(_CONTEXT_KEY)
         )
@@ -459,12 +479,13 @@ class CliRunTool:
     ) -> ToolResult:
         """Hand the command to the process broker, carrying the calling context.
 
-        ``context`` is what ``ToolExecutor`` injected (``_sprout_context``): the
+        ``context`` is attribution normally injected by ``ToolExecutor``: the
         task id, source and requester the agent loop is working for. Passing them
         through is not optional — the broker applies process policy and honors
         the exact upstream CLI approval when present. Without task and approval
         context it would ask twice for the same invocation, or fail to match a
-        task-scoped grant.
+        task-scoped grant. Its legacy approval bool is not evidence: the broker
+        independently verifies a private, one-shot executor handoff.
         """
         ctx = context if isinstance(context, Mapping) else {}
         workspace = _workspace_for(cwd)
@@ -478,6 +499,7 @@ class CliRunTool:
             session_id=str(ctx.get("session_id", "")),
             source=str(ctx.get("source", "") or "interactive"),
             requested_by=str(ctx.get("requested_by", "") or "system"),
+            resource_scope=str(ctx.get("resource_scope", "")),
             upstream_approval_granted=bool(ctx.get("approval_granted")),
         )
         if not result.allowed:
