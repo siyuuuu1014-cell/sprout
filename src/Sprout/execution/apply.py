@@ -93,6 +93,24 @@ class ApplyBroker:
                 reason="Non-empty patch requires explicit files_changed",
             )
 
+        # Point-in-time guard only: do not mix existing staging into this
+        # proposal. This does not lock the index against concurrent writers.
+        try:
+            index_code, _, _ = await self._git(
+                workspace, "diff", "--cached", "--quiet", "--exit-code",
+                "--no-ext-diff", "--no-textconv", "--ita-visible-in-index", "--",
+            )
+        except Exception:
+            return ApplyResult(
+                proposal_id=proposal.id, applied=False,
+                reason="Index inspection failed; refusing apply",
+            )
+        if type(index_code) is not int or index_code != 0:
+            return ApplyResult(
+                proposal_id=proposal.id, applied=False,
+                reason="Index is staged or its state is uncertain; refusing apply",
+            )
+
         patch_path = self._write_patch(proposal.id, patch)
         try:
             # ``git apply`` is all-or-nothing for a single patch, but preflight

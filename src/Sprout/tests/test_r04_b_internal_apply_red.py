@@ -26,6 +26,8 @@ from Sprout.workspace.models import Workspace
 
 PATCH = ("diff --git a/task.txt b/task.txt\n--- a/task.txt\n+++ b/task.txt\n"
          "@@ -1 +1 @@\n-old\n+new\n")
+INDEX_CHECK = ("diff", "--cached", "--quiet", "--exit-code", "--no-ext-diff",
+               "--no-textconv", "--ita-visible-in-index", "--")
 
 
 @pytest.fixture
@@ -33,9 +35,17 @@ def probe(tmp_path, monkeypatch):
     state = SimpleNamespace(
         index=set(), committed=[], target_extra=False, contaminated=False,
         head="a" * 40, worktree_changed=False, failure=None, head_reads=0,
+        index_reply=None, index_error=None,
     )
 
     async def git(workspace, *args):
+        if args[:2] == ("diff", "--cached"):
+            assert args == INDEX_CHECK, "Index inspection must use fixed helper-disabled argv"
+            if state.index_error is not None:
+                raise state.index_error
+            if state.index_reply is not None:
+                return state.index_reply
+            return int(bool(state.index)), "", ""
         if args[0] == "rev-parse":
             state.head_reads += 1
             if state.failure == ("observe", "nonzero") and state.head_reads > 1:
@@ -49,6 +59,8 @@ def probe(tmp_path, monkeypatch):
             state.contaminated = state.target_extra
         if phase == "commit":
             state.committed.append(frozenset(state.index))
+            # After commit these entries match HEAD, not pending staged edits.
+            state.index.clear()
             state.head = "b" * 40
         # Fail after a possible effect; a nonzero exit is not no-effect evidence.
         if state.failure and state.failure[0] == phase:
@@ -333,3 +345,71 @@ async def test_empty_file_set_refuses_before_all_io_and_has_no_broad_add(probe):
     assert not probe.state.committed
     source = inspect.getsource(ApplyBroker)
     assert '"-A"' not in source and '"--all"' not in source
+
+
+@pytest.mark.parametrize("staged", ["unrelated_modified", "task_old", "added", "deleted",
+                                  "conflict", "intent_to_add"])
+async def test_existing_staging_refuses_without_touching_index_or_patch(probe, staged):
+    probe.state.index.add(staged)
+    before = probe.state.index.copy()
+    item = proposal()
+    result = await ApplyBroker(PolicyEngine(), approvals=await approved(item)).apply(
+        item, probe.workspace)
+    assert not result.applied and "Index" in result.reason
+    probe.runner.assert_awaited_once_with(probe.workspace, *INDEX_CHECK)
+    probe.writer.assert_not_called()
+    probe.undo.assert_not_called()
+    probe.capture.assert_not_called()
+    assert probe.state.index == before and not probe.state.committed
+    assert not probe.state.worktree_changed
+
+
+@pytest.mark.parametrize("reply", [(128, "", "unreadable"), (2, "", "unknown"),
+                                   (None, "", ""), (-1, "", ""), (True, "", ""),
+                                   ("0", "", ""), ()])
+async def test_uncertain_index_result_is_not_a_clean_index(probe, reply):
+    probe.state.index_reply = reply
+    item = proposal()
+    result = await ApplyBroker(PolicyEngine(), approvals=await approved(item)).apply(
+        item, probe.workspace)
+    assert not result.applied and "Index" in result.reason
+    probe.runner.assert_awaited_once_with(probe.workspace, *INDEX_CHECK)
+    probe.writer.assert_not_called()
+    probe.undo.assert_not_called()
+    assert not probe.state.committed and not probe.state.worktree_changed
+
+
+@pytest.mark.parametrize("error", [OSError, RuntimeError, TimeoutError])
+async def test_index_exception_refuses_without_mutation_or_compensation(probe, error):
+    probe.state.index_error = error("mock read failure")
+    item = proposal()
+    result = await ApplyBroker(PolicyEngine(), approvals=await approved(item)).apply(
+        item, probe.workspace)
+    assert not result.applied and "Index" in result.reason
+    probe.runner.assert_awaited_once_with(probe.workspace, *INDEX_CHECK)
+    probe.writer.assert_not_called()
+    probe.undo.assert_not_called()
+    assert not probe.state.committed and not probe.state.worktree_changed
+
+
+async def test_index_cancellation_propagates_before_patch_or_mutation(probe):
+    probe.state.index_error = asyncio.CancelledError()
+    item = proposal()
+    with pytest.raises(asyncio.CancelledError):
+        await ApplyBroker(PolicyEngine(), approvals=await approved(item)).apply(
+            item, probe.workspace)
+    probe.runner.assert_awaited_once_with(probe.workspace, *INDEX_CHECK)
+    probe.writer.assert_not_called()
+    probe.undo.assert_not_called()
+    assert not probe.state.committed and not probe.state.worktree_changed
+
+
+async def test_clean_index_keeps_existing_explicit_file_apply_sequence(probe):
+    item = proposal()
+    result = await ApplyBroker(PolicyEngine(), approvals=await approved(item)).apply(
+        item, probe.workspace)
+    assert result.applied
+    assert probe.runner.await_args_list[0].args == (probe.workspace, *INDEX_CHECK)
+    assert [call.args[1] for call in probe.runner.await_args_list] == [
+        "diff", "apply", "rev-parse", "apply", "add", "commit", "rev-parse"]
+    assert probe.state.committed == [frozenset({"task.txt"})]
