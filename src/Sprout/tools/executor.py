@@ -39,6 +39,7 @@ from Sprout.tools.context_keys import (
     NodeToolInvocationContext,
     _approved_cli_call,
 )
+from Sprout.tools.project_analyze_tool import ProjectAnalyzeTool
 from Sprout.tools.registry import ToolRegistry
 from Sprout.tools.result import ToolExecutionUnconfirmed, ToolResult
 
@@ -97,6 +98,11 @@ class ToolExecutor:
             return ToolResult.failure(f"Unknown tool: {name}")
         except LookupError as exc:
             return ToolResult.failure(str(exc))
+
+        if isinstance(tool, ProjectAnalyzeTool):
+            # Policy, approval and invoke must see the same caller-independent
+            # probe flag and payload, including across audit/approval awaits.
+            arguments = deepcopy(dict(arguments))
 
         bound = getattr(tool, "invocation_context", None)
         if isinstance(bound, NodeToolInvocationContext):
@@ -183,6 +189,15 @@ class ToolExecutor:
             decision = replace(
                 decision, decision=AccessDecision.DENY, reason=unavailable,
                 matched_rules=(*decision.matched_rules, "capability:skill_script:unavailable"),
+            )
+
+        if (isinstance(tool, ProjectAnalyzeTool)
+                and arguments.get("include_system_tools") is True
+                and decision.decision in {AccessDecision.ALLOW, AccessDecision.REQUIRE_APPROVAL}):
+            unavailable = "native_project_probe_unavailable"
+            decision = replace(
+                decision, decision=AccessDecision.DENY, reason=unavailable,
+                matched_rules=(*decision.matched_rules, "capability:project_probe:unavailable"),
             )
 
         await self._audit(name, task_id, source, decision.decision.value, decision.reason)

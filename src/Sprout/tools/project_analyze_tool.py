@@ -55,6 +55,8 @@ class ProjectAnalyzeTool:
         )
 
     async def invoke(self, arguments: Mapping[str, Any]) -> ToolResult:
+        if arguments.get("include_system_tools") is True:
+            return ToolResult.denied("native_project_probe_unavailable")
         path_arg = arguments.get("path")
         if not isinstance(path_arg, str) or not path_arg:
             return ToolResult.failure("Argument 'path' must be a non-empty string")
@@ -115,9 +117,6 @@ class ProjectAnalyzeTool:
                 for item in knowledge.items
             ],
         }
-
-        if arguments.get("include_system_tools") is True:
-            payload["system_tools"] = await _system_tool_probe(root)
 
         return ToolResult.success(
             json.dumps(payload, ensure_ascii=False, indent=2),
