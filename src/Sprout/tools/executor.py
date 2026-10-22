@@ -147,7 +147,7 @@ class ToolExecutor:
             matched_rules=(*boundary.matched_rules, *decision.matched_rules),
         )
 
-        from Sprout.tools.system_tools import GitWriteTool
+        from Sprout.tools.system_tools import GitWriteTool, SkillScriptTool
 
         retired = type(tool) is GitWriteTool and decision.decision in {
             AccessDecision.ALLOW, AccessDecision.REQUIRE_APPROVAL,
@@ -170,14 +170,30 @@ class ToolExecutor:
                 matched_rules=(*decision.matched_rules, "mcp:unclassified"),
             )
 
+        # Negative capability: the disabled built-in type and all subclasses
+        # remain unavailable, even if invoke is overridden or registered via an
+        # overlay/another registry. Unrelated same-name plugins are unaffected.
+        # Preserve Policy/Scope denial and reject before touching approvals.
+        unavailable = "skill_script_execution_unavailable" if (
+            isinstance(tool, SkillScriptTool) and decision.decision in {
+            AccessDecision.ALLOW, AccessDecision.REQUIRE_APPROVAL,
+            }
+        ) else ""
+        if unavailable:
+            decision = replace(
+                decision, decision=AccessDecision.DENY, reason=unavailable,
+                matched_rules=(*decision.matched_rules, "capability:skill_script:unavailable"),
+            )
+
         await self._audit(name, task_id, source, decision.decision.value, decision.reason)
 
         if decision.decision not in {AccessDecision.ALLOW, AccessDecision.REQUIRE_APPROVAL}:
             await self._publish(TOOL_DENIED, {
                 "tool": name, "reason": ("capability_retired" if retired else
+                                         "capability_unavailable" if unavailable else
                                          "mcp_unclassified" if unclassified_mcp else "policy"),
             })
-            if retired or unclassified_mcp:
+            if retired or unclassified_mcp or unavailable:
                 return ToolResult.denied(decision.reason)
             return ToolResult.denied(f"Tool {name} is denied by the security policy")
 
