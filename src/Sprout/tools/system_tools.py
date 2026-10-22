@@ -141,6 +141,8 @@ class GrepCheckTool:
     )
 
     async def invoke(self, arguments: Mapping[str, Any]) -> ToolResult:
+        return ToolResult.denied("native_grep_execution_unavailable")
+
         pattern = arguments.get("pattern")
         if not isinstance(pattern, str) or not pattern.strip():
             return ToolResult.failure("Argument 'pattern' must be a non-empty string")
@@ -248,16 +250,13 @@ class CliDetectTool:
                 f"({', '.join(sorted(self._VERSION_ARGS_ALLOWLIST))}); "
                 f"refused: {rejected}"
             )
-        try:
-            _, stdout, stderr = await _run_command(
-                executable, version_args, timeout=10.0
-            )
-            version = _clip((stdout or stderr).strip().splitlines()[0])
-        except (TimeoutError, OSError, ValueError, IndexError):
-            version = "unknown"
-        payload["version"] = version
+        # PATH discovery is metadata, not executable identity or permission.
+        # Never run even a version/help command without a trusted contract.
+        payload["version"] = "not_executed"
+        payload["version_executed"] = False
         return ToolResult.success(
-            f"{command!r} is available at {executable} (version: {version}).",
+            f"{command!r} was found on PATH at {executable}. "
+            "Its identity is not trusted and no version command was executed.",
             data=payload,
         )
 
@@ -559,6 +558,8 @@ class SkillScriptTool:
         )
 
     async def invoke(self, arguments: Mapping[str, Any]) -> ToolResult:
+        return ToolResult.denied("skill_script_execution_unavailable")
+
         from Sprout.orchestration.terminal.ensure import ensure_temporal_async
 
         try:
