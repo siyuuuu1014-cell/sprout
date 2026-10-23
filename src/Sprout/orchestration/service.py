@@ -14,6 +14,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from typing import Any
 
+from Sprout.orchestration.execution_guard import NodeExecutionGuard
 from Sprout.orchestration.models import (
     ExecutionGraph,
     ExecutionNode,
@@ -58,15 +59,7 @@ class SequentialOrchestrator:
         # A local scheduler must not bypass external activity ownership after
         # a configuration change, even when the caller omits that node.
         stored = await self._metadata.list_execution_nodes(graph.task_id)
-        if any(
-            node.metadata.get("execution_guard")
-            and node.status
-            not in {
-                NodeStatus.COMPLETED,
-                NodeStatus.SKIPPED,
-            }
-            for node in stored
-        ):
+        if any(self._blocks_local_replay(node) for node in stored):
             current = await self._metadata.get_task(graph.task_id)
             if current is not None and TaskStateMachine.can_transition(
                 current.status,
@@ -76,7 +69,7 @@ class SequentialOrchestrator:
             return TaskResult(
                 task_id=graph.task_id,
                 status=TaskStatus.WAITING_RESOURCE,
-                error="External activity ownership requires reconciliation; no local replay",
+                error="Unconfirmed node ownership requires reconciliation; no local replay",
             )
         nodes = await self._restore(graph)
         deadline = None
@@ -105,22 +98,32 @@ class SequentialOrchestrator:
                     recorder, node, graph.task_id, "Task budget exceeded (duration)"
                 )
 
-            outcome = await self._run_node(node, graph.task_id, handler, recorder)
+            outcome = await self._run_node(
+                node, graph.task_id, handler, recorder, resume_key=graph.dispatch_key,
+            )
             statuses[node.id] = outcome.status
 
             if outcome.status is NodeStatus.WAITING:
+                resource_wait = (isinstance(outcome.output, dict)
+                                 and outcome.output.get("waiting_kind") == "resource")
+                target = (TaskStatus.WAITING_RESOURCE if resource_wait
+                          else TaskStatus.WAITING_APPROVAL)
                 await self._update_task_status(
                     graph.task_id,
-                    TaskStatus.WAITING_APPROVAL,
+                    target,
                     recorder,
                 )
                 await self._record(
                     recorder,
-                    "task.waiting_approval",
+                    "task.waiting_resource" if resource_wait else "task.waiting_approval",
                     graph.task_id,
                     {"node_id": node.id, "type": node.type.value},
                 )
-                return TaskResult(task_id=graph.task_id, status=TaskStatus.WAITING_APPROVAL)
+                return TaskResult(task_id=graph.task_id, status=target, error=outcome.error)
+
+            if outcome.status is NodeStatus.CANCELLED:
+                await self._update_task_status(graph.task_id, TaskStatus.CANCELLED, recorder)
+                return TaskResult(task_id=graph.task_id, status=TaskStatus.CANCELLED)
 
             if outcome.status is NodeStatus.FAILED:
                 await self._update_task_status(graph.task_id, TaskStatus.FAILED, recorder)
@@ -169,19 +172,30 @@ class SequentialOrchestrator:
         return await self.execute(graph, handler=handler, recorder=recorder, budget=budget)
 
     # -- node execution ------------------------------------------------------
+    @staticmethod
+    def _blocks_local_replay(node: ExecutionNode) -> bool:
+        guard = node.metadata.get("execution_guard", {})
+        if not isinstance(guard, dict):
+            return True
+        if (node.status in {NodeStatus.RUNNING, NodeStatus.FAILED}
+                or guard.get("state") in {"active", "uncertain"}):
+            return True
+        if node.status is NodeStatus.WAITING:
+            output = node.metadata.get("output")
+            return not (guard.get("owner") and guard.get("state") == "waiting"
+                        and isinstance(output, dict) and output.get("waiting") is True)
+        return False
+
     async def _run_node(
         self,
         node: ExecutionNode,
         task_id: str,
         handler: NodeHandler,
         recorder: Any | None,
+        *,
+        resume_key: str = "",
     ) -> NodeResult:
-        max_attempts = max(1, node.budget.max_attempts)
-        current = node
-        while True:
-            NodeStateMachine.validate(current.status, NodeStatus.RUNNING)
-            running = replace(current, status=NodeStatus.RUNNING, attempts=current.attempts + 1)
-            await self._metadata.save_execution_node(running)
+        async def invoke(running: ExecutionNode):
             await self._record(
                 recorder,
                 "node.started",
@@ -192,69 +206,35 @@ class SequentialOrchestrator:
                     "attempt": running.attempts,
                 },
             )
-            try:
-                output = None
-                if handler is not None:
+            if handler is None:
+                return None
 
-                    async def invoke(node: ExecutionNode = running) -> Any:
-                        result = handler(node)
-                        return await result if hasattr(result, "__await__") else result
+            async def call_handler():
+                result = handler(running)
+                return await result if hasattr(result, "__await__") else result
 
-                    if running.budget.timeout_seconds > 0:
-                        output = await asyncio.wait_for(
-                            invoke(),
-                            timeout=running.budget.timeout_seconds,
-                        )
-                    else:
-                        output = await invoke()
-            except Exception as exc:  # noqa: BLE001 - graph failures must update state
-                error = f"{type(exc).__name__}: {exc}"
-                if running.attempts < max_attempts:
-                    await self._record(
-                        recorder,
-                        "node.retrying",
-                        task_id,
-                        {"node_id": running.id, "error": error},
-                    )
-                    current = replace(
-                        running,
-                        status=NodeStatus.PENDING,
-                        metadata={**running.metadata, "last_error": error},
-                    )
-                    continue
-                await self._fail(running, error)
-                await self._record(
-                    recorder,
-                    "node.failed",
-                    task_id,
-                    {"node_id": running.id, "error": error},
+            if running.budget.timeout_seconds > 0:
+                return await asyncio.wait_for(
+                    call_handler(), timeout=running.budget.timeout_seconds,
                 )
-                return NodeResult(running.id, NodeStatus.FAILED, error=error)
+            return await call_handler()
 
-            if isinstance(output, dict) and output.get("waiting"):
-                waiting = replace(
-                    running,
-                    status=NodeStatus.WAITING,
-                    metadata={**running.metadata, "output": output},
-                )
-                NodeStateMachine.validate(running.status, NodeStatus.WAITING)
-                await self._metadata.save_execution_node(waiting)
-                return NodeResult(waiting.id, NodeStatus.WAITING, output=output)
-
-            completed = replace(
-                running,
-                status=NodeStatus.COMPLETED,
-                metadata={**running.metadata, "output": output},
-            )
-            NodeStateMachine.validate(running.status, NodeStatus.COMPLETED)
-            await self._metadata.save_execution_node(completed)
-            await self._record(
-                recorder,
-                "node.completed",
-                task_id,
-                {"node_id": completed.id, "type": completed.type.value},
-            )
-            return NodeResult(completed.id, NodeStatus.COMPLETED, output=output)
+        # Claim, cached results, cancellation and uncertain effects all retain
+        # the existing guard's semantics. Never rewrite an owned row or turn
+        # an exception back into PENDING for an automatic effect retry.
+        result = await NodeExecutionGuard(self._metadata).execute(
+            node, invoke, resume_key=resume_key,
+        )
+        status = NodeStatus(result["status"])
+        output = result.get("output")
+        event_name = ("node.completed" if status is NodeStatus.COMPLETED else
+                      "node.cancelled" if status is NodeStatus.CANCELLED else "node.waiting")
+        await self._record(
+            recorder, event_name,
+            task_id, {"node_id": node.id, "type": node.type.value},
+        )
+        return NodeResult(node.id, status, output=output,
+                          error=output.get("error") if isinstance(output, dict) else None)
 
     # -- state helpers -------------------------------------------------------
     async def _restore(self, graph: ExecutionGraph) -> tuple[ExecutionNode, ...]:
@@ -287,6 +267,10 @@ class SequentialOrchestrator:
         task_id: str,
         reason: str,
     ) -> TaskResult:
+        current = await self._metadata.get_execution_node(node.id)
+        if current is not None and current.metadata.get("execution_guard"):
+            await self._update_task_status(task_id, TaskStatus.WAITING_RESOURCE, recorder)
+            return TaskResult(task_id=task_id, status=TaskStatus.WAITING_RESOURCE, error=reason)
         await self._fail(node, reason)
         await self._record(
             recorder,
@@ -313,6 +297,11 @@ class SequentialOrchestrator:
         task_id: str,
         recorder: Any | None,
     ) -> None:
+        current = await self._metadata.get_execution_node(node.id)
+        if current is not None and current.metadata.get("execution_guard"):
+            if current.status in {NodeStatus.COMPLETED, NodeStatus.SKIPPED}:
+                return
+            raise PermissionError("Owned node cannot be skipped by the local scheduler")
         skipped = replace(
             node,
             status=NodeStatus.SKIPPED,

@@ -23,6 +23,7 @@ import httpx
 from Sprout.security.net_guard import NetworkGuard
 from Sprout.security.secret_broker import SecretBroker
 from Sprout.tools.context_keys import CONTEXT_KEY as _CONTEXT_KEY
+from Sprout.tools.context_keys import _cli_process_binding
 from Sprout.tools.result import ToolResult
 from Sprout.tools.spec import ToolSpec
 
@@ -140,6 +141,8 @@ class GrepCheckTool:
     )
 
     async def invoke(self, arguments: Mapping[str, Any]) -> ToolResult:
+        return ToolResult.denied("native_grep_execution_unavailable")
+
         pattern = arguments.get("pattern")
         if not isinstance(pattern, str) or not pattern.strip():
             return ToolResult.failure("Argument 'pattern' must be a non-empty string")
@@ -247,16 +250,13 @@ class CliDetectTool:
                 f"({', '.join(sorted(self._VERSION_ARGS_ALLOWLIST))}); "
                 f"refused: {rejected}"
             )
-        try:
-            _, stdout, stderr = await _run_command(
-                executable, version_args, timeout=10.0
-            )
-            version = _clip((stdout or stderr).strip().splitlines()[0])
-        except (TimeoutError, OSError, ValueError, IndexError):
-            version = "unknown"
-        payload["version"] = version
+        # PATH discovery is metadata, not executable identity or permission.
+        # Never run even a version/help command without a trusted contract.
+        payload["version"] = "not_executed"
+        payload["version_executed"] = False
         return ToolResult.success(
-            f"{command!r} is available at {executable} (version: {version}).",
+            f"{command!r} was found on PATH at {executable}. "
+            "Its identity is not trusted and no version command was executed.",
             data=payload,
         )
 
@@ -406,7 +406,8 @@ class CliRunTool:
         self._allowed_roots = tuple(Path(root).resolve() for root in roots)
         self._process_broker = process_broker
 
-    async def invoke(self, arguments: Mapping[str, Any]) -> ToolResult:
+    def _prepare_invocation(self, arguments):
+        """Resolve a CLI subject without spawning; also pins the approval handoff."""
         command = arguments.get("command")
         if not isinstance(command, str) or not command.strip():
             return ToolResult.failure("Argument 'command' must be a non-empty string")
@@ -421,6 +422,10 @@ class CliRunTool:
             return ToolResult.denied(
                 "Working directory is outside the allowed roots: "
                 + ", ".join(str(root) for root in self._allowed_roots)
+            )
+        if self._process_broker is None:
+            return ToolResult.denied(
+                "CLI execution requires ProcessBroker; host fallback is disabled"
             )
         timeout = _as_number(arguments.get("timeout"), default=30.0, minimum=0.1)
         executable = shutil.which(command)
@@ -440,23 +445,26 @@ class CliRunTool:
         # environment handed every API key in the process to a subprocess that
         # a single approval had unlocked.
         env = self._secrets.child_env(base_env=os.environ, extra=extra_env)
-        if self._process_broker is not None:
-            return await self._run_via_broker(
-                executable, args, cwd, env, timeout, arguments.get(_CONTEXT_KEY)
-            )
-        try:
-            returncode, stdout, stderr = await _run_command(
-                executable, args, cwd=str(cwd), env=env, timeout=timeout
-            )
-        except TimeoutError:
-            return ToolResult.failure(f"Command timed out after {timeout}s")
-        output = _clip(stdout)
-        if stderr.strip():
-            output += "\n[stderr]\n" + _clip(stderr)
-        if returncode == 0:
-            return ToolResult.success(output, data={"returncode": returncode})
-        return ToolResult.failure(
-            f"Command exited with code {returncode}\n{output}",
+        return executable, list(args), cwd, env, timeout
+
+    def _approval_binding(self, arguments, task_id, session_id, source, requested_by,
+                          resource_scope):
+        prepared = self._prepare_invocation(arguments)
+        if isinstance(prepared, ToolResult):
+            return None
+        executable, args, cwd, env, timeout = prepared
+        workspace = _workspace_for(cwd)
+        return _cli_process_binding((executable, *args), cwd, env, timeout,
+                                    task_id, session_id, source, requested_by, resource_scope,
+                                    workspace.id, workspace.kind.value)
+
+    async def invoke(self, arguments: Mapping[str, Any]) -> ToolResult:
+        prepared = self._prepare_invocation(arguments)
+        if isinstance(prepared, ToolResult):
+            return prepared
+        executable, args, cwd, env, timeout = prepared
+        return await self._run_via_broker(
+            executable, args, cwd, env, timeout, arguments.get(_CONTEXT_KEY)
         )
 
     async def _run_via_broker(
@@ -470,12 +478,13 @@ class CliRunTool:
     ) -> ToolResult:
         """Hand the command to the process broker, carrying the calling context.
 
-        ``context`` is what ``ToolExecutor`` injected (``_sprout_context``): the
+        ``context`` is attribution normally injected by ``ToolExecutor``: the
         task id, source and requester the agent loop is working for. Passing them
         through is not optional — the broker applies process policy and honors
         the exact upstream CLI approval when present. Without task and approval
         context it would ask twice for the same invocation, or fail to match a
-        task-scoped grant.
+        task-scoped grant. Its legacy approval bool is not evidence: the broker
+        independently verifies a private, one-shot executor handoff.
         """
         ctx = context if isinstance(context, Mapping) else {}
         workspace = _workspace_for(cwd)
@@ -489,6 +498,7 @@ class CliRunTool:
             session_id=str(ctx.get("session_id", "")),
             source=str(ctx.get("source", "") or "interactive"),
             requested_by=str(ctx.get("requested_by", "") or "system"),
+            resource_scope=str(ctx.get("resource_scope", "")),
             upstream_approval_granted=bool(ctx.get("approval_granted")),
         )
         if not result.allowed:
@@ -548,6 +558,8 @@ class SkillScriptTool:
         )
 
     async def invoke(self, arguments: Mapping[str, Any]) -> ToolResult:
+        return ToolResult.denied("skill_script_execution_unavailable")
+
         from Sprout.orchestration.terminal.ensure import ensure_temporal_async
 
         try:
@@ -688,72 +700,27 @@ class GitInspectTool:
                 f"Invalid operation; expected one of: {', '.join(sorted(self._OPERATIONS))}"
             )
         repo = str(arguments.get("repo") or ".")
-        if self._git_broker is not None and operation in {"status", "log", "branch", "diff"}:
+        if self._git_broker is None:
+            return ToolResult.denied("GitBroker is required; host Git fallback is disabled")
+        if operation not in {"status", "log", "branch", "diff"}:
+            return ToolResult.denied(f"Git operation '{operation}' is not supported by this tool")
+        method = getattr(self._git_broker, operation, None)
+        if not callable(method):
+            return ToolResult.denied(f"GitBroker capability '{operation}' is unavailable")
+        if operation in {"status", "log", "branch", "diff"}:
             workspace = _workspace_for(repo)
             if operation == "status":
-                result = await self._git_broker.status(workspace)
+                result = await method(workspace)
             elif operation == "log":
-                result = await self._git_broker.log(
+                result = await method(
                     workspace,
                     _as_int(arguments.get("limit"), 20, 1),
                 )
             elif operation == "branch":
-                result = await self._git_broker.branch(workspace)
+                result = await method(workspace)
             elif operation == "diff":
-                result = await self._git_broker.diff(workspace)
+                result = await method(workspace)
             return _git_result_to_tool_result(result)
-        args = ["-C", repo]
-        if operation == "status":
-            args.extend(["status", "--short", "--branch"])
-        elif operation == "log":
-            args.extend(
-                [
-                    "log",
-                    "--oneline",
-                    "--decorate",
-                    "-n",
-                    str(_as_int(arguments.get("limit"), 20, 1)),
-                ]
-            )
-            ref = _safe_git_ref(arguments.get("ref"))
-            if ref:
-                args.append(ref)
-        elif operation == "branch":
-            args.extend(["branch", "--all", "-vv"])
-        elif operation == "diff":
-            args.append("diff")
-            if _as_bool(arguments.get("name_only")):
-                args.append("--name-only")
-            base = _safe_git_ref(arguments.get("base"))
-            ref = _safe_git_ref(arguments.get("ref"))
-            if base and ref:
-                args.append(f"{base}..{ref}")
-            elif base:
-                args.append(base)
-            elif ref:
-                args.append(ref)
-            files = arguments.get("files", [])
-            if files:
-                args.extend(["--", *_string_list(files)])
-            elif not _as_bool(arguments.get("name_only")) and not (base or ref):
-                args.append("--stat")
-        elif operation == "show":
-            ref = _safe_git_ref(arguments.get("ref")) or "HEAD"
-            args.extend(["show", "--stat", "--oneline", ref])
-        elif operation == "remote":
-            args.extend(["remote", "-v"])
-        elif operation == "tag":
-            args.extend(["tag", "--list"])
-        elif operation == "stash_list":
-            args.extend(["stash", "list"])
-        elif operation == "rev_parse":
-            ref = _safe_git_ref(arguments.get("ref")) or "HEAD"
-            args.extend(["rev-parse", "--verify", ref])
-        elif operation == "ls_files":
-            args.extend(["ls-files"])
-            if _as_bool(arguments.get("untracked")):
-                args.extend(["--others", "--exclude-standard"])
-        return await _run_git(args)
 
 
 class GitWriteTool:
@@ -850,147 +817,9 @@ class GitWriteTool:
             return ToolResult.failure(
                 f"Invalid operation; expected one of: {', '.join(sorted(self._OPERATIONS))}"
             )
-        repo = str(arguments.get("repo") or ".")
-        if self._git_broker is not None and operation in {"add", "commit", "pull"}:
-            workspace = _workspace_for(repo)
-            files = tuple(
-                item for item in arguments.get("files", []) if isinstance(item, str)
-            )
-            if operation == "add":
-                result = await self._git_broker.add(workspace, files)
-            elif operation == "pull":
-                result = await self._git_broker.pull(workspace)
-            elif operation == "commit":
-                message = arguments.get("message")
-                if not isinstance(message, str) or not message.strip():
-                    return ToolResult.failure("'message' is required for git commit")
-                result = await self._git_broker.commit(
-                    workspace,
-                    message,
-                    files=files,
-                )
-            return _git_result_to_tool_result(result)
-        files = arguments.get("files", [])
-        if files:
-            try:
-                files = _string_list(files)
-            except ValueError as exc:
-                return ToolResult.failure(str(exc))
-        args = ["-C", repo]
-        if operation == "pull":
-            remote = _safe_git_ref(arguments.get("remote")) or "origin"
-            upstream = _safe_git_ref(arguments.get("upstream"))
-            pull_args = [*args, "pull", "--ff-only", remote]
-            if upstream:
-                pull_args.append(upstream)
-            return await _run_git(pull_args)
-        if operation == "fetch":
-            remote = _safe_git_ref(arguments.get("remote")) or "--all"
-            return await _run_git([*args, "fetch", remote])
-        if operation == "push":
-            remote = _safe_git_ref(arguments.get("remote")) or "origin"
-            branch = _safe_git_ref(arguments.get("branch"))
-            push_args = [*args, "push"]
-            if _as_bool(arguments.get("set_upstream")):
-                push_args.append("--set-upstream")
-            push_args.append(remote)
-            if branch:
-                push_args.append(branch)
-            return await _run_git(push_args)
-        if operation == "add":
-            return await _run_git([*args, "add", *(files or ["-A"])])
-        if operation == "commit":
-            message = arguments.get("message")
-            if not isinstance(message, str) or not message.strip():
-                return ToolResult.failure("'message' is required for git commit")
-            staged = await _run_git([*args, "add", *(files or ["-A"])])
-            if not staged.ok:
-                return staged
-            return await _run_git([*args, "commit", "-m", message])
-        if operation == "checkout":
-            ref = _safe_git_ref(arguments.get("ref")) or _safe_git_ref(arguments.get("branch"))
-            if not ref:
-                return ToolResult.failure("'ref' or 'branch' is required for git checkout")
-            return await _run_git([*args, "checkout", ref])
-        if operation == "switch":
-            branch = _safe_git_ref(arguments.get("branch")) or _safe_git_ref(arguments.get("ref"))
-            if not branch:
-                return ToolResult.failure("'branch' is required for git switch")
-            return await _run_git([*args, "switch", branch])
-        if operation == "branch_create":
-            branch = _safe_git_ref(arguments.get("branch"))
-            if not branch:
-                return ToolResult.failure("'branch' is required for branch_create")
-            ref = _safe_git_ref(arguments.get("ref"))
-            return await _run_git([*args, "branch", branch, *([ref] if ref else [])])
-        if operation == "branch_delete":
-            branch = _safe_git_ref(arguments.get("branch"))
-            if not branch:
-                return ToolResult.failure("'branch' is required for branch_delete")
-            return await _run_git([*args, "branch", "-d", branch])
-        if operation == "merge":
-            ref = _safe_git_ref(arguments.get("ref")) or _safe_git_ref(arguments.get("branch"))
-            if not ref:
-                return ToolResult.failure("'ref' or 'branch' is required for git merge")
-            return await _run_git([*args, "merge", "--no-edit", ref])
-        if operation == "rebase":
-            ref = _safe_git_ref(arguments.get("ref")) or _safe_git_ref(arguments.get("branch"))
-            if not ref:
-                return ToolResult.failure("'ref' or 'branch' is required for git rebase")
-            return await _run_git([*args, "rebase", ref])
-        if operation == "reset":
-            mode = str(arguments.get("mode") or "mixed")
-            if mode not in {"soft", "mixed", "hard"}:
-                return ToolResult.failure("'mode' must be soft, mixed, or hard")
-            ref = _safe_git_ref(arguments.get("ref")) or "HEAD"
-            return await _run_git([*args, "reset", f"--{mode}", ref])
-        if operation == "restore":
-            restore_args = [*args, "restore"]
-            ref = _safe_git_ref(arguments.get("ref"))
-            if ref:
-                restore_args.extend(["--source", ref])
-            restore_args.extend(["--", *(files or ["."])])
-            return await _run_git(restore_args)
-        if operation == "revert":
-            ref = _safe_git_ref(arguments.get("ref"))
-            if not ref:
-                return ToolResult.failure("'ref' is required for git revert")
-            return await _run_git([*args, "revert", "--no-edit", ref])
-        if operation == "stash_push":
-            stash_args = [*args, "stash", "push"]
-            message = arguments.get("message")
-            if isinstance(message, str) and message.strip():
-                stash_args.extend(["-m", message])
-            if files:
-                stash_args.extend(["--", *files])
-            return await _run_git(stash_args)
-        if operation in {"stash_apply", "stash_pop", "stash_drop"}:
-            stash = _safe_git_ref(arguments.get("stash")) or "stash@{0}"
-            subcommand = operation.removeprefix("stash_")
-            return await _run_git([*args, "stash", subcommand, stash])
-        if operation == "tag_create":
-            tag = _safe_git_ref(arguments.get("tag"))
-            if not tag:
-                return ToolResult.failure("'tag' is required for tag_create")
-            message = arguments.get("message")
-            if isinstance(message, str) and message.strip():
-                return await _run_git([*args, "tag", "-a", tag, "-m", message])
-            return await _run_git([*args, "tag", tag])
-        if operation == "tag_delete":
-            tag = _safe_git_ref(arguments.get("tag"))
-            if not tag:
-                return ToolResult.failure("'tag' is required for tag_delete")
-            return await _run_git([*args, "tag", "-d", tag])
-        if operation == "clone":
-            url = arguments.get("url")
-            if not isinstance(url, str) or not url.strip():
-                return ToolResult.failure("'url' is required for git clone")
-            directory = arguments.get("directory")
-            clone_args = ["clone", url]
-            if isinstance(directory, str) and directory.strip():
-                clone_args.append(directory)
-            return await _run_git(clone_args)
-        return ToolResult.failure(f"Unsupported git operation: {operation}")
+        return ToolResult.denied(
+            "Generic GitWriteTool capability retired; GitBroker write operations are not supported"
+        )
 
 
 async def _run_git(args: list[str]) -> ToolResult:

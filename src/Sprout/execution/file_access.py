@@ -21,6 +21,53 @@ class FileBoundaryError(OSError):
     """A secure resource identity could not be established; never retry loosely."""
 
 
+async def directory_entries(root: Path, target: Path, limit: int, authorize_entry):
+    """Private pinned POSIX listing. No Windows/path traversal fallback.
+
+    Names remain broker-internal until separately authorized. Child metadata is
+    not opened before its visibility check. No worker thread outlives cancellation;
+    ExitStack closes pinned descriptors even across a cancelled authority await.
+    """
+    from Sprout.execution.file_snapshot import DirectoryEntry, ResourceIdentity
+
+    if (os.name != "posix" or os.scandir not in os.supports_fd
+            or os.open not in os.supports_dir_fd or os.stat not in os.supports_dir_fd
+            or os.stat not in os.supports_follow_symlinks
+            or not all(hasattr(os, flag) for flag in ("O_NOFOLLOW", "O_DIRECTORY"))):
+        raise FileBoundaryError("directory_enumeration_unavailable")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    with ExitStack() as stack:
+        fd = os.open("/", flags)
+        stack.callback(os.close, fd)
+        for part in (*root.parts[1:], *target.relative_to(root).parts):
+            fd = os.open(part, flags, dir_fd=fd)
+            stack.callback(os.close, fd)
+        before = ResourceIdentity.from_stat(os.fstat(fd))
+        entries = []
+        # scandir(fd) streams bounded entries; listdir would allocate unbounded names.
+        with os.scandir(fd) as stream:
+            for index, entry in enumerate(stream):
+                if index >= limit:
+                    raise FileBoundaryError("directory_budget_exceeded")
+                name = entry.name
+                if name in {".", ".."} or "/" in name or "\\" in name:
+                    raise FileBoundaryError("directory_entry_invalid")
+                if not await authorize_entry(target / name):
+                    continue
+                info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+                    raise FileBoundaryError("directory_link_or_special_file")
+                if stat.S_ISREG(info.st_mode) and info.st_nlink != 1:
+                    raise FileBoundaryError("directory_shared_file")
+                entries.append(DirectoryEntry(
+                    (target / name).relative_to(root).as_posix(), stat.S_ISDIR(info.st_mode),
+                    ResourceIdentity.from_stat(info),
+                ))
+        if ResourceIdentity.from_stat(os.fstat(fd)) != before:
+            raise FileBoundaryError("directory_identity_changed")
+        return tuple(entries)
+
+
 def file_operation(
     root: Path, target: Path, operation: str, authorize: Callable[[], None],
     *, content: str = "", newline: str | None = None,
@@ -41,6 +88,10 @@ def _missing(operation, authorize):
 
 
 def _stream(fd: int, operation: str, content: str, newline: str | None):
+    if operation == "snapshot":
+        from Sprout.execution.file_snapshot import read_fd
+
+        return read_fd(fd, content)
     if operation == "write":
         # Never truncate at pathname-open time: identity must already be proved.
         os.ftruncate(fd, 0)
@@ -235,7 +286,7 @@ def _windows(root, target, operation, authorize, content, newline):
                     raise FileBoundaryError("secure_directory_creation_refused") from None
                 _win_directory(parent, stack)
         authorize()  # Recheck before OPEN_ALWAYS may create a leaf.
-        access = {"write": 0x40000000, "read": 0x80000000,
+        access = {"write": 0x40000000, "read": 0x80000000, "snapshot": 0x80000000,
                   "delete": 0x10080, "probe": 0x80, "exists": 0x80}[operation]
         try:
             handle = _win_open(parent / relative[-1], access,

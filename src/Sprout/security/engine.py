@@ -79,6 +79,13 @@ class PolicyEngine:
             )
 
         kind = request.resource.kind
+        if request.action is ActionType.DIRECTORY_LIST:
+            if kind in {ResourceKind.SECRET, ResourceKind.SENSITIVE, ResourceKind.EXTERNAL}:
+                return _decision(AccessDecision.DENY, "Directory classification denied",
+                                 "matrix:directory.list:classification")
+            return _decision(AccessDecision.REQUIRE_APPROVAL,
+                             "Directory names require explicit server authorization",
+                             "matrix:directory.list")
         if request.action is ActionType.SECRET_USE:
             return _decision(
                 AccessDecision.REQUIRE_APPROVAL,

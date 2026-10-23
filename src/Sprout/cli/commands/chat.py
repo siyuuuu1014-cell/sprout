@@ -340,6 +340,97 @@ async def _execute_language_command(requested: str | None = None) -> None:
         _apply_language_request(selected)
 
 
+async def _provide_cli_analysis_task(runtime, workspace_id, *, message, session, principal):
+    """Explicit fixed resources; Workspace confirmation alone grants nothing."""
+    from Sprout.task.models import DelegationScope, TaskExecutionMode
+    from Sprout.task.paths import bound_scope_path, scope_path
+    from Sprout.workspace.authorized_content import ContentLimits, relative_label
+
+    if not principal.authenticated or principal.source != "cli":
+        raise PermissionError("cli_analysis_identity_unavailable")
+    workspace = await runtime.get_workspace(workspace_id) if workspace_id else None
+    if workspace is None:
+        raise PermissionError("cli_analysis_workspace_required")
+    if not sys.stdin.isatty():
+        raise PermissionError("cli_analysis_interactive_confirmation_required")
+    typer.echo(_L("本次只读分析工作区：", "Read-only analysis workspace: ")
+               + f"{workspace.id}  {workspace.root}")
+    typer.echo(_L(
+        "选择范围不替代 Policy/Scope 授权。", "Selection does not override Policy/Scope.",
+    ))
+    try:
+        raw = await questionary.text(_L(
+            "输入 Workspace 相对文件路径或 JSON 文件清单（空白取消）：",
+            "Enter a workspace-relative file or JSON file list (blank cancels):",
+        )).ask_async()
+        if not raw or not raw.strip():
+            return None
+        try:
+            if raw.lstrip().startswith("["):
+                selected = json.loads(raw)
+                if (type(selected) is not list or not selected
+                        or len(selected) > ContentLimits().max_files
+                        or any(type(path) is not str for path in selected)):
+                    raise ValueError("invalid_manifest")
+            else:
+                selected = [line.strip() for line in raw.splitlines() if line.strip()]
+                if len(selected) != 1:
+                    # Preserve the old plain-text format; multi-file input is
+                    # explicit JSON, never silently truncated to its first line.
+                    raise PermissionError("project_multi_file_analysis_unavailable")
+                if selected[0].casefold() in {"auto", "自动", "自动发现", "*", "**"}:
+                    raise PermissionError("project_auto_discovery_unavailable")
+            paths = tuple(relative_label(path.replace("\\", "/")) for path in selected)
+            if len({path.casefold() for path in paths}) != len(paths):
+                raise ValueError("duplicate_manifest_path")
+        except (ValueError, TypeError) as exc:
+            raise PermissionError("analysis_file_selection_invalid") from exc
+        root = scope_path(str(workspace.root))
+        for path in paths:
+            target = scope_path(bound_scope_path(path, str(workspace.root)))
+            if root is None or target is None or not root.contains(target):
+                raise PermissionError("analysis_file_selection_invalid")
+        typer.echo(_L("本次分析请求：", "Analysis request: ") + message.content)
+        typer.echo(_L("只读取所选文件：", "Selected files only: ") + "\n" + "\n".join(paths))
+        confirmed = await questionary.confirm(_L(
+            "确认请求分析以上文件？", "Confirm analysis of these files?",
+        ), default=False).ask_async()
+        if not confirmed:
+            return None
+    except (EOFError, KeyboardInterrupt):
+        return None
+    # Prompts can yield. Recheck the actual Session before creating the Task;
+    # --user and Message.user_id never become the authenticated actor.
+    owned = await runtime._sessions.require_owner(session.id, principal)
+    frozen = runtime._sessions.frozen_principal(owned)
+    if (frozen.user_id, frozen.source, frozen.authenticated) != (
+            principal.user_id, principal.source, principal.authenticated):
+        raise PermissionError("cli_analysis_identity_unavailable")
+    return await runtime.create_task(
+        workspace.id, message.content, actor=principal, source=principal.source,
+        execution_mode=TaskExecutionMode.READ_ONLY,
+        delegation_scope=DelegationScope(
+            allowed_actions=frozenset({"tool.invoke", "file.read"}),
+            allowed_paths=tuple(str(workspace.root / path) for path in paths),
+        ),
+        metadata={"session_id": owned.id, "required_paths": list(paths)},
+    )
+
+
+def _cli_analysis_task_provider(runtime, workspace_id, live=None):
+    """Bind one turn's host and terminal, not mutable REPL loop variables."""
+    async def provide(**request):
+        # readline has completed; suspend Rich before questionary owns input.
+        if live is not None:
+            live.stop()
+        try:
+            return await _provide_cli_analysis_task(runtime, workspace_id, **request)
+        finally:
+            if live is not None:
+                live.start()
+    return provide
+
+
 async def _repl(
     gateway,
     *,
@@ -565,6 +656,11 @@ async def _repl(
         reply_metadata: dict = {}
         response_error: str | None = None
         console = Console(theme=_CLI_MARKDOWN_THEME)
+        try:
+            principal = current_cli_principal()
+        except ValueError:
+            typer.echo(ui.warning("cli_analysis_identity_unavailable"))
+            continue
         if console.is_terminal:
             with Live(
                 Spinner(
@@ -579,7 +675,8 @@ async def _repl(
                 vertical_overflow="crop",
             ) as live:
                 async for chunk in runtime.handle_stream(
-                    stream_message, principal=current_cli_principal(), foreground=True
+                    stream_message, principal=principal, foreground=True,
+                    analysis_task_provider=_cli_analysis_task_provider(runtime, workspace_id, live),
                 ):
                     if chunk.error is not None:
                         response_error = chunk.error
@@ -598,7 +695,8 @@ async def _repl(
         else:
             typer.echo(ui.muted(_L("  正在生成…", "  Generating…")))
             async for chunk in runtime.handle_stream(
-                stream_message, principal=current_cli_principal(), foreground=True
+                stream_message, principal=principal, foreground=True,
+                analysis_task_provider=_cli_analysis_task_provider(runtime, workspace_id),
             ):
                 if chunk.error is not None:
                     response_error = chunk.error

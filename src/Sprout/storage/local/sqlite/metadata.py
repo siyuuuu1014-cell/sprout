@@ -50,6 +50,10 @@ from Sprout.workspace.models import (
 )
 
 SCHEMA = MODEL_BUDGET_SCHEMA + """
+CREATE TABLE IF NOT EXISTS node_result_sources_v1 (
+    node_id TEXT PRIMARY KEY,
+    source_json TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS coding_intents (
     id TEXT PRIMARY KEY,
     node_id TEXT NOT NULL,
@@ -639,6 +643,50 @@ class SqliteMetadataStore:
         )
 
     # -- execution nodes ----------------------------------------------------
+    async def save_node_result_source(self, source) -> bool:
+        from Sprout.execution.node_result_source import NodeResultSourceV1, payload_digest
+
+        if type(source) is not NodeResultSourceV1:
+            return False
+        try:
+            source = NodeResultSourceV1.from_json(source.to_json())
+        except (ValueError, TypeError):
+            return False
+        row = await self._db.fetchone("SELECT * FROM execution_nodes WHERE id = ?",
+                                      (source.node_id,))
+        if row is None:
+            return False
+        node = self._row_to_execution_node(row)
+        guard = node.metadata.get("execution_guard", {})
+        if (node.task_id != source.task_id or node.type.value != source.node_type
+                or node.status is not NodeStatus.COMPLETED
+                or guard.get("state") != "completed" or guard.get("owner") != source.owner
+                or node.result_ref is not None
+                or payload_digest(node.metadata.get("output")) != source.output_digest):
+            return False
+        # CAS against the exact settled row. Never overwrite an existing origin.
+        changed = await self._db.execute(
+            "INSERT INTO node_result_sources_v1 (node_id, source_json) "
+            "SELECT id, ? FROM execution_nodes WHERE id = ? AND status = 'completed' "
+            "AND metadata_json = ? AND result_ref_json IS NULL "
+            "ON CONFLICT(node_id) DO NOTHING",
+            (source.to_json(), node.id, row["metadata_json"]),
+        )
+        return changed == 1 or await self.get_node_result_source(node.id) == source
+
+    async def get_node_result_source(self, node_id: str):
+        from Sprout.execution.node_result_source import NodeResultSourceV1
+
+        row = await self._db.fetchone(
+            "SELECT source_json FROM node_result_sources_v1 WHERE node_id = ?", (node_id,),
+        )
+        if row is None:
+            return None
+        try:
+            return NodeResultSourceV1.from_json(row["source_json"])
+        except (TypeError, ValueError):
+            return None
+
     async def claim_execution_node(self, node: ExecutionNode, owner: str, resume_key: str) -> bool:
         """Atomically occupy a node; ownership never expires or gets stolen."""
         guard = {
