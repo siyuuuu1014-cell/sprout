@@ -112,6 +112,48 @@ class WorkspaceIntelligence:
         self._skills_dir = skills_dir
         self._graph_store = graph_store
 
+    async def analyze_view(self, workspace, task, view):
+        from Sprout.workspace.authorized_content import AuthorizedContentView
+
+        if type(view) is not AuthorizedContentView:
+            raise TypeError("captured_content_view_required")
+        try:
+            return await self._analyze_view_contents(workspace, task, view)
+        except BaseException:
+            view.invalidate()
+            raise
+
+    async def _analyze_view_contents(self, workspace, task, view):
+        """Analyze selected captured contents; no persistence/cache/skill lane.
+
+        A synthetic view is an algorithm input, not an authority assertion.
+        Runtime's restricted entry owns real capture and publication checks.
+        """
+        import asyncio
+
+        view.check(workspace.id)
+        if task.workspace_id != workspace.id:
+            raise PermissionError("content_task_workspace_mismatch")
+        await asyncio.sleep(0)  # Cancellation checkpoint before CPU-only stages.
+        manifest = self._scanner.scan_view(workspace, view)
+        enriched = replace(workspace, revision=view.revision, manifest=manifest)
+        plan = self._scanner.build_read_plan_view(enriched, task, view)
+        fingerprint = WorkspaceFingerprint.compute_view(enriched, view)
+        graph = self._graph_builder.build_view(enriched, view)
+        await asyncio.sleep(0)
+        view.check()
+        knowledge = self._knowledge_builder.build_view(enriched, manifest, view)
+        contracts = PythonContractAnalyzer().analyze_view(enriched, view)
+        sql = SqlContractAnalyzer().analyze_view(enriched, view)
+        knowledge = replace(knowledge, items=knowledge.items + contracts.items + sql)
+        plan = replace(plan, purpose="restricted captured selection: " + plan.purpose,
+                       excludes=("all resources outside captured view",))
+        plan = self._refine_read_plan(plan, graph, knowledge)
+        await asyncio.sleep(0)
+        view.check()
+        return WorkspaceAnalysis(enriched, manifest, plan, graph, knowledge, fingerprint,
+                                 changed_resources=tuple(fingerprint.resource_hashes))
+
     async def analyze(
         self,
         workspace: Workspace,

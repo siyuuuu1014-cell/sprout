@@ -28,6 +28,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
+from typing import Any
 
 #: Carries ``{task_id, source, requested_by}`` from ``ToolExecutor`` to a tool
 #: that hands work to a broker. The broker gates the delegated action under its
@@ -52,6 +53,83 @@ class NodeToolInvocationContext:
     source: str
     requested_by: str
     resource_scope: str
+
+
+@dataclass(slots=True, repr=False)
+class _ProjectNodeScope:
+    runtime: Any
+    task: Any
+    workspace: Any
+    node: Any
+    owner: object
+    guard_owner: str
+    session_id: str
+    active: bool = True
+    known_paths: tuple = ()
+    captured_paths: tuple = ()
+    untracked_tool_use: bool = False
+    read_captured: bool = False
+    resource_receipts: tuple = ()
+    parent_receipts: tuple = ()
+
+
+@dataclass(slots=True, repr=False)
+class _ProjectAnalysisCall:
+    tool: object
+    node_scope: _ProjectNodeScope | None
+    owner: object
+    active: bool = True
+
+
+_PROJECT_NODE: ContextVar[_ProjectNodeScope | None] = ContextVar("project_node_b1", default=None)
+_PROJECT_CALL: ContextVar[_ProjectAnalysisCall | None] = ContextVar("project_call_b1", default=None)
+
+
+def _current_project_node():
+    scope = _PROJECT_NODE.get()
+    return scope if scope is not None and scope.active and (
+        scope.owner is asyncio.current_task()) else None
+
+
+def _current_project_analysis_call():
+    frame = _PROJECT_CALL.get()
+    return frame if frame is not None and frame.active and (
+        frame.owner is asyncio.current_task()) else None
+
+
+def _current_node_publication():
+    scope = _current_project_node()
+    if scope is not None and scope.runtime._node_publications.get(scope.node.id) is scope:
+        return scope
+    return None
+
+
+@contextmanager
+def _project_node_scope(runtime, task, workspace, node):
+    """Host execution domain, not a serializable grant or a replacement node claim."""
+    guard = node.metadata.get("execution_guard", {})
+    scope = _ProjectNodeScope(
+        runtime, task, workspace, node, asyncio.current_task(),
+        guard.get("owner", "") if isinstance(guard, dict) else "",
+        task.metadata.get("session_id", ""),
+    )
+    token = _PROJECT_NODE.set(scope)
+    try:
+        yield scope
+    finally:
+        scope.active = False
+        _PROJECT_NODE.reset(token)
+
+
+@contextmanager
+def _project_analysis_call(tool):
+    frame = _ProjectAnalysisCall(tool, _current_project_node(), asyncio.current_task())
+    token = _PROJECT_CALL.set(frame)
+    try:
+        yield frame
+    finally:
+        frame.active = False
+        _PROJECT_CALL.reset(token)
 
 
 def _cli_process_binding(command, cwd, env, timeout, task_id, session_id,

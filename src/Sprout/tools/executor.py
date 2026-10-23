@@ -38,10 +38,12 @@ from Sprout.tools.context_keys import (
     CONTEXT_TOOLS,
     NodeToolInvocationContext,
     _approved_cli_call,
+    _project_analysis_call,
 )
 from Sprout.tools.project_analyze_tool import ProjectAnalyzeTool
 from Sprout.tools.registry import ToolRegistry
 from Sprout.tools.result import ToolExecutionUnconfirmed, ToolResult
+from Sprout.tools.workspace_query_tool import WorkspaceQueryTool
 
 if TYPE_CHECKING:
     from Sprout.security.audit import SecurityAuditLog
@@ -99,11 +101,35 @@ class ToolExecutor:
         except LookupError as exc:
             return ToolResult.failure(str(exc))
 
-        if isinstance(tool, ProjectAnalyzeTool):
+        if isinstance(tool, (ProjectAnalyzeTool, WorkspaceQueryTool)):
             # Policy, approval and invoke must see the same caller-independent
             # probe flag and payload, including across audit/approval awaits.
             arguments = deepcopy(dict(arguments))
+            with _project_analysis_call(tool) as frame:
+                return await self._execute_tool(
+                    name, tool, arguments, requested_by=requested_by, task_id=task_id,
+                    session_id=session_id, source=source, resource_scope=resource_scope,
+                    analysis_frame=frame,
+                )
+        return await self._execute_tool(
+            name, tool, arguments, requested_by=requested_by, task_id=task_id,
+            session_id=session_id, source=source, resource_scope=resource_scope,
+        )
 
+    async def _execute_tool(
+        self, name, tool, arguments, *, requested_by, task_id, session_id, source,
+        resource_scope, analysis_frame=None,
+    ):
+        from Sprout.tools.context_keys import _current_project_node
+
+        scope = _current_project_node()
+        if scope is not None and not (
+            analysis_frame is not None
+            and scope.runtime._project_tool_ready(tool, arguments, analysis_frame)
+        ):
+            # Only Runtime-registered project consumers have captured footprints.
+            # All opaque effects remain non-reusable; names/metadata grant nothing.
+            scope.untracked_tool_use = True
         bound = getattr(tool, "invocation_context", None)
         if isinstance(bound, NodeToolInvocationContext):
             if not self.scoped_only:
@@ -117,6 +143,20 @@ class ToolExecutor:
         if is_mcp:
             arguments = deepcopy(dict(arguments))
         decision = self.policy.decide_for_spec(tool.spec)
+        subject = None
+        binding_denied = False
+        binding_rejected = False
+        if analysis_frame is not None and analysis_frame.node_scope is not None:
+            try:
+                if not self.scoped_only:
+                    raise PermissionError("Strict node dispatch required")
+                subject = await analysis_frame.node_scope.runtime._project_analysis_request(
+                    tool, arguments, analysis_frame, session_id,
+                )
+                task_id, source = subject.task_id, analysis_frame.node_scope.task.source
+                requested_by, resource_scope = subject.actor.user_id, subject.resource.workspace_id
+            except Exception:  # noqa: BLE001 - metadata failure cannot grant a default scope
+                binding_denied = True
 
         # A read-only command is granted without asking. This runs *after* the
         # policy decision and only ever relaxes REQUIRE_APPROVAL — a DENY still
@@ -139,19 +179,22 @@ class ToolExecutor:
         argv = arguments.get("args")
         if isinstance(command, str) and isinstance(argv, list | tuple):
             policy_arguments["command"] = [command, *argv]
-        boundary = self.policy_engine.decide(
-            ActionRequest(
-                task_id=task_id,
-                action=ActionType.TOOL_INVOKE,
-                arguments=policy_arguments,
+        # An invalid B1 subject cannot be replaced by an unrestricted request.
+        # Keep the ToolSpec DENY and PA-1 precedence; otherwise deny the binding
+        # below. Only validated B1 subjects reach resource/Scope policy checks.
+        if not binding_denied:
+            boundary_request = (replace(subject, arguments=policy_arguments)
+                                if subject is not None else ActionRequest(
+                                    task_id=task_id, action=ActionType.TOOL_INVOKE,
+                                    arguments=policy_arguments,
+                                ))
+            boundary = self.policy_engine.decide(boundary_request)
+            decision = replace(
+                decision,
+                decision=LayeredPolicyEngine._intersect(decision.decision, boundary.decision),
+                reason="; ".join(filter(None, (boundary.reason, decision.reason))),
+                matched_rules=(*boundary.matched_rules, *decision.matched_rules),
             )
-        )
-        decision = replace(
-            decision,
-            decision=LayeredPolicyEngine._intersect(decision.decision, boundary.decision),
-            reason="; ".join(filter(None, (boundary.reason, decision.reason))),
-            matched_rules=(*boundary.matched_rules, *decision.matched_rules),
-        )
 
         from Sprout.tools.system_tools import GitWriteTool, SkillScriptTool
 
@@ -200,15 +243,48 @@ class ToolExecutor:
                 matched_rules=(*decision.matched_rules, "capability:project_probe:unavailable"),
             )
 
+        if (isinstance(tool, ProjectAnalyzeTool)
+                and decision.decision in {AccessDecision.ALLOW, AccessDecision.REQUIRE_APPROVAL}):
+            if binding_denied:
+                binding_rejected = True
+                decision = replace(
+                    decision, decision=AccessDecision.DENY,
+                    reason="project_analysis_binding_denied",
+                    matched_rules=(*decision.matched_rules, "binding:project_analysis:denied"),
+                )
+
+        ready = (analysis_frame is not None and analysis_frame.node_scope is not None
+                 and analysis_frame.node_scope.runtime._project_tool_ready(
+                     tool, arguments, analysis_frame))
+        if (isinstance(tool, ProjectAnalyzeTool)
+                and (not ready or decision.decision is AccessDecision.REQUIRE_APPROVAL)
+                and decision.decision in {AccessDecision.ALLOW, AccessDecision.REQUIRE_APPROVAL}):
+            unavailable = "project_analysis_scope_unavailable"
+            decision = replace(
+                decision, decision=AccessDecision.DENY, reason=unavailable,
+                matched_rules=(*decision.matched_rules, "capability:project_analysis:unavailable"),
+            )
+
+        if (isinstance(tool, WorkspaceQueryTool)
+                and (binding_denied or not ready
+                     or decision.decision is AccessDecision.REQUIRE_APPROVAL)
+                and decision.decision in {AccessDecision.ALLOW, AccessDecision.REQUIRE_APPROVAL}):
+            unavailable = "workspace_query_scope_unavailable"
+            decision = replace(
+                decision, decision=AccessDecision.DENY, reason=unavailable,
+                matched_rules=(*decision.matched_rules, "capability:workspace_query:unavailable"),
+            )
+
         await self._audit(name, task_id, source, decision.decision.value, decision.reason)
 
         if decision.decision not in {AccessDecision.ALLOW, AccessDecision.REQUIRE_APPROVAL}:
             await self._publish(TOOL_DENIED, {
                 "tool": name, "reason": ("capability_retired" if retired else
                                          "capability_unavailable" if unavailable else
+                                         "binding" if binding_rejected else
                                          "mcp_unclassified" if unclassified_mcp else "policy"),
             })
-            if retired or unclassified_mcp or unavailable:
+            if retired or unclassified_mcp or unavailable or binding_rejected:
                 return ToolResult.denied(decision.reason)
             return ToolResult.denied(f"Tool {name} is denied by the security policy")
 

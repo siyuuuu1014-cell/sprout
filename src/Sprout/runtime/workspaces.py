@@ -178,6 +178,11 @@ class WorkspaceService:
             logging.getLogger(__name__).warning("Project cache mirror failed", exc_info=True)
         return analysis
 
+    async def analyze_view(self, workspace, task, view):
+        """Pure captured-content service, not a new source of file authority."""
+        view.check(workspace.id)
+        return await self._intelligence.analyze_view(workspace, task, view)
+
     async def analyze_path(
         self, root: Path, instruction: str = "analyze project",
     ) -> WorkspaceAnalysis:

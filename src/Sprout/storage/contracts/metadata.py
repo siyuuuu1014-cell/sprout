@@ -11,6 +11,7 @@ from Sprout.trajectory.models import Trajectory
 from Sprout.workspace.models import Workspace
 
 if TYPE_CHECKING:
+    from Sprout.execution.node_result_source import NodeResultSourceV1
     from Sprout.orchestration.models import ExecutionNode
 
 
@@ -60,6 +61,9 @@ class MetadataStore(Protocol):
         self, node: ExecutionNode, owner: str, resume_key: str
     ) -> bool: ...
     async def finish_execution_node(self, node: ExecutionNode, owner: str, state: str) -> bool: ...
+
+    async def save_node_result_source(self, source: NodeResultSourceV1) -> bool: ...
+    async def get_node_result_source(self, node_id: str) -> NodeResultSourceV1 | None: ...
 
     async def save_artifact(self, artifact: Artifact) -> None: ...
     async def record_artifact_validation(
