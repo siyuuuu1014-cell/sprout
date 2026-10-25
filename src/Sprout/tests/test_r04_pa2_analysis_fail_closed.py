@@ -332,9 +332,13 @@ async def test_explicit_internal_analysis_compatibility(internal_runtime, entry)
             message=Message(content="internal_symbol", user_id="fixture",
                             metadata={"workspace_id": workspace.id}),
             session=Session(id="internal-session", user_id="fixture"), tools={}, skills={})
-        assert context.workspace is not None
-        assert "Workspace:" in context.metadata["workspace_context"]
+        # A workspace hint alone cannot authorize project publication.
+        assert context.workspace is None
+        assert "workspace_context" not in context.metadata
     else:
-        result = await WorkspaceQueryTool(runtime.analyze_workspace).invoke(
+        callback = AsyncMock(wraps=runtime.analyze_workspace)
+        result = await WorkspaceQueryTool(callback).invoke(
             {"workspace_id": workspace.id, "operation": "symbols"})
-        assert result.ok and "internal_symbol" in result.content
+        assert not result.ok
+        assert result.error == "workspace_query_scope_unavailable"
+        callback.assert_not_called()

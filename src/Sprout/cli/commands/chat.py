@@ -358,6 +358,9 @@ async def _provide_cli_analysis_task(runtime, workspace_id, *, message, session,
     typer.echo(_L(
         "选择范围不替代 Policy/Scope 授权。", "Selection does not override Policy/Scope.",
     ))
+    if any(term in message.content.casefold() for term in (
+            "整个项目", "完整项目", "whole project", "entire project")):
+        return await _provide_cli_directory_task(runtime, workspace, session, principal, message)
     try:
         raw = await questionary.text(_L(
             "输入 Workspace 相对文件路径或 JSON 文件清单（空白取消）：",
@@ -414,6 +417,55 @@ async def _provide_cli_analysis_task(runtime, workspace_id, *, message, session,
             allowed_paths=tuple(str(workspace.root / path) for path in paths),
         ),
         metadata={"session_id": owned.id, "required_paths": list(paths)},
+    )
+
+
+async def _provide_cli_directory_task(runtime, workspace, session, principal, message):
+    """Confirm a finite directory request; only server policy grants enumeration."""
+    from Sprout.security.access import AccessDecision, ActionRequest, ActionType
+    from Sprout.task.models import DelegationScope, TaskExecutionMode
+    from Sprout.workspace.authorized_content import relative_label
+    from Sprout.workspace.models import ResourceKind, ResourceRef
+
+    try:
+        raw = await questionary.text(_L(
+            "本次自动分析目录（Workspace 相对路径，. 表示项目根；空白取消）：",
+            "Analysis directory (workspace-relative, . for root; blank cancels):",
+        )).ask_async()
+        if not raw or not raw.strip():
+            return None
+        label = raw.strip().replace("\\", "/")
+        try:
+            label = "." if label == "." else relative_label(label)
+        except (ValueError, TypeError) as exc:
+            raise PermissionError("analysis_directory_selection_invalid") from exc
+        target = workspace.root if label == "." else workspace.root / label
+        typer.echo(_L("自动分析授权范围：", "Automatic analysis scope: ") + str(target))
+        if not await questionary.confirm(_L(
+                "确认请求读取此目录下获准的项目文件？",
+                "Confirm analysis of authorized project files in this directory?"),
+                default=False).ask_async():
+            return None
+    except (EOFError, KeyboardInterrupt):
+        return None
+    owned = await runtime._sessions.require_owner(session.id, principal)
+    if runtime._sessions.frozen_principal(owned) != principal:
+        raise PermissionError("cli_analysis_identity_unavailable")
+    scope = DelegationScope(
+        allowed_actions=frozenset({"tool.invoke", "file.read", "directory.list"}),
+        allowed_paths=(str(target),),
+    )
+    decision = runtime._policy_engine.decide(ActionRequest(
+        actor=principal, action=ActionType.DIRECTORY_LIST,
+        resource=ResourceRef(workspace.id, str(target), ResourceKind.OTHER), scope=scope,
+    ))
+    if (decision.decision is not AccessDecision.ALLOW
+            or not any(rule.startswith("directory:grant:") for rule in decision.matched_rules)):
+        raise PermissionError("directory.list requires explicit server directory authorization")
+    return await runtime.create_task(
+        workspace.id, message.content, actor=principal, source=principal.source,
+        execution_mode=TaskExecutionMode.READ_ONLY, delegation_scope=scope,
+        metadata={"session_id": owned.id, "analysis_directory": label},
     )
 
 

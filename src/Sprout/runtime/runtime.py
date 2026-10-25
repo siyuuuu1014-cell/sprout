@@ -124,6 +124,7 @@ _DEFAULT_TRAJECTORY_DIR = Path.home() / ".sprout" / "data" / "trajectory"
 
 _INTENT_EVENTS: dict[str, str] = {str(intent): event for intent, event in INTENT_EVENTS.items()}
 _PROJECT_ANALYZE_TERMS = (
+    "分析当前整个项目", "分析整个项目", "分析完整项目", "entire project", "whole project",
     "scan project",
     "analyze project",
     "inspect project",
@@ -338,6 +339,7 @@ class Runtime:
         self._node_products = {}
         self._node_publications = {}
         self._original_user_turns = {}
+        self._ordinary_assistant_turns = {}
         self._settings = settings
         self.models = models
         self.tools = tools
@@ -420,7 +422,8 @@ class Runtime:
             GitWriteTool,
         )
 
-        self.tools.register(DatabaseQueryTool(self._database_broker))
+        self.tools.register(DatabaseQueryTool(
+            self._database_broker, invoke_query=self._invoke_database_query))
         self.tools.register(
             CliRunTool(
                 secrets=security.secrets if security is not None else None,
@@ -733,7 +736,45 @@ class Runtime:
             relative_label(path)
         self._project_tool_paths[tool] = paths
 
-    async def _issue_project_query_tool(self, *, paths):
+    async def _invoke_database_query(self, tool, database, sql, workspace_id):
+        """Use the existing live node authority, never JSON attribution."""
+        from Sprout.security.access import AccessDecision, ActionRequest, ActionType
+        from Sprout.task.paths import bound_scope_path, scope_path
+        from Sprout.tools.context_keys import _current_project_node
+        from Sprout.workspace.models import ResourceKind, ResourceRef
+
+        scope = _current_project_node()
+        if (scope is None or scope.runtime is not self
+                or self.tools.get("database_query") is not tool):
+            raise PermissionError("database_task_binding_unavailable")
+        task, workspace = await self._project_analysis_subject(scope)
+        if workspace_id not in {None, "", workspace.id}:
+            raise PermissionError("database_workspace_mismatch")
+        path = bound_scope_path(database, str(workspace.root))
+        target, root = scope_path(path), scope_path(str(workspace.root))
+        effective = task.delegation_scope.bind_paths(str(workspace.root)).narrow(
+            scope.task.delegation_scope.bind_paths(str(workspace.root)))
+        if (target is None or root is None or not root.contains(target)
+                or not effective.permits("db.read", target.text())
+                or not effective.permits("tool.invoke", target.text())):
+            raise PermissionError("database_scope_denied")
+        request = ActionRequest(task_id=task.id, actor=task.actor,
+            action=ActionType.TOOL_INVOKE, scope=effective,
+            resource=ResourceRef(workspace.id, target.text(), ResourceKind.DATA),
+            arguments={"tool": tool.spec.name, "sql": sql})
+        decision = self._policy_engine.decide(request)
+        await self._record_project_capture_policy(request, decision)
+        if decision.decision is not AccessDecision.ALLOW:
+            raise PermissionError("database_tool_invocation_denied")
+        scope.untracked_tool_use = True
+        result = await self._database_broker.query(
+            workspace, target.text(), sql, task_id=task.id, scope=effective, actor=task.actor)
+        current, current_workspace = await self._project_analysis_subject(scope)
+        if current.delegation_scope != task.delegation_scope or current_workspace != workspace:
+            raise PermissionError("database_authority_changed")
+        return result
+
+    async def _issue_project_query_tool(self, *, paths=None, discover=False):
         from Sprout.tools.context_keys import _current_project_node
         from Sprout.tools.workspace_query_tool import WorkspaceQueryTool
 
@@ -742,7 +783,10 @@ class Runtime:
             raise PermissionError("project_capture_frame_unavailable")
         await self._project_analysis_subject(scope)
         tool = WorkspaceQueryTool()
-        self._set_project_tool_paths(tool, paths)
+        if discover and paths is None:
+            self._project_tool_paths[tool] = None
+        else:
+            self._set_project_tool_paths(tool, paths)
         self._project_analysis_tools[tool] = scope
         return tool
 
@@ -871,6 +915,7 @@ class Runtime:
                      "details": dict(item.details)} for item in analysis.knowledge.items
                 ],
                 "coverage": {"mode": "discovery" if discovered else "files",
+                             "file_count": len(paths),
                              "complete_project": False,
                              "visibility": "authorized_only"},
             }
@@ -905,7 +950,9 @@ class Runtime:
             if arguments.get("workspace_id", workspace.id) != workspace.id:
                 raise PermissionError("workspace_query_workspace_mismatch")
             paths = self._project_tool_paths.get(tool)
-            raw = (str(workspace.root / paths[0]) if paths else None) if (
+            admission = self._online_analysis_requests.get(scope.node.id)
+            directory = admission["target"] if admission is not None else None
+            raw = (str(workspace.root / paths[0]) if paths else directory) if (
                 "workspace_id" in arguments) else arguments.get("path")
         else:
             raw = arguments.get("path")
@@ -1291,11 +1338,42 @@ class Runtime:
         turns = await self._session_store.recent_turns(
             stored.id, limit=self._contexts._settings.working_window,
         )
-        working = tuple(turn for turn in turns if turn.role == "user"
-                        and self._original_user_turns.get((stored.id, turn.id))
-                        == (turn.content, dict(turn.metadata)))
+        working = tuple(turn for turn in turns if (
+            (turn.role == "user" and self._original_user_turns.get((stored.id, turn.id))
+             == (turn.content, dict(turn.metadata)))
+            or (turn.role == "assistant"
+                and self._ordinary_assistant_turns.get((stored.id, turn.id))
+                == (turn.content, dict(turn.metadata)))))
         base = self._contexts._isolated_context(message, stored, tools, skills)
         return replace(base, memory=ContextMemory(session=base.session, working=working))
+
+    def _ordinary_response_has_source(self, context, agent, result):
+        """Only the normal online call may attest a resource-free response.
+
+        No persisted role, model flag or caller-supplied result grants origin.
+        Tool-using/project responses still require the existing project chain.
+        Receipts remain local; this does not upgrade legacy stored memories.
+        """
+        from Sprout.agent.base import ModelAgent
+        from Sprout.agent.loop import AgentLoop
+        from Sprout.memory.models import ContextMemory
+
+        if (context is None or context.workspace is not None or context.files
+                or context.knowledge or type(context.memory) is not ContextMemory
+                or context.memory.summary or context.memory.facts
+                or context.memory.recalled or context.memory.knowledge
+                or context.metadata.get("resume_tool_calls")):
+            return False
+        for turn in context.memory.working:
+            records = (self._original_user_turns if turn.role == "user"
+                       else self._ordinary_assistant_turns if turn.role == "assistant" else {})
+            if records.get((context.session.id, turn.id)) != (turn.content, dict(turn.metadata)):
+                return False
+        return (type(agent) is ModelAgent or (
+            type(agent) is AgentLoop and type(result.metadata.get("tool_calls")) is int
+            and result.metadata["tool_calls"] == 0
+            and not any(result.metadata.get(key) for key in (
+                "approval_required", "workspace_requested", "truncated", "degraded"))))
 
     def _remember_node_product(self, scope, output):
         from copy import deepcopy
@@ -1664,6 +1742,13 @@ class Runtime:
                 plan = ReadPlan(task_id=task.id, purpose=task.instruction)
                 paths = ()
                 target = str(workspace.root)
+                directory = task.metadata.get("analysis_directory")
+                if directory is not None:
+                    from Sprout.workspace.authorized_content import relative_label
+
+                    if directory != ".":
+                        directory = relative_label(directory)
+                        target = str(workspace.root / directory)
             # Explicit path hints may constrain, never enlarge, the host selection.
             for key in ("workspace_path", "project_path", "path", "root"):
                 hint = message.metadata.get(key)
@@ -1705,6 +1790,11 @@ class Runtime:
                     "unavailable_reason", "project_analysis_unavailable"))
             await self._persist_node_products()
             content = output["content"]
+            coverage = admission["analysis_result"].data.get("coverage", {})
+            if coverage.get("mode") == "discovery":
+                content += ("\n\n覆盖范围 / coverage: authorized project files; "
+                            f"{coverage.get('file_count', 0)} files; "
+                            "partial project coverage (policy/scope and supported resource types).")
             reason = ""
         except PermissionError as exc:
             content = reason = str(exc)
@@ -1833,7 +1923,8 @@ class Runtime:
             )
             return await self.middleware.after(held, outbound)
 
-        await self._persist_turns(session, message, result)
+        await self._persist_turns(session, message, result,
+                                 ordinary_context=context, ordinary_agent=agent)
         await self.events.publish(Event(AGENT_COMPLETED, {"session_id": session.id}, message.id))
         await self.events.publish(Event(MESSAGE_SENT, {"session_id": session.id}, message.id))
         outbound = OutboundMessage(
@@ -2678,7 +2769,12 @@ class Runtime:
                 chunks.append(result.content)
                 result_metadata = dict(result.metadata)
             else:
-                async for chunk in stream(message, context):
+                from Sprout.agent.loop import AgentLoop
+
+                # Opt in only for the known stream contract; legacy text-only
+                # consumers and other agents retain their existing signature.
+                options = {"include_result": True} if type(agent) is AgentLoop else {}
+                async for chunk in stream(message, context, **options):
                     if isinstance(chunk, AgentResult):
                         if chunk.content:
                             chunks.append(chunk.content)
@@ -2733,7 +2829,8 @@ class Runtime:
             metadata=dict(result.metadata),
         )
         yield StreamChunk(outbound=outbound)
-        self._schedule_background_task(self._finish_stream_turn(session, message, result, outbound))
+        self._schedule_background_task(self._finish_stream_turn(
+            session, message, result, outbound, ordinary_context=context, ordinary_agent=agent))
 
     def schedule_background(self, coroutine) -> None:
         """Run a coroutine off the turn path, drained by ``stop()``.
@@ -2755,10 +2852,13 @@ class Runtime:
         message: Message,
         result: AgentResult,
         outbound: OutboundMessage,
+        *, ordinary_context=None, ordinary_agent=None,
     ) -> None:
         """Finish a streamed turn after its response has reached the caller."""
         try:
-            await self._persist_turns(session, message, result)
+            await self._persist_turns(session, message, result,
+                                     ordinary_context=ordinary_context,
+                                     ordinary_agent=ordinary_agent)
             await self.events.publish(
                 Event(AGENT_COMPLETED, {"session_id": session.id}, message.id)
             )
@@ -2901,7 +3001,10 @@ class Runtime:
         offloaded = {**envelope, "blob_uri": uri, "content_bytes": size}
         return content[:TURN_PREVIEW_CHARS], offloaded
 
-    async def _persist_turns(self, session: Session, message: Message, result: AgentResult) -> Turn:
+    async def _persist_turns(
+        self, session: Session, message: Message, result: AgentResult, *,
+        ordinary_context=None, ordinary_agent=None,
+    ) -> Turn:
         """Append the user and assistant turns with their full envelopes.
 
         This is the only authority write point of the online path (P1): the
@@ -2937,6 +3040,10 @@ class Runtime:
                     raise LookupError("Could not issue durable workspace consent")
         await Runtime._persist_attachments(self, user_turn, message)
         await self._session_store.append_turn(assistant_turn)
+        if self._ordinary_response_has_source(ordinary_context, ordinary_agent, result):
+            self._ordinary_assistant_turns[(session.id, assistant_turn.id)] = deepcopy((
+                assistant_turn.content, dict(assistant_turn.metadata),
+            ))
         stored = list(await self._session_store.recent_turns(session.id, limit=2))
         payload: dict = {"session_id": session.id}
         if len(stored) == 2:

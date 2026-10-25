@@ -365,6 +365,11 @@ class NodeExecutor:
         from Sprout.tools.context_keys import _current_project_node
 
         scope = _current_project_node()
+        if "db.read" in scope.task.delegation_scope.allowed_actions:
+            tools = dict(context.tools)
+            database = scope.runtime.tools.get("database_query")
+            tools[database.spec.name] = database
+            context = replace(context, tools=tools)
         if scope.known_paths:
             tools = dict(context.tools)
             for tool in (await scope.runtime._issue_project_analysis_tool(paths=scope.known_paths),
@@ -408,9 +413,9 @@ class NodeExecutor:
             paths=paths or None, discover=not paths,
         )
         tools = {tool.spec.name: tool}
-        if paths:
-            query = await scope.runtime._issue_project_query_tool(paths=paths)
-            tools[query.spec.name] = query
+        query = await scope.runtime._issue_project_query_tool(
+            paths=paths or None, discover=not paths)
+        tools[query.spec.name] = query
         context = self._contexts.build_node_context(
             user_id=task.actor.user_id, node_id=node.id, tools=tools,
             metadata={"task_id": task.id},
