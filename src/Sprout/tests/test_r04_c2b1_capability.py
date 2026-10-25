@@ -3,8 +3,10 @@
 import asyncio
 import socket
 import subprocess
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import replace
+from functools import wraps
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -20,8 +22,8 @@ from Sprout.tools.registry import ToolRegistry, create_tool_registry
 from Sprout.tools.result import ToolResult
 
 
-@pytest.fixture(autouse=True)
-def forbid_effects(monkeypatch):
+@contextmanager
+def _forbid_effects(monkeypatch):
     spawn = AsyncMock(side_effect=AssertionError("External execution forbidden"))
     sync = Mock(side_effect=AssertionError("External execution forbidden"))
 
@@ -32,17 +34,27 @@ def forbid_effects(monkeypatch):
         def __new__(cls, *args, **kwargs):
             return sync(*args, **kwargs)
 
-    monkeypatch.setattr(subprocess, "Popen", ForbiddenPopen)
-    monkeypatch.setattr(subprocess, "run", sync)
-    monkeypatch.setattr(socket.socket, "connect", sync)
-    monkeypatch.setattr(socket, "getaddrinfo", sync)
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
-    monkeypatch.setattr(asyncio, "create_subprocess_shell", spawn)
-    monkeypatch.setattr(system_tools, "_run_command", spawn)
-    monkeypatch.setattr("Sprout.orchestration.terminal.ensure.ensure_temporal_async", spawn)
-    yield
-    spawn.assert_not_called()
-    sync.assert_not_called()
+    with monkeypatch.context() as guard:
+        guard.setattr(subprocess, "Popen", ForbiddenPopen)
+        guard.setattr(subprocess, "run", sync)
+        guard.setattr(socket.socket, "connect", sync)
+        guard.setattr(socket, "getaddrinfo", sync)
+        guard.setattr(asyncio, "create_subprocess_exec", spawn)
+        guard.setattr(asyncio, "create_subprocess_shell", spawn)
+        guard.setattr(system_tools, "_run_command", spawn)
+        guard.setattr("Sprout.orchestration.terminal.ensure.ensure_temporal_async", spawn)
+        yield
+        spawn.assert_not_called()
+        sync.assert_not_called()
+
+
+def _with_forbidden_effects(test):
+    @wraps(test)
+    async def guarded(*args, **kwargs):
+        with _forbid_effects(kwargs["monkeypatch"]):
+            return await test(*args, **kwargs)
+
+    return guarded
 
 
 @pytest.mark.parametrize("source", ["interactive", "cron", "automation"])
@@ -50,6 +62,7 @@ def forbid_effects(monkeypatch):
 @pytest.mark.parametrize("grant", [None, True, False])
 @pytest.mark.parametrize("kind", ["factory", "direct", "subclass", "override", "cross",
                                   "overlay", "renamed"])
+@_with_forbidden_effects
 async def test_disabled_builtin_preserves_all_approval_state(
     tmp_path, monkeypatch, source, policy_kind, grant, kind,
 ):
@@ -126,7 +139,8 @@ async def test_disabled_builtin_preserves_all_approval_state(
 
 
 @pytest.mark.parametrize("kind", ["plugin", "replacement", "overlay"])
-async def test_unbound_instances_retain_ordinary_approval_flow(tmp_path, kind):
+@_with_forbidden_effects
+async def test_unbound_instances_retain_ordinary_approval_flow(tmp_path, kind, monkeypatch):
     registry = create_tool_registry(skills_dir=tmp_path)
 
     class Plugin:
@@ -150,6 +164,7 @@ async def test_unbound_instances_retain_ordinary_approval_flow(tmp_path, kind):
     tool.invoke.assert_awaited_once()
 
 
+@_with_forbidden_effects
 async def test_bound_identity_survives_spec_rename_and_scoped_dispatch(tmp_path, monkeypatch):
     registry = create_tool_registry(skills_dir=tmp_path)
     builtin = registry.get("skill_script")
@@ -169,7 +184,8 @@ async def test_bound_identity_survives_spec_rename_and_scoped_dispatch(tmp_path,
         spy.assert_not_called()
 
 
-async def test_disabled_type_remains_denied_across_registries(tmp_path):
+@_with_forbidden_effects
+async def test_disabled_type_remains_denied_across_registries(tmp_path, monkeypatch):
     first = create_tool_registry(skills_dir=tmp_path)
     builtin = first.get("skill_script")
     second = ToolRegistry()
