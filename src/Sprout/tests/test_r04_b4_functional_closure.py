@@ -1,7 +1,10 @@
 """B4 function restoration; disk persistence uses real SQLite, not an in-memory DB."""
+import os
 import sqlite3
 from dataclasses import replace
+from pathlib import Path
 from unittest.mock import Mock
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 import pytest
 
@@ -20,8 +23,38 @@ from Sprout.tests.test_r04_pa2_b1_binding import rig as rig
 from Sprout.workspace.models import ReadPlan, ResourceRef
 
 
+@pytest.fixture
+def local_sqlite_connect(tmp_path, monkeypatch):
+    """Reversible test-only URI boundary; not a production broker guarantee.
+
+    No process-wide audit hook is installed. Only tests explicitly requesting
+    this fixture use the wrapper, and monkeypatch restores it after each test.
+    """
+    original = sqlite3.connect
+
+    def connect(database, *args, **kwargs):
+        name = str(database)
+        path = name
+        if name.startswith("file:"):
+            uri = urlsplit(name)
+            pairs = parse_qsl(uri.query, keep_blank_values=True)
+            if (uri.netloc or uri.fragment or "%00" in uri.path.lower()
+                    or (pairs and (len(pairs) != 1 or pairs[0][0] != "mode"
+                                   or pairs[0][1] not in {"ro", "rw", "rwc"}))):
+                raise PermissionError("Test SQLite URI unavailable")
+            path = unquote(uri.path, errors="strict")
+            if os.name == "nt" and len(path) > 3 and path[0] == "/" and path[2] == ":":
+                path = path[1:]
+        if not Path(path).resolve().is_relative_to(tmp_path.resolve()):
+            raise PermissionError("Test SQLite path outside fixture root")
+        return original(database, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    return connect
+
+
 @pytest.mark.parametrize("form", ["driver", "absolute_uri"])
-def test_guard_accepts_only_local_sqlite_uri(tmp_path, form):
+def test_guard_accepts_only_local_sqlite_uri(tmp_path, form, local_sqlite_connect):
     path = tmp_path / "uri database.sqlite3"
     sqlite3.connect(str(path)).close()
     uri = f"file:{path}?mode=ro" if form == "driver" else path.as_uri() + "?mode=ro"
@@ -32,14 +65,14 @@ def test_guard_accepts_only_local_sqlite_uri(tmp_path, form):
     "file:C:/outside-test-root.sqlite?mode=rwc", "file://remote/share/db?mode=ro",
     "file:C:/outside-test-root.sqlite?mode=memory", "file:%00?mode=ro",
 ])
-def test_guard_rejects_untrusted_sqlite_uri(name):
+def test_guard_rejects_untrusted_sqlite_uri(name, local_sqlite_connect):
     with pytest.raises(PermissionError):
         sqlite3.connect(name, uri=True)
 
 
 @pytest.mark.parametrize("suffix", ["?vfs=unknown", "?mode=ro&mode=rw", "#fragment",
                                   "?immutable=1", "?mode=memory"])
-def test_guard_does_not_grant_sqlite_extensions(tmp_path, suffix):
+def test_guard_does_not_grant_sqlite_extensions(tmp_path, suffix, local_sqlite_connect):
     with pytest.raises(PermissionError):
         sqlite3.connect((tmp_path / "extension.sqlite3").as_uri() + suffix, uri=True)
 

@@ -8,9 +8,10 @@ from pathlib import Path
 from Sprout.config.loader import default_settings
 from Sprout.gateway.daemon_gateway import DaemonGateway
 from Sprout.runtime.factory import create_runtime
+from Sprout.tests.readonly_host_fixtures import authorized_read_host as authorized_read_host
 
 
-def test_daemon_gateway_executes_task(tmp_path: Path) -> None:
+def test_daemon_gateway_executes_task(tmp_path: Path, authorized_read_host) -> None:
     (tmp_path / "pyproject.toml").write_text(
         "[project]\nname='demo'\nversion='0.1.0'\n",
         encoding="utf-8",
@@ -37,10 +38,12 @@ def test_daemon_gateway_executes_task(tmp_path: Path) -> None:
         runtime = create_runtime(settings)
         workspace = await runtime.open_workspace(tmp_path)
         gateway = DaemonGateway(runtime)
+        principal, scope = authorized_read_host(tmp_path / "src/main.py", source="daemon-host")
         task = await gateway.create_task(
             workspace.id, "explain this project", execution_mode="read_only",
+            principal=principal, delegation_scope=scope,
         )
-        response = await gateway.run_task(task.id)
+        response = await gateway.run_task(task.id, principal=principal)
         assert response.status in {"waiting_approval", "completed"}
         await runtime.stop()
 

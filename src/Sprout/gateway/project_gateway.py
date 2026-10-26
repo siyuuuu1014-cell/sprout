@@ -7,7 +7,7 @@ from Sprout.gateway.identity import Principal
 from Sprout.gateway.runtime_gateway import RuntimeGateway
 from Sprout.gateway.task_adapter import GatewayRequest, GatewayResponse
 from Sprout.runtime.runtime import Runtime
-from Sprout.task.models import Task
+from Sprout.task.models import DelegationScope, Task
 from Sprout.workspace.models import Workspace
 from Sprout.workspace.query import WorkspaceQueryResult
 
@@ -33,11 +33,12 @@ class ProjectGateway:
     async def list_workspaces(self):
         return await self._runtime.list_workspaces()
 
-    async def analyze_workspace(self, workspace_id: str):
-        return await self._runtime.analyze_workspace(workspace_id)
+    async def analyze_workspace(self, workspace_id: str, *, principal=None, analysis_task=None):
+        return await self._runtime.analyze_workspace(
+            workspace_id, principal=principal, analysis_task=analysis_task)
 
-    async def plan_task(self, task_id: str):
-        return await self._runtime.plan_task(task_id)
+    async def plan_task(self, task_id: str, *, principal=None):
+        return await self._runtime.plan_task(task_id, principal=principal)
 
     async def verification_report(self, task_id: str):
         return await self._runtime.get_verification_report(task_id)
@@ -54,8 +55,11 @@ class ProjectGateway:
         *,
         name: str = "",
         relation: str | None = None,
+        principal: Principal | None = None,
+        analysis_task: Task | None = None,
     ):
-        analysis = await self._runtime.analyze_workspace(workspace_id)
+        analysis = await self.analyze_workspace(
+            workspace_id, principal=principal, analysis_task=analysis_task)
         return analysis.query().neighbors(name, relation=relation)
 
     async def query_project_knowledge(
@@ -64,8 +68,11 @@ class ProjectGateway:
         *,
         query: str = "",
         kind: str | None = None,
+        principal: Principal | None = None,
+        analysis_task: Task | None = None,
     ):
-        analysis = await self._runtime.analyze_workspace(workspace_id)
+        analysis = await self.analyze_workspace(
+            workspace_id, principal=principal, analysis_task=analysis_task)
         return analysis.query().knowledge(query, kind=kind)
 
     async def query_workspace_symbols(
@@ -74,8 +81,11 @@ class ProjectGateway:
         *,
         kind: str | None = None,
         query: str = "",
+        principal: Principal | None = None,
+        analysis_task: Task | None = None,
     ):
-        analysis = await self._runtime.analyze_workspace(workspace_id)
+        analysis = await self.analyze_workspace(
+            workspace_id, principal=principal, analysis_task=analysis_task)
         return analysis.query().symbols(kind=kind, query=query)
 
     async def query_workspace_dependencies(
@@ -84,9 +94,12 @@ class ProjectGateway:
         path: str,
         *,
         direction: str = "out",
+        principal: Principal | None = None,
+        analysis_task: Task | None = None,
     ):
         """Dependency edges of ``path``, plus the nodes those edges touch."""
-        analysis = await self._runtime.analyze_workspace(workspace_id)
+        analysis = await self.analyze_workspace(
+            workspace_id, principal=principal, analysis_task=analysis_task)
         edges = analysis.query().dependencies(path, direction=direction)
         touched = {edge.source for edge in edges} | {edge.target for edge in edges}
         nodes = tuple(node for node in analysis.graph.nodes if node.id in touched)
@@ -99,8 +112,11 @@ class ProjectGateway:
         *,
         max_depth: int = 2,
         relation: str | None = None,
+        principal: Principal | None = None,
+        analysis_task: Task | None = None,
     ):
-        analysis = await self._runtime.analyze_workspace(workspace_id)
+        analysis = await self.analyze_workspace(
+            workspace_id, principal=principal, analysis_task=analysis_task)
         return analysis.query().subgraph(name, max_depth=max_depth, relation=relation)
 
     async def create_task(
@@ -111,6 +127,7 @@ class ProjectGateway:
         user_id: str | None = None,
         execution_mode: str = "code",
         principal: Principal | None = None,
+        delegation_scope: DelegationScope | None = None,
     ) -> Task:
         # Goes through strategy planning so plan steps drive the execution
         # graph; falls back to a plain task if planning is unavailable.
@@ -118,8 +135,9 @@ class ProjectGateway:
             workspace_id,
             instruction,
             actor=principal or Principal(user_id=user_id or self._default_user),
-            source=self._transport,
+            source=principal.source if principal is not None else self._transport,
             execution_mode=execution_mode,
+            delegation_scope=delegation_scope,
         )
 
     async def confirm_task_mode(self, task_id: str, execution_mode: str) -> Task:

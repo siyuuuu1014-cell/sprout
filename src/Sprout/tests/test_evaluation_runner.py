@@ -12,6 +12,16 @@ from Sprout.evaluation.fixtures import CASES
 from Sprout.evaluation.runner import _repo, run_suite
 
 
+@pytest.fixture
+def eval_host(monkeypatch):
+    # Controlled SID on Windows; never a claim of native identity verification.
+    from Sprout.cli.commands.project import _eval_scope_for_workspace
+    from Sprout.gateway.local_identity import current_cli_principal
+
+    monkeypatch.setattr("Sprout.gateway.local_identity._windows_sid", lambda: "S-1-5-21-4700")
+    return current_cli_principal(), _eval_scope_for_workspace
+
+
 def test_generated_fixture_conftest_passes_ruff(tmp_path):
     case = next(case for case in CASES if case.id == "C01")
     repo = _repo(tmp_path, case)
@@ -53,9 +63,10 @@ async def test_remote_temporal_environment_is_rejected(tmp_path, monkeypatch):
     assert not list(tmp_path.iterdir())
 
 
-async def test_fixed_suite_and_persisted_report(tmp_path, monkeypatch):
+async def test_fixed_suite_and_persisted_report(tmp_path, monkeypatch, eval_host):
     monkeypatch.delenv("TEMPORAL_HOST", raising=False)
-    report = await run_suite(tmp_path)
+    principal, provider = eval_host
+    report = await run_suite(tmp_path, principal=principal, scope_provider=provider)
     evaluation_failures(report, tmp_path)
     assert report["scenario_passed"] == 10, json.dumps(
         [
@@ -71,13 +82,16 @@ async def test_fixed_suite_and_persisted_report(tmp_path, monkeypatch):
     assert persisted == report
 
 
-def test_cli_non_green_eval_has_nonzero_exit(monkeypatch):
+def test_cli_non_green_eval_has_nonzero_exit(monkeypatch, eval_host):
     from typer.testing import CliRunner
 
     from Sprout.cli.commands import project
     from Sprout.evaluation import runner
 
-    async def failed(output, *, case_ids):
+    async def failed(output, *, case_ids, principal, scope_provider, preparation_provider):
+        assert principal == eval_host[0]
+        assert scope_provider is eval_host[1]
+        assert preparation_provider is project._eval_inputs_for_workspace
         return {"total": 1, "scenario_passed": 0, "failure_stages": {"setup": 1}}
 
     monkeypatch.setattr(runner, "run_suite", failed)
@@ -86,7 +100,7 @@ def test_cli_non_green_eval_has_nonzero_exit(monkeypatch):
     assert json.loads(result.output)["scenario_passed"] == 0
 
 
-async def test_broken_positive_fixture_is_reported_not_hidden(tmp_path, monkeypatch):
+async def test_broken_positive_fixture_is_reported_not_hidden(tmp_path, monkeypatch, eval_host):
     from Sprout.evaluation import runner
 
     monkeypatch.delenv("TEMPORAL_HOST", raising=False)
@@ -98,6 +112,8 @@ async def test_broken_positive_fixture_is_reported_not_hidden(tmp_path, monkeypa
         return repo
 
     monkeypatch.setattr(runner, "_repo", broken)
-    report = await run_suite(tmp_path, case_ids=("C01",))
+    principal, provider = eval_host
+    report = await run_suite(tmp_path, case_ids=("C01",), principal=principal,
+                             scope_provider=provider)
     assert report["scenario_passed"] == 0
     assert report["baseline_invalid"] == 1

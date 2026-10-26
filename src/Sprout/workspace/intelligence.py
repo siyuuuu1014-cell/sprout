@@ -17,7 +17,6 @@ from Sprout.workspace.models import ReadPlan, ReadStage, Workspace, WorkspaceMan
 from Sprout.workspace.python_contracts import PythonContractAnalyzer
 from Sprout.workspace.query import WorkspaceQuery
 from Sprout.workspace.scanner import WorkspaceScanner
-from Sprout.workspace.skills import SkillWorkspaceAnalyzer
 from Sprout.workspace.sql_contracts import SqlContractAnalyzer
 
 if TYPE_CHECKING:
@@ -161,84 +160,8 @@ class WorkspaceIntelligence:
         *,
         previous: WorkspaceAnalysis | None = None,
     ) -> WorkspaceAnalysis:
-        manifest = workspace.manifest or self._scanner.scan(workspace)
-        enriched = Workspace(
-            id=workspace.id,
-            root=workspace.root,
-            kind=workspace.kind,
-            revision=workspace.revision,
-            manifest=manifest,
-        )
-        read_plan = self._scanner.build_read_plan(enriched, task)
-        graph_resources = self._scanner.collect_resources(enriched)
-        fingerprint = WorkspaceFingerprint.compute(enriched, ReadPlan(resources=graph_resources))
-        skill_analysis = None
-        if self._skills_dir is not None:
-            # External skill bundles are analysis inputs too. Use the shared
-            # loader's complete artifact digest, including supporting assets.
-            skill_analysis = SkillWorkspaceAnalyzer().analyze(enriched.id, self._skills_dir)
-            fingerprint = replace(fingerprint, resource_hashes={
-                **fingerprint.resource_hashes, **skill_analysis.resource_hashes,
-            })
-        if previous is not None and not fingerprint.is_stale(previous.fingerprint):
-            return replace(
-                previous, workspace=enriched, manifest=manifest,
-                read_plan=self._refine_read_plan(read_plan, previous.graph, previous.knowledge),
-            )
-
-        graph_plan = ReadPlan(
-            task_id=task.id,
-            purpose=read_plan.purpose,
-            resources=graph_resources,
-            excludes=read_plan.excludes,
-            stage=read_plan.stage,
-        )
-        graph = self._graph_builder.build(enriched, graph_plan)
-        knowledge = self._knowledge_builder.build(enriched, manifest)
-        contracts = PythonContractAnalyzer().analyze(enriched, graph_resources)
-        sql_contracts = SqlContractAnalyzer().analyze(enriched, graph_resources)
-        knowledge = replace(knowledge, items=knowledge.items + contracts.items + sql_contracts)
-        if skill_analysis is not None:
-            graph = replace(
-                graph,
-                nodes=graph.nodes + skill_analysis.nodes,
-                edges=graph.edges + skill_analysis.edges,
-            )
-            knowledge = replace(
-                knowledge,
-                items=knowledge.items + skill_analysis.knowledge_items,
-            )
-        read_plan = self._refine_read_plan(read_plan, graph, knowledge)
-        changed_resources = fingerprint.changed_resources(
-            previous.fingerprint if previous is not None else None
-        )
-        stale_knowledge_ids = self._stale_knowledge_ids(
-            previous,
-            set(changed_resources),
-        )
-        stale_knowledge_items = self._stale_knowledge_items(
-            previous,
-            stale_knowledge_ids,
-        )
-        # The builder already rebuilt every resource. Publishing its complete
-        # graph avoids retaining removed modules and obsolete cross-file edges.
-
-        if self._knowledge_store is not None:
-            await self._persist_knowledge(knowledge)
-        if self._graph_store is not None:
-            await self._persist_graph(graph)
-
-        return WorkspaceAnalysis(
-            workspace=enriched,
-            manifest=manifest,
-            read_plan=read_plan,
-            graph=graph,
-            knowledge=knowledge,
-            fingerprint=fingerprint,
-            changed_resources=changed_resources,
-            stale_knowledge_ids=stale_knowledge_ids,
-            stale_knowledge_items=stale_knowledge_items,
-        )
+        """Retired disk entry: pure analyze_view is the supported data path."""
+        raise PermissionError("authorized_content_view_required")
 
     async def _persist_graph(self, graph: WorkspaceGraph) -> None:
         for node in graph.nodes:

@@ -331,6 +331,8 @@ class Runtime:
         self._project_analysis_tools = WeakKeyDictionary()
         # Host admissions live only for one local dispatch, never in model metadata.
         self._online_analysis_requests = {}
+        # Temporary preparation Tasks are data, not portable read grants.
+        self._preparation_tasks = {}
         self._project_analysis_selections = WeakKeyDictionary()
         self._project_tool_paths = WeakKeyDictionary()
         self._project_manifest_tools = WeakKeyDictionary()
@@ -670,6 +672,13 @@ class Runtime:
             raise PermissionError("Project analysis execution domain unavailable")
         metadata = self._metadata_or_raise()
         task = await metadata.get_task(scope.task.id)
+        if task is not None and task.metadata.get("plan_kind") == "r04_preparation_v1":
+            issued = self._preparation_tasks.get(task.id)
+            if (issued is None or task.actor != issued[0].actor
+                    or task.delegation_scope != issued[0].delegation_scope):
+                raise PermissionError("preparation_instance_unavailable")
+            if issued[1] is not None:
+                await self._check_preparation_parent(issued[1], scope.workspace, issued[2])
         if (task is None or task.id != scope.task.id or task.status is not TaskStatus.RUNNING
                 or task.workspace_id != scope.workspace.id
                 or task.actor != scope.task.actor or task.source != scope.task.source
@@ -897,6 +906,11 @@ class Runtime:
             return await self._query_project_selection(selection, arguments)
 
         def project(analysis):
+            admission = self._online_analysis_requests.get(frame.node_scope.node.id)
+            if admission is not None:
+                # Provisional data only; the host returns it only after capture's
+                # publication checks and the real Guard settlement succeed.
+                admission["analysis_data"] = analysis
             payload = {
                 "workspace_id": analysis.workspace.id,
                 "root": analysis.workspace.root.as_posix(),
@@ -921,8 +935,17 @@ class Runtime:
             }
             return ToolResult.success(analysis.context_summary(), data=payload)
 
+        admission = self._online_analysis_requests.get(frame.node_scope.node.id)
+        projector = admission.get("content_project") if admission is not None else None
+
+        def project_contents(analysis, view):
+            result = project(analysis)
+            if projector is not None:
+                admission["projected_data"] = projector(analysis, view)
+            return result
+
         result = await self._capture_project_selection(
-            selection, project=project, expected_identities=identities,
+            selection, content_project=project_contents, expected_identities=identities,
         )
         admission = self._online_analysis_requests.get(frame.node_scope.node.id)
         if admission is not None and result.ok:
@@ -964,8 +987,13 @@ class Runtime:
         effective = task.delegation_scope.bind_paths(str(workspace.root)).narrow(
             scope.task.delegation_scope.bind_paths(str(workspace.root)),
         )
+        preparation = self._preparation_tasks.get(task.id)
+        # The read service owns a real separate node, but original CODE effects
+        # remain charged to the authoritative parent for task-specific Policy.
+        # Only a live Runtime registration, not child metadata, selects it.
+        resource_task = preparation[1] if preparation and preparation[1] is not None else task
         return ActionRequest(
-            task_id=task.id, actor=task.actor, action=ActionType.TOOL_INVOKE,
+            task_id=resource_task.id, actor=task.actor, action=ActionType.TOOL_INVOKE,
             resource=ResourceRef(workspace_id=workspace.id, path=target.text(),
                                  kind=ResourceKind.OTHER),
             scope=effective,
@@ -1284,7 +1312,7 @@ class Runtime:
         scope.read_captured = True
         return result
 
-    def _known_read_only_plan(self, workspace, task):
+    def _known_read_only_plan(self, workspace, task, *, scheduling=False):
         """Prepare existing explicit targets without host scanning or cache reuse.
 
         The empty manifest is only graph preparation for READ_ONLY, never an
@@ -1295,6 +1323,18 @@ class Runtime:
         from Sprout.workspace.models import ResourceRef
 
         raw = task.metadata.get("required_paths")
+        if raw is None:
+            # A finite, server-issued scope is also an explicit resource selection.
+            # Directories are not scanned here; the capture broker still decides
+            # whether each selected resource can actually be opened.
+            raw = task.delegation_scope.allowed_paths
+        if not raw and scheduling:
+            # Graph preparation performs no read. The worker independently builds
+            # its authoritative read plan when it executes the persistent node.
+            manifest = WorkspaceManifest(workspace.id, revision=workspace.revision)
+            return replace(workspace, manifest=manifest), ReadPlan(
+                task_id=task.id, purpose=task.instruction,
+            )
         if (type(raw) not in {tuple, list} or not raw
                 or len(raw) > ContentLimits().max_files):
             raise PermissionError("project_auto_discovery_unavailable")
@@ -1992,7 +2032,7 @@ class Runtime:
         task = await self.create_task(
             workspace_id,
             message.content,
-            actor=Principal(user_id=principal.user_id if principal else "anonymous", source=source),
+            actor=principal or Principal(user_id="anonymous", source=source),
             source=source,
             # Recorded so a later turn can report this task back to the session
             # that asked for it. Without it a parked task belongs to no
@@ -3214,14 +3254,279 @@ class Runtime:
     async def scan_workspace(self, workspace_id: str) -> WorkspaceManifest:
         return await self._workspaces.scan(workspace_id)
 
-    async def analyze_workspace(self, workspace_id: str) -> WorkspaceAnalysis:
-        return await self._workspaces.analyze(workspace_id)
+    async def analyze_workspace(
+        self, workspace_id: str, *, principal: Principal | None = None,
+        analysis_task: Task | None = None,
+    ) -> WorkspaceAnalysis:
+        return await self._analyze_host_task(
+            workspace_id, principal=principal, analysis_task=analysis_task)
+
+    async def _analyze_host_task(
+        self, workspace_id, *, principal, analysis_task, project=None, refine=None,
+    ):
+        """Fresh host analysis through the existing owned-node/Broker/View lane.
+
+        Task is a reference, never a credential. Neither cached snapshots nor
+        model-supplied paths participate in this host admission.
+        """
+        from Sprout.orchestration.service import SequentialOrchestrator
+        from Sprout.security.policy import SecurityPolicy
+        from Sprout.tools.executor import ToolExecutor
+
+        if (not isinstance(principal, Principal) or principal.authenticated is not True
+                or not isinstance(analysis_task, Task)):
+            raise PermissionError("authorized_workspace_analysis_required")
+        store = self._metadata_or_raise()
+        task = await store.get_task(analysis_task.id)
+        workspace = await store.get_workspace(workspace_id)
+        if (task is None or workspace is None or task.workspace_id != workspace_id
+                or task.actor != principal or task.source != principal.source
+                or task.execution_mode is not TaskExecutionMode.READ_ONLY
+                or task.status not in {TaskStatus.CREATED, TaskStatus.READY}
+                or task.delegation_scope.is_expired()
+                or not task.delegation_scope.allowed_paths
+                or await store.list_execution_nodes(task.id)):
+            raise PermissionError("analysis_task_subject_unavailable")
+        session_id = task.metadata.get("session_id", "")
+        if session_id:
+            owned = await self._sessions.require_owner(session_id, principal)
+            if self._sessions.frozen_principal(owned) != principal:
+                raise PermissionError("analysis_task_subject_unavailable")
+        raw = task.metadata.get("required_paths")
+        if raw:
+            _, plan = self._known_read_only_plan(workspace, task)
+            paths = tuple(resource.path for resource in plan.resources)
+            target = str(workspace.root / paths[0])
+        elif raw is not None:
+            raise PermissionError("project_capture_selection_unavailable")
+        else:
+            # Discovery is an explicit host Task choice. DIRECTORY_LIST policy
+            # and the platform Broker, not root existence, decide visibility.
+            from Sprout.workspace.authorized_content import relative_label
+
+            directory = task.metadata.get("analysis_directory")
+            if not isinstance(directory, str):
+                raise PermissionError("project_capture_selection_unavailable")
+            directory = directory if directory == "." else relative_label(directory)
+            paths = ()
+            target = str(workspace.root / directory)
+        node = ExecutionNode(task_id=task.id, type=NodeType.AGENT)
+        admission = {"paths": paths, "analysis_result": None, "analysis_data": None,
+                     "content_project": project, "projected_data": None}
+        self._online_analysis_requests[node.id] = admission
+
+        async def capture(running):
+            with self._project_analysis_scope(task, workspace, running) as live:
+                tool = await self._issue_project_analysis_tool(
+                    paths=paths or None, discover=not paths)
+                executor = ToolExecutor(
+                    self.tools,
+                    policy=self.security.tool_policy if self.security else SecurityPolicy(),
+                    policy_engine=self._policy_engine,
+                    approvals=self._approvals, audit=self.audit, events=self.events,
+                    scoped={tool.spec.name: tool}, scoped_only=True,
+                )
+                result = await executor.execute(
+                    tool.spec.name, {"path": target, "instruction": task.instruction},
+                    task_id=task.id, session_id=session_id, source=task.source,
+                    requested_by=principal.user_id,
+                )
+                if not result.ok or admission["analysis_data"] is None:
+                    raise PermissionError("project_analysis_unavailable")
+                if refine is not None:
+                    from Sprout.security.access import AccessDecision, ActionType
+                    from Sprout.tools.context_keys import _project_analysis_call
+                    from Sprout.workspace.models import ResourceKind, ResourceRef
+
+                    async def recheck():
+                        await self._project_analysis_subject(live)
+                        with _project_analysis_call(tool) as frame:
+                            for receipt in live.resource_receipts:
+                                request = await self._project_analysis_request(
+                                    tool, {"path": str(workspace.root / receipt["path"])},
+                                    frame, session_id)
+                                await self._check_project_selection((frame, request, workspace))
+                                request = replace(request, action=ActionType.FILE_READ,
+                                    resource=ResourceRef(workspace.id, request.resource.path,
+                                                         kind=ResourceKind(receipt["kind"])))
+                                decision = self._policy_engine.decide(request)
+                                await self._record_project_capture_policy(request, decision)
+                                if (decision.decision is not AccessDecision.ALLOW
+                                        or not request.scope.permits(
+                                            ActionType.FILE_READ.value, request.resource.path)):
+                                    raise PermissionError("preparation_publication_denied")
+
+                    await recheck()
+                    admission["projected_data"] = await refine(admission["projected_data"])
+                    await recheck()
+                return {"analysis_ok": True}
+
+        try:
+            graph = ExecutionGraph(task_id=task.id, nodes=(node,), entry_node_ids=(node.id,))
+            result = await SequentialOrchestrator(store).execute(graph, handler=capture)
+            current = await store.get_task(task.id)
+            if (result.status is not TaskStatus.COMPLETED or current is None
+                    or current.status is not TaskStatus.COMPLETED
+                    or current.execution_mode is not TaskExecutionMode.READ_ONLY
+                    or current.actor != principal or current.source != task.source
+                    or current.workspace_id != workspace_id
+                    or current.metadata.get("session_id", "") != session_id
+                    or current.delegation_scope != task.delegation_scope
+                    or current.delegation_scope.is_expired()
+                    or await store.get_workspace(workspace_id) != workspace
+                    or admission["analysis_data"] is None):
+                raise PermissionError("analysis_publication_unavailable")
+            if session_id:
+                await self._sessions.require_owner(session_id, principal)
+            return admission["analysis_data"] if project is None else admission["projected_data"]
+        finally:
+            self._online_analysis_requests.pop(node.id, None)
+
+    async def _check_preparation_parent(self, expected, workspace, owner_node=None):
+        current = await self._metadata_or_raise().get_task(expected.id)
+        if (current is None or current.actor != expected.actor or current.source != expected.source
+                or current.workspace_id != workspace.id
+                or current.delegation_scope != expected.delegation_scope
+                or current.delegation_scope.is_expired()
+                or current.metadata.get("session_id") != expected.metadata.get("session_id")
+                or current.status in {TaskStatus.CANCELLED, TaskStatus.ROLLED_BACK,
+                                      TaskStatus.COMPLETED, TaskStatus.FAILED}):
+            raise PermissionError("preparation_authority_changed")
+        if owner_node is not None:
+            node = await self._metadata_or_raise().get_execution_node(owner_node.id)
+            guard = node.metadata.get("execution_guard", {}) if node else {}
+            if (node is None or node.task_id != expected.id or node.type != owner_node.type
+                    or node.status is not NodeStatus.RUNNING or guard.get("state") != "active"
+                    or not guard.get("owner")
+                    or guard.get("owner") != owner_node.metadata.get(
+                        "execution_guard", {}).get("owner")):
+                raise PermissionError("preparation_owner_changed")
+        return current
+
+    async def _capture_preparation(
+        self, workspace, *, actor, source, scope, instruction, metadata, parent=None,
+        project=None, refine=None, owner_node=None,
+    ):
+        """A new real read owner, finite authority, and no transferable grant.
+
+        Existing plan_kind is a negative marker only. Missing live registration
+        (including another worker/Runtime) refuses; neither it nor a callback
+        grants access. Scope is revoked on exit; UNKNOWN owners are never reset.
+        """
+        from datetime import UTC, datetime, timedelta
+
+        if (not isinstance(actor, Principal) or actor.authenticated is not True
+                or not actor.user_id or not actor.source or source != actor.source
+                or not isinstance(scope, DelegationScope) or not scope.allowed_paths
+                or scope.is_expired()):
+            raise PermissionError("preparation_subject_unavailable")
+        if parent is not None:
+            await self._check_preparation_parent(parent, workspace, owner_node)
+        deadline = datetime.now(UTC) + timedelta(seconds=self._agent_timeout_seconds())
+        child_scope = replace(scope, expires_at=min(scope.expires_at, deadline)
+                              if scope.expires_at else deadline)
+        child = await self.create_task(
+            workspace.id, instruction, actor=actor, source=source,
+            execution_mode=TaskExecutionMode.READ_ONLY, delegation_scope=child_scope,
+            metadata={**metadata, "plan_kind": "r04_preparation_v1"},
+        )
+        self._preparation_tasks[child.id] = (child, parent, owner_node)
+        try:
+            result = await self._analyze_host_task(
+                workspace.id, principal=actor, analysis_task=child, project=project, refine=refine)
+            if parent is not None:
+                await self._check_preparation_parent(parent, workspace, owner_node)
+            return result
+        finally:
+            try:
+                current = await self._metadata_or_raise().get_task(child.id)
+                if current is not None:
+                    now = datetime.now(UTC)
+                    expiry = current.delegation_scope.expires_at
+                    await self._metadata_or_raise().save_task(replace(
+                        current, delegation_scope=replace(current.delegation_scope,
+                            expires_at=min(expiry, now) if expiry else now)))
+            finally:
+                self._preparation_tasks.pop(child.id, None)
+
+    async def _prepare_code_resources(self, task, workspace, *, owned_node=None):
+        store = self._metadata_or_raise()
+        authoritative = await store.get_task(task.id)
+        if authoritative is not None:
+            if authoritative.actor != task.actor or authoritative.workspace_id != workspace.id:
+                raise PermissionError("preparation_subject_unavailable")
+            task = authoritative
+        elif (task.actor.authenticated is not True or not task.delegation_scope.allowed_paths
+              or task.source != task.actor.source):
+            raise PermissionError("preparation_subject_unavailable")
+        else:
+            await store.save_task(task)  # SDK Tasks may not yet have a durable row.
+        from Sprout.orchestration.service import SequentialOrchestrator
+
+        if any(SequentialOrchestrator._blocks_local_replay(node)
+               for node in await store.list_execution_nodes(task.id)
+               if owned_node is None or node.id != owned_node.id):
+            raise PermissionError("code_preparation_unconfirmed")
+        selection = {key: task.metadata[key] for key in
+                     ("required_paths", "analysis_directory", "session_id") if key in task.metadata}
+        if "required_paths" not in selection and "analysis_directory" not in selection:
+            _, known = self._known_read_only_plan(workspace, task)
+            selection["required_paths"] = [resource.path for resource in known.resources]
+        analysis = await self._capture_preparation(
+            replace(workspace, manifest=None), actor=task.actor, source=task.source,
+            scope=task.delegation_scope, instruction=task.instruction,
+            metadata=selection, parent=task,
+            owner_node=owned_node,
+        )
+        return (replace(workspace, manifest=analysis.manifest),
+                replace(analysis.read_plan, task_id=task.id, purpose=task.instruction))
 
     async def invalidate_workspace(self, workspace_id: str | None = None) -> None:
         await self._workspaces.invalidate_workspace(workspace_id)
 
-    async def plan_task(self, task_id: str) -> ReadPlan:
-        return await self._workspaces.read_plan(task_id)
+    async def plan_task(self, task_id: str, *, principal: Principal | None = None) -> ReadPlan:
+        store = self._metadata_or_raise()
+        if not isinstance(principal, Principal) or principal.authenticated is not True:
+            raise PermissionError("authorized_workspace_analysis_required")
+        task = await store.get_task(task_id)
+        if task is None:
+            raise LookupError(f"Task not found: {task_id}")
+        if (task.actor != principal or task.source != principal.source
+                or task.status not in {TaskStatus.CREATED, TaskStatus.READY, TaskStatus.RUNNING}
+                or task.delegation_scope.is_expired()
+                or not task.delegation_scope.allowed_paths):
+            raise PermissionError("analysis_task_subject_unavailable")
+        reference = task
+        if (task.execution_mode is not TaskExecutionMode.READ_ONLY
+                or task.status is TaskStatus.RUNNING
+                or await store.list_execution_nodes(task.id)):
+            # Planning must not complete/reclaim a CODE or already-owned graph.
+            # Use a separate read-only task with the EXACT existing authority.
+            # No Scope widening, implicit directory discovery or disk scanner.
+            workspace = await store.get_workspace(task.workspace_id)
+            if workspace is None:
+                raise PermissionError("analysis_workspace_unavailable")
+            _, selected = self._known_read_only_plan(workspace, task)
+            reference = await self.create_task(
+                task.workspace_id, task.instruction, actor=principal, source=task.source,
+                execution_mode=TaskExecutionMode.READ_ONLY,
+                delegation_scope=task.delegation_scope,
+                metadata={"required_paths": [r.path for r in selected.resources],
+                          **({"session_id": task.metadata["session_id"]}
+                             if task.metadata.get("session_id") else {})},
+            )
+        plan = (await self.analyze_workspace(
+            task.workspace_id, principal=principal, analysis_task=reference)).read_plan
+        current = await store.get_task(task_id)
+        if (current is None or current.actor != task.actor or current.source != task.source
+                or current.workspace_id != task.workspace_id
+                or current.delegation_scope != task.delegation_scope
+                or current.delegation_scope.is_expired()
+                or current.metadata.get("session_id") != task.metadata.get("session_id")
+                or current.status not in {TaskStatus.CREATED, TaskStatus.READY,
+                                          TaskStatus.RUNNING, TaskStatus.COMPLETED}):
+            raise PermissionError("analysis_publication_unavailable")
+        return replace(plan, task_id=task_id)
 
     async def create_task(
         self,
@@ -3300,8 +3605,10 @@ class Runtime:
         *,
         actor: Principal | None = None,
         source: str = "cli",
+        delegation_scope: DelegationScope | None = None,
         language: str = "",
         use_model_planner: bool = False,
+        preparation_paths: tuple[str, ...] | None = None,
     ) -> Task:
         """Plan a requirement with the strategy layer, then materialize a task.
 
@@ -3319,32 +3626,46 @@ class Runtime:
         from Sprout.strategy.pipeline import StrategyPipeline
 
         pipeline = StrategyPipeline()
-        if use_model_planner:
-            plan = await pipeline.plan_user_request_with_model(
-                workspace.root,
-                requirement,
-                self.models.default(),
-                language=language,
-            )
-        else:
-            plan = pipeline.plan_user_request(
-                workspace.root,
-                requirement,
-                language=language,
-            )
+        if (not isinstance(actor, Principal) or actor.authenticated is not True
+                or not isinstance(delegation_scope, DelegationScope)
+                or not delegation_scope.allowed_paths):
+            raise PermissionError("preparation_subject_unavailable")
+        # A finite host Scope is an existing known-resource selector, not an
+        # implicit permission to list a directory. Actual opens remain Brokered.
+        paths = (delegation_scope.allowed_paths if preparation_paths is None
+                 else preparation_paths)
+        if (type(paths) not in {tuple, list} or not paths
+                or any(type(path) is not str for path in paths)):
+            raise PermissionError("preparation_inputs_unavailable")
+        paths = tuple(paths)
+        selection = {"required_paths": list(paths)}
+
+        def project(analysis, view):
+            return pipeline.plan_view(analysis, view, requirement, language=language)
+
+        async def refine(plan):
+            return await pipeline.model_planner.refine(plan, self.models.default())
+
+        plan = await self._capture_preparation(
+            replace(workspace, manifest=None), actor=actor, source=source,
+            scope=delegation_scope, instruction=requirement, metadata=selection,
+            project=project, refine=refine if use_model_planner else None,
+        )
         spec = ExecutionPlanner().plan_to_task_spec(plan)
         return await self.create_task(
             workspace_id,
             spec.instruction,
             actor=actor,
             source=source,
+            delegation_scope=delegation_scope,
             budget=spec.budget,
             metadata={
-                "required_paths": list(spec.resources),
                 "tool_names": list(spec.tools),
                 "plan_kind": "model" if use_model_planner else "local",
                 **({"response_language": language} if language else {}),
                 **spec.metadata,
+                # Planner output and future write authority cannot add READ inputs.
+                "required_paths": list(paths),
             },
         )
 
@@ -3355,9 +3676,11 @@ class Runtime:
         *,
         actor: Principal | None = None,
         source: str = "cli",
+        delegation_scope: DelegationScope | None = None,
         language: str = "",
         use_model_planner: bool = False,
         execution_mode: str = TaskExecutionMode.CODE,
+        preparation_paths: tuple[str, ...] | None = None,
     ) -> Task:
         """Create a task through strategy planning, falling back if it fails.
 
@@ -3390,6 +3713,18 @@ class Runtime:
         if workspace is None:
             raise LookupError(f"Workspace not found: {workspace_id}")
         execution_metadata({}, execution_mode)
+        if (preparation_paths is not None
+                and (type(preparation_paths) not in {tuple, list} or not preparation_paths
+                     or any(type(path) is not str for path in preparation_paths))):
+            raise PermissionError("preparation_inputs_unavailable")
+        if preparation_paths is not None:
+            preparation_paths = tuple(preparation_paths)
+            # A selector is not authority, including the scheduling-only lane.
+            if (not isinstance(actor, Principal) or actor.authenticated is not True
+                    or not actor.user_id or not actor.source or source != actor.source
+                    or not isinstance(delegation_scope, DelegationScope)
+                    or not delegation_scope.allowed_paths or delegation_scope.is_expired()):
+                raise PermissionError("preparation_subject_unavailable")
         if execution_mode == TaskExecutionMode.READ_ONLY or not (workspace.root / ".git").exists():
             return await self.create_task(
                 workspace_id,
@@ -3397,6 +3732,9 @@ class Runtime:
                 actor=actor,
                 source=source,
                 execution_mode=execution_mode,
+                delegation_scope=delegation_scope,
+                metadata=({"required_paths": list(preparation_paths)}
+                          if preparation_paths is not None else None),
             )
         try:
             return await self.create_task_from_strategy(
@@ -3406,7 +3744,13 @@ class Runtime:
                 source=source,
                 language=language,
                 use_model_planner=use_model_planner,
+                delegation_scope=delegation_scope,
+                preparation_paths=preparation_paths,
             )
+        except PermissionError:
+            # A denied resource preparation is not a planner bug. Never hide
+            # it behind an unscoped plain-task fallback.
+            raise
         except Exception as exc:  # noqa: BLE001 - planning must never block the task
             logger.warning(
                 "strategy planning failed (%s: %s); creating a plain task",
@@ -3418,10 +3762,13 @@ class Runtime:
                 instruction,
                 actor=actor,
                 source=source,
+                delegation_scope=delegation_scope,
                 metadata={
                     "plan_kind": "fallback",
                     "require_acceptance_tests": True,
                     **({"response_language": language} if language else {}),
+                    **({"required_paths": list(preparation_paths)}
+                       if preparation_paths is not None else {}),
                 },
             )
 
@@ -3929,10 +4276,13 @@ class Runtime:
         isolated_wait = await self._isolated_execution_wait(task)
         if isolated_wait is not None:
             return isolated_wait
-        if isinstance(backend or self._orchestrator_backend, TemporalOrchestratorBackend):
-            authoritative = await metadata.get_task(task.id)
-            if authoritative is not None:
-                task = authoritative
+        execution_backend = backend or self._orchestrator_for(metadata)
+        authoritative = await metadata.get_task(task.id)
+        if authoritative is not None:
+            if authoritative.actor != task.actor or authoritative.workspace_id != task.workspace_id:
+                raise PermissionError("preparation_subject_unavailable")
+            task = authoritative
+            if isinstance(execution_backend, TemporalOrchestratorBackend):
                 if task.status in {
                     TaskStatus.COMPLETED,
                     TaskStatus.CANCELLED,
@@ -3946,22 +4296,26 @@ class Runtime:
         task = self._task_for_execution(task, workspace)
 
         if task.execution_mode is TaskExecutionMode.READ_ONLY:
-            workspace, read_plan = self._known_read_only_plan(workspace, task)
+            workspace, read_plan = self._known_read_only_plan(
+                workspace, task,
+                scheduling=isinstance(execution_backend, TemporalOrchestratorBackend),
+            )
             manifest = workspace.manifest
         else:
-            manifest = self._scanner.scan(workspace)
-            workspace = replace(workspace, manifest=manifest)
-            await metadata.save_workspace(workspace)
-        await metadata.save_task(task)
+            try:
+                workspace, read_plan = await self._prepare_code_resources(task, workspace)
+            except PermissionError as exc:
+                if str(exc) != "code_preparation_unconfirmed":
+                    raise
+                return TaskResult(task_id=task.id, status=TaskStatus.WAITING_RESOURCE,
+                                  error=str(exc))
+            manifest = workspace.manifest
+        if await metadata.get_task(task.id) is None:
+            await metadata.save_task(task)
 
-        required_paths = tuple(task.metadata.get("required_paths") or ())
         tool_names = tuple(task.metadata.get("tool_names") or ())
         steps = tuple(task.metadata.get("steps") or ())
         verification_commands = tuple(task.metadata.get("verification_commands") or ())
-        if task.execution_mode is not TaskExecutionMode.READ_ONLY:
-            read_plan = self._scanner.build_read_plan(
-                workspace, task, required_paths=required_paths,
-            )
         graph = self._graph_builder.build(
             task,
             read_plan,
@@ -3981,7 +4335,7 @@ class Runtime:
         previous_skills = self.skills.list()
         pinned_skill = await executor.pin_snapshot(recorder, artifact_snapshot, task.id)
         try:
-            result = await (backend or self._orchestrator_for(metadata)).execute(
+            result = await execution_backend.execute(
                 graph,
                 handler=executor.handler(task, workspace, read_plan),
                 recorder=recorder,
@@ -4031,15 +4385,17 @@ class Runtime:
             workspace, read_plan = self._known_read_only_plan(workspace, task)
             manifest = workspace.manifest
         else:
-            manifest = workspace.manifest or self._scanner.scan(workspace)
-        required_paths = tuple(task.metadata.get("required_paths") or ())
+            try:
+                workspace, read_plan = await self._prepare_code_resources(task, workspace)
+            except PermissionError as exc:
+                if str(exc) != "code_preparation_unconfirmed":
+                    raise
+                return TaskResult(task_id=task.id, status=TaskStatus.WAITING_RESOURCE,
+                                  error=str(exc))
+            manifest = workspace.manifest
         tool_names = tuple(task.metadata.get("tool_names") or ())
         steps = tuple(task.metadata.get("steps") or ())
         verification_commands = tuple(task.metadata.get("verification_commands") or ())
-        if task.execution_mode is not TaskExecutionMode.READ_ONLY:
-            read_plan = self._scanner.build_read_plan(
-                workspace, task, required_paths=required_paths,
-            )
         graph = self._graph_builder.build(
             task,
             read_plan,
@@ -4191,9 +4547,8 @@ class Runtime:
             if task.execution_mode is TaskExecutionMode.READ_ONLY:
                 prepared, read_plan = self._known_read_only_plan(workspace, task)
             else:
-                manifest = workspace.manifest or self._scanner.scan(workspace)
-                prepared = replace(workspace, manifest=manifest)
-                read_plan = self._scanner.build_read_plan(prepared, task)
+                prepared, read_plan = await self._prepare_code_resources(
+                    task, workspace, owned_node=running)
             executor = self._executor(metadata)
             if isinstance(executor, NodeExecutor):
                 # External scheduler activities retain their own executor;

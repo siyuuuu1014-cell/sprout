@@ -11,6 +11,7 @@ import typer
 from Sprout.cli import ui
 from Sprout.cli.commands.task_lifecycle import app as task_lifecycle_app
 from Sprout.cli.diff import render_diff
+from Sprout.gateway.local_identity import current_cli_principal
 
 app = typer.Typer(help="Project Agent Runtime operations.", no_args_is_help=True)
 app.add_typer(task_lifecycle_app, name="task")
@@ -27,6 +28,42 @@ def _gateway(config: str | None):
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+async def _analysis_context(gateway, workspace_id):
+    """Explicit CLI selection, no filesystem discovery or implicit root grant."""
+    from Sprout.task.models import DelegationScope
+    from Sprout.workspace.authorized_content import ContentLimits, relative_label
+
+    principal = current_cli_principal()
+    if principal.authenticated is not True:
+        raise PermissionError("cli_analysis_identity_unavailable")
+    runtime = gateway._runtime
+    workspace = await runtime.get_workspace(workspace_id)
+    if workspace is None:
+        raise LookupError("analysis_workspace_unavailable")
+    typer.echo(f"Read-only workspace: {workspace.id}  {workspace.root}")
+    raw = typer.prompt("Workspace-relative file or explicit JSON file list", default="")
+    selected = json.loads(raw) if raw.lstrip().startswith("[") else [raw]
+    if (type(selected) is not list or not selected
+            or len(selected) > ContentLimits().max_files
+            or any(type(path) is not str for path in selected)):
+        raise PermissionError("analysis_file_selection_invalid")
+    paths = tuple(relative_label(path.replace("\\", "/")) for path in selected)
+    if len({path.casefold() for path in paths}) != len(paths):
+        raise PermissionError("project_capture_duplicate_path")
+    typer.echo("Selected files only:\n" + "\n".join(paths))
+    if not typer.confirm("Confirm this finite read-only analysis?", default=False):
+        raise PermissionError("project_analysis_cancelled")
+    task = await runtime.create_task(
+        workspace.id, "understand selected project", actor=principal,
+        source=principal.source, execution_mode="read_only",
+        delegation_scope=DelegationScope(
+            allowed_paths=tuple(str(workspace.root / path) for path in paths),
+            allowed_actions=frozenset({"tool.invoke", "file.read"}),
+        ), metadata={"required_paths": list(paths)},
+    )
+    return {"principal": principal, "analysis_task": task}
 
 
 @app.command("eval")
@@ -48,7 +85,10 @@ def evaluate(
     from Sprout.evaluation.runner import run_suite
 
     try:
-        report = _run(run_suite(Path(output) if output else None, case_ids=tuple(case or ())))
+        report = _run(run_suite(
+            Path(output) if output else None, case_ids=tuple(case or ()),
+            principal=current_cli_principal(), scope_provider=_eval_scope_for_workspace,
+            preparation_provider=_eval_inputs_for_workspace))
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from None
     if as_json:
@@ -59,6 +99,34 @@ def evaluate(
         typer.echo(ui.key_value("evidence", report["evidence_dir"]))
     if report["scenario_passed"] != report["total"]:
         raise typer.Exit(code=1)
+
+
+def _eval_inputs_for_workspace(workspace, principal, case):
+    """Explicit first-party input selection, separate from output permissions."""
+    from Sprout.evaluation.runner import _eval_preparation_inputs
+
+    return _eval_preparation_inputs(workspace, principal, case)
+
+
+def _eval_scope_for_workspace(workspace, principal):
+    """CLI host policy for fixed CODE fixtures, independent of model/case paths.
+
+    tests/examples are bounded generated-verification output directories. This
+    grants no action by itself; existing Policy and resource checks still apply.
+    """
+    from Sprout.security.access import ActionType
+    from Sprout.task.models import DelegationScope
+
+    paths = ("src/app.py", "src/helper.py", "src/__init__.py", "pyproject.toml",
+             "pytest.ini", "conftest.py", ".gitignore", "tests", "examples")
+    return DelegationScope(
+        allowed_paths=tuple(str(workspace.root / path) for path in paths),
+        allowed_actions=frozenset(action.value for action in (
+            ActionType.TOOL_INVOKE, ActionType.FILE_READ, ActionType.FILE_WRITE,
+            ActionType.FILE_DELETE, ActionType.PROCESS_RUN, ActionType.GIT_STATUS,
+            ActionType.GIT_DIFF, ActionType.GIT_ADD, ActionType.GIT_COMMIT)),
+        issued_by=principal.source + ":" + principal.user_id,
+    )
 
 
 async def _resolve_proposal(gateway, prefix: str):
@@ -96,7 +164,8 @@ def analyze(
     gateway = _gateway(config)
 
     async def run() -> None:
-        analysis = await gateway.analyze_workspace(workspace_id)
+        analysis = await gateway.analyze_workspace(
+            workspace_id, **await _analysis_context(gateway, workspace_id))
         payload = {
             "workspace_id": analysis.workspace.id,
             "languages": list(analysis.manifest.detected_languages),
@@ -155,6 +224,7 @@ def graph(
             workspace_id,
             name=name,
             relation=relation,
+            **await _analysis_context(gateway, workspace_id),
         )
         if as_json:
             payload = {
@@ -270,7 +340,9 @@ def symbols(
     gateway = _gateway(config)
 
     async def run() -> None:
-        nodes = await gateway.query_workspace_symbols(workspace_id, kind=kind, query=query)
+        nodes = await gateway.query_workspace_symbols(
+            workspace_id, kind=kind, query=query,
+            **await _analysis_context(gateway, workspace_id))
         if as_json:
             typer.echo(
                 json.dumps([_node_payload(node) for node in nodes], indent=2, ensure_ascii=False)
@@ -306,7 +378,9 @@ def dependencies(
     gateway = _gateway(config)
 
     async def run() -> None:
-        result = await gateway.query_workspace_dependencies(workspace_id, path, direction=direction)
+        result = await gateway.query_workspace_dependencies(
+            workspace_id, path, direction=direction,
+            **await _analysis_context(gateway, workspace_id))
         if as_json:
             payload = {
                 "path": path,
@@ -350,7 +424,8 @@ def subgraph(
 
     async def run() -> None:
         result = await gateway.query_workspace_subgraph(
-            workspace_id, name, max_depth=depth, relation=relation
+            workspace_id, name, max_depth=depth, relation=relation,
+            **await _analysis_context(gateway, workspace_id),
         )
         if as_json:
             payload = {
@@ -398,6 +473,7 @@ def knowledge(
             workspace_id,
             query=query,
             kind=kind,
+            **await _analysis_context(gateway, workspace_id),
         )
         if as_json:
             typer.echo(
@@ -440,7 +516,7 @@ def readplan(
     gateway = _gateway(config)
 
     async def run() -> None:
-        plan = await gateway.plan_task(task_id)
+        plan = await gateway.plan_task(task_id, principal=current_cli_principal())
         if as_json:
             payload = {
                 "id": plan.id,
@@ -477,7 +553,9 @@ def task_create(
     gateway = _gateway(config)
 
     async def run() -> None:
-        task = await gateway.create_task(workspace_id, instruction, execution_mode=mode)
+        task = await gateway.create_task(
+            workspace_id, instruction, execution_mode=mode, principal=current_cli_principal(),
+        )
         typer.echo(task.id)
 
     _run(run())

@@ -157,6 +157,27 @@ class ToolExecutor:
                 requested_by, resource_scope = subject.actor.user_id, subject.resource.workspace_id
             except Exception:  # noqa: BLE001 - metadata failure cannot grant a default scope
                 binding_denied = True
+        elif is_mcp:
+            from Sprout.tools.context_keys import _PROJECT_NODE
+
+            # A copied/expired frame must not fall back to a host MCP call.
+            if scope is None and _PROJECT_NODE.get() is not None:
+                binding_denied = True
+            elif scope is not None:
+                try:
+                    if not self.scoped_only:
+                        raise PermissionError("Strict node dispatch required")
+                    task, workspace = await scope.runtime._project_analysis_subject(scope)
+                    subject = ActionRequest(
+                        task_id=task.id, actor=task.actor, action=ActionType.TOOL_INVOKE,
+                        scope=task.delegation_scope.bind_paths(str(workspace.root)).narrow(
+                            scope.task.delegation_scope.bind_paths(str(workspace.root))),
+                    )
+                    task_id, source = task.id, task.source
+                    session_id = scope.session_id
+                    requested_by, resource_scope = task.actor.user_id, workspace.id
+                except Exception:  # noqa: BLE001 - no default identity on failed revalidation
+                    binding_denied = True
 
         # A read-only command is granted without asking. This runs *after* the
         # policy decision and only ever relaxes REQUIRE_APPROVAL — a DENY still
@@ -195,6 +216,13 @@ class ToolExecutor:
                 reason="; ".join(filter(None, (boundary.reason, decision.reason))),
                 matched_rules=(*boundary.matched_rules, *decision.matched_rules),
             )
+
+        if (is_mcp and binding_denied
+                and decision.decision in {AccessDecision.ALLOW, AccessDecision.REQUIRE_APPROVAL}):
+            binding_rejected = True
+            decision = replace(decision, decision=AccessDecision.DENY,
+                reason="mcp_task_binding_denied",
+                matched_rules=(*decision.matched_rules, "mcp:task-binding:denied"))
 
         from Sprout.tools.system_tools import GitWriteTool, SkillScriptTool
 

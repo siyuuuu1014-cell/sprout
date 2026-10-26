@@ -27,7 +27,7 @@ def _task_payload(task) -> dict:
     }
 
 
-def create_project_routes(runtime: Runtime) -> list[Route]:
+def create_project_routes(runtime: Runtime, *, analysis_task_provider=None) -> list[Route]:
     gateway = ProjectGateway(runtime, transport="web", default_user="web-user")
 
     async def list_workspaces(request: Request) -> JSONResponse:
@@ -144,7 +144,20 @@ def create_project_routes(runtime: Runtime) -> list[Route]:
         return JSONResponse({"tasks": [_task_payload(task) for task in tasks]})
 
     async def analyze_workspace(request: Request) -> JSONResponse:
-        analysis = await gateway.analyze_workspace(request.path_params["workspace_id"])
+        # Optional Python host dependency, never recovered from HTTP JSON/state
+        # supplied by the client. Authentication alone grants no resource Scope.
+        principal = principal_of(request)
+        workspace_id = request.path_params["workspace_id"]
+        try:
+            if (principal is None or principal.authenticated is not True
+                    or analysis_task_provider is None):
+                raise PermissionError("authorized_workspace_analysis_required")
+            task = await analysis_task_provider(
+                principal=principal, workspace_id=workspace_id)
+            analysis = await gateway.analyze_workspace(
+                workspace_id, principal=principal, analysis_task=task)
+        except PermissionError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=403)
         return JSONResponse(
             {
                 "workspace_id": request.path_params["workspace_id"],
