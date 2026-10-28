@@ -51,6 +51,16 @@ class FileBroker:
             overrides=self._classify_overrides,
         )
 
+    async def _node_attribution(self, request, sandbox):
+        from Sprout.tools.context_keys import _NODE_TOOL_CALL, _current_node_tool_call
+
+        if _NODE_TOOL_CALL.get() is None:
+            return request  # Existing explicit host Broker contract is unchanged.
+        frame = _current_node_tool_call()
+        if frame is None:
+            raise PermissionError("node_file_binding_unavailable")
+        return await frame[3].runtime._node_file_request(request, sandbox)
+
     async def enumerate_readable(
         self, sandbox=None, relative_directory=None, *, subject=None, limits=None,
     ):
@@ -169,6 +179,27 @@ class FileBroker:
     async def read_snapshot(
         self, sandbox, relative_path, *, subject: ActionRequest, max_bytes, expected_identity=None,
     ):
+        return await self._read_snapshot_impl(sandbox, relative_path, subject=subject,
+            max_bytes=max_bytes, expected_identity=expected_identity)
+
+    async def read_worktree_snapshot(self, sandbox, relative_path, *, max_bytes=100_000):
+        """F3-only raw bytes: the issuer registry supplies every authority field."""
+        from Sprout.execution.verification_manifest import snapshot_subject
+
+        try:
+            target = self._safe_target(sandbox, relative_path)
+            if target is None:
+                raise PermissionError("verification_snapshot_boundary")
+            subject = await snapshot_subject(sandbox, str(target))
+            return await self._read_snapshot_impl(sandbox, relative_path, subject=subject,
+                max_bytes=max_bytes, verification=True)
+        except (OSError, ValueError):
+            from Sprout.execution.file_snapshot import SnapshotResult
+
+            return SnapshotResult(reason="verification_snapshot_unavailable")
+
+    async def _read_snapshot_impl(self, sandbox, relative_path, *, subject, max_bytes,
+                                  expected_identity=None, verification=False):
         """Internal B1-bound single-file capture; no partial result on failure.
 
         Authority is refreshed before access and before return. This is not a
@@ -197,7 +228,14 @@ class FileBroker:
             target = self._safe_target(sandbox, relative_path)
             if target is None:
                 return SnapshotResult(reason="snapshot_boundary_denied")
-            canonical = await current_read_subject(str(target))
+            async def resolve_subject():
+                if verification:
+                    from Sprout.execution.verification_manifest import snapshot_subject
+
+                    return await snapshot_subject(sandbox, str(target))
+                return await current_read_subject(str(target))
+
+            canonical = await resolve_subject()
             if (subject.actor != canonical.actor or subject.task_id != canonical.task_id
                     or subject.resource != canonical.resource or subject.scope != canonical.scope
                     or subject.action != canonical.action):
@@ -209,9 +247,10 @@ class FileBroker:
             # Require exactly that root, not a caller-selected broader sandbox.
             from Sprout.tools.context_keys import _current_project_analysis_call
 
-            frame = _current_project_analysis_call()
-            if self._root(sandbox) != Path(frame.node_scope.workspace.root):
-                return SnapshotResult(reason="snapshot_workspace_mismatch")
+            if not verification:
+                frame = _current_project_analysis_call()
+                if self._root(sandbox) != Path(frame.node_scope.workspace.root):
+                    return SnapshotResult(reason="snapshot_workspace_mismatch")
             kind = self._classify(target, sandbox)
             request = replace(subject, action=ActionType.FILE_READ,
                               resource=ResourceRef(workspace_id=sandbox.id,
@@ -280,7 +319,7 @@ class FileBroker:
             result = checked_snapshot(result, max_bytes, expected_identity)
             if not result.ok:
                 return result
-            latest = await current_read_subject(str(target))
+            latest = await resolve_subject()
             if (latest.actor != subject.actor or latest.task_id != subject.task_id
                     or latest.resource != subject.resource or latest.scope != subject.scope):
                 return SnapshotResult(reason="snapshot_authority_changed")
@@ -368,6 +407,7 @@ class FileBroker:
                 str(self._root(sandbox)),
             ),
         )
+        request = await self._node_attribution(request, sandbox)
         decision = self._policy.decide(request)
         await emit_policy_decision(self._events, request, decision)
         if decision.decision is not AccessDecision.SANDBOX_ONLY:
@@ -390,6 +430,7 @@ class FileBroker:
         *,
         task_id: str = "",
         scope: DelegationScope | None = None,
+        actor=None,
     ) -> FileResult:
         target = self._safe_target(sandbox, relative_path)
         if target is None:
@@ -398,6 +439,7 @@ class FileBroker:
         kind = self._classify(target, sandbox)
         request = ActionRequest(
             task_id=task_id,
+            **({"actor": actor} if actor is not None else {}),
             action=ActionType.FILE_READ,
             resource=ResourceRef(
                 workspace_id=sandbox.id,
@@ -408,6 +450,7 @@ class FileBroker:
                 str(self._root(sandbox)),
             ),
         )
+        request = await self._node_attribution(request, sandbox)
         decision = self._policy.decide(request)
         await emit_policy_decision(self._events, request, decision)
         if decision.decision not in {AccessDecision.ALLOW, AccessDecision.ALLOW_REDACTED}:

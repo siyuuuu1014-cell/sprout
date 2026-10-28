@@ -22,6 +22,140 @@ EXCLUDED = {
 }
 
 
+def export_authorized_view(view, destination, *, receipt):
+    """F3-only byte-preserving export. No source path reads or discovery.
+
+    The live Runtime receipt authorizes this exact managed destination, not a
+    caller-provided path or a synthetic view. Failed partial exports stay sealed
+    from publication and are never implicitly overwritten/reused.
+    """
+    from threading import Event
+
+    from Sprout.execution.file_access import file_operation
+    from Sprout.execution.file_snapshot import _ReadOptions, checked_snapshot
+    from Sprout.execution.host_acceptance import pin_execution_directory
+    from Sprout.execution.verification_manifest import current_frame
+
+    frame = current_frame()
+    record = frame.issuer._verification_frames[frame]
+    destination = Path(destination)
+    if (receipt is not frame or record.get("view") is not view
+            or record["destination"] != destination or record.get("export_state") is not None):
+        raise PermissionError("verification_export_receipt_denied")
+    view.check(record["workspace"].id)
+    prepared = []
+    for entry in view.entries:
+        if (entry.identity is None or private_resource(Path(entry.relative_path), destination)
+                or any(part.casefold() in EXCLUDED for part in Path(entry.relative_path).parts)):
+            raise PermissionError("verification_export_resource_denied")
+        # Explicit current capability: UTF-8 source/config/test inputs, retaining
+        # BOM and CRLF bytes. Non-UTF8 never falls back to lossy text decoding.
+        text = entry.data.decode("utf-8", errors="strict")
+        if text.encode("utf-8") != entry.data:
+            raise PermissionError("verification_export_encoding")
+        prepared.append((entry, text))
+    if not prepared or destination.exists() or destination.is_symlink():
+        raise PermissionError("verification_export_destination_exists")
+    record["export_state"] = "writing"
+    try:
+        with pin_execution_directory(record["parent"]) as parent_pin:
+            if parent_pin.identity != record["parent_identity"]:
+                raise PermissionError("verification_export_parent_changed")
+            def check():
+                if current_frame() is not frame or record.get("export_state") != "writing":
+                    raise PermissionError("verification_export_cancelled")
+                view.check()
+                record["pin"].check()
+                parent_pin.check()
+            receipts = {}
+            for entry, text in prepared:
+                target = destination / entry.relative_path
+                check()
+                file_operation(record["parent"], target, "write", check,
+                               content=text, newline="")
+                result = file_operation(record["parent"], target, "snapshot", check,
+                    content=_ReadOptions(len(entry.data) or 1, None, Event(), check))
+                result = checked_snapshot(result, len(entry.data), None)
+                if not result.ok or result.data != entry.data or result.digest != entry.digest:
+                    raise PermissionError("verification_export_content_changed")
+                from dataclasses import asdict
+
+                receipts[entry.relative_path] = {"digest": result.digest,
+                                                "identity": asdict(result.identity)}
+            check()
+            with pin_execution_directory(destination) as export_pin:
+                root_identity = export_pin.identity
+            record["export_state"] = "sealed"
+            return {"root": str(destination), "root_identity": root_identity,
+                    "files": receipts, "workspace": view.workspace_id}
+    except BaseException:
+        record["export_state"] = "failed"
+        raise
+
+
+async def check_export_receipt(receipt, *, revalidate=None):
+    """Check a Runtime-held receipt, never turn a supplied JSON into a grant."""
+    from threading import Event
+
+    from Sprout.execution.file_access import directory_entries, file_operation
+    from Sprout.execution.file_snapshot import ResourceIdentity, _ReadOptions, checked_snapshot
+    from Sprout.execution.host_acceptance import pin_execution_directory
+
+    root = Path(receipt["root"])
+    with pin_execution_directory(root) as pin:
+        if tuple(receipt["root_identity"]) != pin.identity:
+            raise PermissionError("verification_export_root_changed")
+        # Only names/identities are observed here. An unexpected name is denied
+        # before opening it or reading any content, including hard-link aliases.
+        expected_names = set(receipt["files"])
+        directories = {""}
+        for name in expected_names:
+            from Sprout.workspace.authorized_content import relative_label
+
+            relative_label(name)
+            directories.update(p.as_posix() for p in Path(name).parents if p != Path("."))
+
+        async def inventory():
+            seen = set()
+            for directory in sorted(directories):
+                if revalidate is not None:
+                    await revalidate()
+                async def selected(path):
+                    pin.check()
+                    relative = path.relative_to(root).as_posix()
+                    if relative not in expected_names | directories:
+                        raise PermissionError("verification_export_inventory_changed")
+                    return True
+                entries = await directory_entries(root, root / directory, 129, selected)
+                for entry in entries:
+                    name = entry.relative_path
+                    if entry.is_directory != (name in directories):
+                        raise PermissionError("verification_export_entry_type_changed")
+                    seen.add(name)
+            if seen != (expected_names | (directories - {""})):
+                raise PermissionError("verification_export_inventory_changed")
+            pin.check()
+
+        await inventory()
+        for name, entry in receipt["files"].items():
+            if revalidate is not None:
+                await revalidate()
+            from Sprout.workspace.authorized_content import relative_label
+
+            relative_label(name)
+            expected = ResourceIdentity(**entry["identity"])
+            result = file_operation(root, root / name, "snapshot", pin.check,
+                content=_ReadOptions(expected.size or 1, expected, Event(), pin.check))
+            result = checked_snapshot(result, expected.size, expected)
+            if not result.ok or result.digest != entry["digest"]:
+                raise PermissionError("verification_export_changed")
+        await inventory()
+        if revalidate is not None:
+            await revalidate()
+        pin.check()
+        return {name: entry["digest"] for name, entry in receipt["files"].items()}
+
+
 def private_resource(relative, root, overrides=None):
     denied = {ResourceKind.SECRET, ResourceKind.SENSITIVE, ResourceKind.DATA, ResourceKind.EXTERNAL}
     return (

@@ -376,6 +376,8 @@ class NodeExecutor:
                          await scope.runtime._issue_project_query_tool(paths=scope.known_paths)):
                 tools[tool.spec.name] = tool
             context = replace(context, tools=tools)
+        for tool in context.tools.values():
+            scope.runtime._node_tool_scopes[tool] = scope
         return await agent.run(message, context)
 
     async def _read(
@@ -664,6 +666,8 @@ class NodeExecutor:
             return {**measured, "isolated_design": True, "acceptance_spec": spec.to_payload(),
                     "acceptance_fingerprint": fingerprint, "baseline": measured.get("results", []),
                     "baseline_failed": measured.get("status") == "failed"}
+        if task.metadata.get("host_acceptance_v1") is not None:
+            return await self._host_test_design(node, workspace, task, sandbox)
         payload = previous.get("acceptance_spec")
         binding = None
         if self._local_acceptance:
@@ -730,13 +734,65 @@ class NodeExecutor:
         if binding is not None:
             output["local_executor"] = binding
             red = {"assertion_failed", "requirement_not_implemented",
-                   "target_module_not_implemented"}
+                   "target_module_not_implemented", "target_exception"}
             output["baseline_failed"] = any(item["category"] in red for item in baseline)
             output["local_baseline_valid"] = (not pending and all(
                 item["category"] in red | {"passed"} for item in baseline))
             if not pending and not output["local_baseline_valid"]:
                 output.update(self._acceptance_wait("local_baseline_invalid"))
         return output
+
+    async def _host_test_design(self, node, workspace, task, sandbox):
+        from Sprout.execution.host_acceptance import check_binding
+        from Sprout.tools.context_keys import _current_project_node
+
+        # This admits READ/SANDBOX/PLAN with fresh authority and real source
+        # receipts. A host specification cannot excuse an untracked model effect.
+        await self._check_model_publication(node, workspace, task)
+        frozen = task.metadata["host_acceptance_v1"]
+        spec = check_binding(task, workspace, frozen)
+        scope = _current_project_node()
+        receipts = {entry["path"]: entry for entry in scope.resource_receipts}
+        expected = {frozen["test_path"]: render_acceptance_tests(spec),
+                    frozen["demo_path"]: render_acceptance_demo(spec)}
+        for path, text in expected.items():
+            pinned = frozen["resources"][path]
+            latest = receipts.get(path)
+            if latest is None or any(latest[k] != pinned[k] for k in ("digest", "identity")):
+                raise PermissionError("host_acceptance_source_changed")
+            read = await self._file_broker.read_text(
+                sandbox, path, task_id=task.id, scope=task.delegation_scope, actor=task.actor)
+            if not read.wrote or read.content.replace("\r\n", "\n") != text:
+                raise PermissionError("host_acceptance_worktree_changed")
+        executor = local_executor_binding()
+        baseline = []
+        for case in spec.cases:
+            outcome = await self._local_acceptance_run(
+                workspace, task, sandbox.root, spec, frozen["test_path"], case.id, executor)
+            if outcome.allowed and outcome.exit_code is None and outcome.started is not False:
+                from Sprout.tools.result import ToolExecutionUnconfirmed
+
+                raise ToolExecutionUnconfirmed("Frozen pytest execution result unconfirmed")
+            if not outcome.allowed:
+                return {**self._acceptance_wait(outcome.error or "acceptance_execution_denied"),
+                        "waiting_kind": "approval" if outcome.approval_id else "resource",
+                        "pending_approvals": [outcome.approval_id] if outcome.approval_id else [],
+                        "baseline": baseline, "binding_sha256": frozen["sha256"]}
+            baseline.append({"case_id": case.id, "exit_code": outcome.exit_code,
+                "executed": True, "output": _clamp_test_output(
+                    outcome.stdout, outcome.stderr, outcome.error),
+                "category": local_acceptance_evidence(outcome, executor)})
+        valid = all(r["category"] in {
+            "passed", "assertion_failed", "requirement_not_implemented",
+            "target_module_not_implemented", "target_exception"} for r in baseline)
+        return {"acceptance_spec": spec.to_payload(), "test_path": frozen["test_path"],
+                "test_hash": sha256(render_acceptance_tests(spec).encode()).hexdigest(),
+                "demo_path": frozen["demo_path"],
+                "demo_hash": sha256(render_acceptance_demo(spec).encode()).hexdigest(),
+                "binding_sha256": frozen["sha256"], "local_executor": executor,
+                "baseline": baseline, "baseline_failed": any(r["exit_code"] == 1 for r in baseline),
+                "local_baseline_valid": valid, "waiting": False,
+                **(self._acceptance_wait("local_baseline_invalid") if not valid else {})}
 
     @staticmethod
     def _acceptance_wait(reason):
@@ -746,13 +802,48 @@ class NodeExecutor:
     async def _local_acceptance_run(self, workspace, task, cwd, spec, path, case_id, binding):
         if self._isolated_coding_required or not self._local_acceptance:
             raise RuntimeError("Local acceptance unavailable for this backend")
-        return await self._process_broker.run_local_acceptance(
-            workspace, spec, path, case_id, binding, cwd=cwd, task_id=task.id,
-            scope=task.delegation_scope, command_origin="manifest",
-            source=str(task.actor.source or "interactive"),
-            requested_by=task.actor.user_id or "system",
-            resource_scope=task.workspace_id,
-        )
+        contract = None
+        if task.metadata.get("host_acceptance_v1"):
+            from Sprout.execution.models import ProcessResult
+            from Sprout.tools.context_keys import _current_project_node
+
+            scope = _current_project_node()
+            try:
+                if scope is None:
+                    raise PermissionError("Frozen acceptance node unavailable")
+                contract = await scope.runtime._issue_frozen_execution(
+                    cwd, spec, path, case_id, binding)
+            except (OSError, ValueError) as exc:
+                return ProcessResult(command=(), allowed=False, started=False, error=str(exc))
+        for attempt in range(2):
+            execution = (scope.runtime._frozen_execution_record(contract, self._process_broker)
+                         if contract is not None else None)
+            outcome = await self._process_broker.run_local_acceptance(
+                workspace, spec, path, case_id, binding, cwd=cwd, task_id=task.id,
+                scope=task.delegation_scope, command_origin="manifest",
+                source=str(task.actor.source or "interactive"),
+                requested_by=task.actor.user_id or "system",
+                actor=task.actor,
+                resource_scope=task.workspace_id,
+                **({"execution_contract": contract, "session_id": scope.session_id}
+                   if contract is not None else {}),
+            )
+            if execution is None or not outcome.approval_id or attempt:
+                break
+            try:
+                await self._process_broker._wait_frozen_approval(execution, outcome.approval_id)
+                contract = await scope.runtime._issue_frozen_execution(
+                    cwd, spec, path, case_id, binding)
+                fresh = scope.runtime._frozen_execution_record(contract, self._process_broker)
+                fresh["approved_record"] = outcome.approval_id
+            except (OSError, ValueError) as exc:
+                return replace(outcome, error=str(exc), approval_id=None)
+        if (contract is not None and outcome.allowed and outcome.exit_code is None
+                and outcome.started is not False):
+            from Sprout.tools.result import ToolExecutionUnconfirmed
+
+            raise ToolExecutionUnconfirmed("Frozen pytest execution result unconfirmed")
+        return outcome
 
     async def _subtask(
         self, node: ExecutionNode, workspace: Workspace, task: Task
@@ -836,6 +927,10 @@ class NodeExecutor:
 
     def _model_access(self, task, sandbox, tools, resources):
         if not self._isolated_coding_required:
+            if task.execution_mode == "code":
+                # These legacy tools access the host without per-resource Broker checks.
+                tools = [tool for tool in tools if not isinstance(
+                    tool, (SandboxListTool, SandboxSearchTool, SandboxGitTool))]
             return tools, resources
         if sandbox is None:
             raise ValueError("Isolated model tools require a managed sandbox")
@@ -852,6 +947,12 @@ class NodeExecutor:
         provider = (IsolatedGitWorktreeSandbox if self._isolated_coding_required
                     else GitWorktreeSandbox)
         ref = await provider(workspace).create()
+        if not self._isolated_coding_required:
+            from Sprout.tools.context_keys import _current_project_node
+
+            scope = _current_project_node()
+            if scope is not None and scope.task.metadata.get("host_acceptance_v1"):
+                await scope.runtime._register_frozen_sandbox(ref)
         return {
             "id": ref.id,
             "kind": ref.kind,
@@ -869,6 +970,11 @@ class NodeExecutor:
         nothing about the diff waiting for approval. It now runs where the agent
         wrote. ``build_commands`` was carried in node metadata and never read.
         """
+        from Sprout.tools.context_keys import _current_project_node
+
+        scope = _current_project_node()
+        if scope is not None and task.id in scope.runtime._verification_hosts:
+            return await scope.runtime._evaluate_host_verification(node)
         nodes = await self._metadata.list_execution_nodes(task.id)
         sandbox_ref = self._sandbox_ref_from(self._output_for(nodes, NodeType.SANDBOX))
         cwd = sandbox_ref.root if sandbox_ref is not None else workspace.root

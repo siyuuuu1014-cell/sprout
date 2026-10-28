@@ -123,13 +123,6 @@ class ToolExecutor:
         from Sprout.tools.context_keys import _current_project_node
 
         scope = _current_project_node()
-        if scope is not None and not (
-            analysis_frame is not None
-            and scope.runtime._project_tool_ready(tool, arguments, analysis_frame)
-        ):
-            # Only Runtime-registered project consumers have captured footprints.
-            # All opaque effects remain non-reusable; names/metadata grant nothing.
-            scope.untracked_tool_use = True
         bound = getattr(tool, "invocation_context", None)
         if isinstance(bound, NodeToolInvocationContext):
             if not self.scoped_only:
@@ -140,13 +133,29 @@ class ToolExecutor:
         from Sprout.mcp.adapter.tool import MCPTool, _authorized_mcp_call, _classification
 
         is_mcp = isinstance(tool, MCPTool)
+        from Sprout.tools.context_keys import _PROJECT_NODE
+
+        generic_binding = not is_mcp and analysis_frame is None and (
+            _PROJECT_NODE.get() is not None or bool(getattr(tool, "_task_id", "")))
+        if generic_binding:
+            arguments = deepcopy(dict(arguments))
         if is_mcp:
             arguments = deepcopy(dict(arguments))
         decision = self.policy.decide_for_spec(tool.spec)
         subject = None
         binding_denied = False
         binding_rejected = False
-        if analysis_frame is not None and analysis_frame.node_scope is not None:
+        if generic_binding:
+            try:
+                if scope is None or not self.scoped_only:
+                    raise PermissionError("node_tool_binding_unavailable")
+                subject = await scope.runtime._node_tool_request(tool, arguments)
+                task_id, source = subject.task_id, scope.task.source
+                session_id, requested_by = scope.session_id, subject.actor.user_id
+                resource_scope = scope.workspace.id
+            except Exception:  # noqa: BLE001 - invalid node authority never falls back
+                binding_denied = True
+        elif analysis_frame is not None and analysis_frame.node_scope is not None:
             try:
                 if not self.scoped_only:
                     raise PermissionError("Strict node dispatch required")
@@ -217,12 +226,12 @@ class ToolExecutor:
                 matched_rules=(*boundary.matched_rules, *decision.matched_rules),
             )
 
-        if (is_mcp and binding_denied
+        if ((is_mcp or generic_binding) and binding_denied
                 and decision.decision in {AccessDecision.ALLOW, AccessDecision.REQUIRE_APPROVAL}):
             binding_rejected = True
             decision = replace(decision, decision=AccessDecision.DENY,
-                reason="mcp_task_binding_denied",
-                matched_rules=(*decision.matched_rules, "mcp:task-binding:denied"))
+                reason="mcp_task_binding_denied" if is_mcp else "node_tool_binding_denied",
+                matched_rules=(*decision.matched_rules, "binding:task:denied"))
 
         from Sprout.tools.system_tools import GitWriteTool, SkillScriptTool
 
@@ -386,8 +395,34 @@ class ToolExecutor:
                     tool, contextual, (task_id, session_id, source, requested_by, resource_scope),
                     mcp_binding,
                 )
+            if generic_binding:
+                from Sprout.tools.context_keys import _node_tool_call
+
+                fresh = await scope.runtime._node_tool_request(tool, arguments)
+                if replace(fresh, id=subject.id, created_at=subject.created_at) != subject:
+                    raise PermissionError("node_tool_authority_changed")
+                handoff = _node_tool_call(tool, subject, arguments)
+            previous_untracked = scope.untracked_tool_use if scope is not None else False
+            if scope is not None and not (
+                analysis_frame is not None
+                and scope.runtime._project_tool_ready(tool, arguments, analysis_frame)
+            ):
+                # Preserve the negative marker unless an exact admitted READ
+                # is proven below. Exceptions leave the marker set.
+                scope.untracked_tool_use = True
             with handoff:
                 result = await tool.invoke(contextual)
+            if generic_binding and scope.runtime._same_admitted_read(
+                    scope, tool, arguments, result):
+                scope.untracked_tool_use = previous_untracked
+            if generic_binding and self.audit is not None:
+                from hashlib import sha256
+
+                self.audit.record("tool.result", {
+                    "tool": name, "task_id": subject.task_id, "node_id": scope.node.id,
+                    "actor": subject.actor.user_id, "source": source, "ok": result.ok,
+                    "content_sha256": sha256(result.content.encode()).hexdigest(),
+                })
         except ToolExecutionUnconfirmed:
             await self._publish(TOOL_EXECUTED, {"tool": name, "ok": False,
                                                 "execution_unconfirmed": True})

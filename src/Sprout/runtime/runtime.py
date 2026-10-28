@@ -340,6 +340,13 @@ class Runtime:
         # and fresh resource capture before they may enter this local registry.
         self._node_products = {}
         self._node_publications = {}
+        self._node_tool_scopes = WeakKeyDictionary()
+        self._frozen_sandboxes = {}
+        self._frozen_executions = WeakKeyDictionary()
+        self._frozen_worktree_inputs = {}
+        self._verification_hosts = {}
+        self._verification_frames = WeakKeyDictionary()
+        self._verification_preparations = WeakKeyDictionary()
         self._original_user_turns = {}
         self._ordinary_assistant_turns = {}
         self._settings = settings
@@ -654,7 +661,15 @@ class Runtime:
         with _project_node_scope(self, task, workspace, node) as scope:
             try:
                 yield scope
+            except BaseException:
+                host = self._verification_hosts.get(task.id)
+                if host is not None:
+                    host.get("agent_candidates", {}).clear()
+                raise
             finally:
+                for key, preparation in tuple(self._verification_preparations.items()):
+                    if preparation["scope"] is scope:
+                        self._release_verification_preparation(key)
                 self._node_publications.pop(node.id, None)
                 for tool, issued in tuple(self._project_analysis_tools.items()):
                     if issued is scope:
@@ -709,6 +724,798 @@ class Runtime:
                 raise PermissionError("Project analysis session identity unavailable")
         return task, workspace
 
+    async def _register_frozen_sandbox(self, sandbox):
+        from Sprout.execution.host_acceptance import pin_execution_directory
+        from Sprout.tools.context_keys import _current_project_node
+
+        scope = _current_project_node()
+        task, workspace = await self._project_analysis_subject(scope)
+        if (scope.node.type is not NodeType.SANDBOX or sandbox.kind != "git_worktree"
+                or sandbox.root == workspace.root or task.id in self._frozen_sandboxes):
+            raise PermissionError("frozen_sandbox_registration_denied")
+        with pin_execution_directory(sandbox.root) as pin:
+            self._frozen_sandboxes[task.id] = (
+                sandbox, scope.node.id, scope.guard_owner, pin.identity)
+        if task.id in self._verification_hosts:
+            await self._freeze_verification_oracles(scope)
+
+    async def bind_task_verification(self, task_id, principal, *, paths, export_parent,
+                                     images, source_digests, discovery=None, tools=None,
+                                     docker=None):
+        """Explicit Python Host only. No metadata/JSON/CLI deserialization of grants."""
+        if getattr(self, "_verification_stopping", False):
+            raise PermissionError("verification_runtime_stopping")
+        from copy import deepcopy
+
+        from Sprout.execution.docker_verification import safe_path, validate_image
+        from Sprout.execution.host_acceptance import check_binding
+        from Sprout.workspace.authorized_content import relative_label
+
+        task = await self._metadata_or_raise().get_task(task_id)
+        if (task is None or task.status is not TaskStatus.CREATED or task.actor != principal
+                or principal.authenticated is not True or task.source != principal.source
+                or not principal.user_id or not principal.source
+                or task.execution_mode != "code" or task.id in self._verification_hosts
+                or await self._metadata_or_raise().list_execution_nodes(task.id)):
+            raise PermissionError("verification_host_binding_denied")
+        workspace = await self._metadata_or_raise().get_workspace(task.workspace_id)
+        if (workspace is None or not task.delegation_scope.allowed_paths
+                or not task.delegation_scope.allowed_actions):
+            raise PermissionError("verification_host_workspace_or_scope_unavailable")
+        check_binding(task, workspace, task.metadata.get("host_acceptance_v1"))
+        if type(paths) is not tuple or not paths or len(paths) > 64:
+            raise ValueError("verification_host_paths")
+        for path in paths:
+            relative_label(path)
+            if not task.delegation_scope.bind_paths(str(workspace.root)).permits(
+                    "file.read", str(workspace.root / path)):
+                raise PermissionError("verification_host_scope_denied")
+        if (len(set(p.casefold() for p in paths)) != len(paths)
+                or not set(task.metadata["host_acceptance_v1"]["resources"]) <= set(paths)):
+            raise ValueError("verification_host_paths")
+        import re
+
+        if (type(source_digests) is not dict or set(source_digests) != set(paths)
+                or any(type(v) is not str or not re.fullmatch(r"[0-9a-f]{64}", v)
+                       for v in source_digests.values())):
+            raise ValueError("verification_host_source_digests")
+        if type(images) is not dict or set(images) != {"verification", "coding"}:
+            raise ValueError("verification_host_images")
+        for image in images.values():
+            validate_image(image)
+        parent = safe_path(Path(export_parent))
+        if (not parent.is_dir() or parent.is_relative_to(workspace.root.resolve())
+                or workspace.root.resolve().is_relative_to(parent)):
+            raise ValueError("verification_export_parent")
+        from Sprout.execution.host_acceptance import pin_execution_directory
+
+        with pin_execution_directory(parent) as parent_pin:
+            parent_identity = parent_pin.identity
+        self._verification_hosts[task.id] = {
+            "task": deepcopy(task), "workspace": deepcopy(workspace), "paths": paths,
+            "parent": parent, "images": deepcopy(images), "discovery": deepcopy(discovery),
+            "tools": deepcopy(tools or {}), "oracles": None,
+            "source_digests": deepcopy(source_digests),
+            "parent_identity": parent_identity,
+            "docker": deepcopy(docker),
+        }
+
+    def _verification_export_boundary(self, host, workspace, sandbox):
+        """Host-selected output is not permission to write into live resources."""
+        from Sprout.execution.docker_verification import safe_path
+        from Sprout.execution.host_acceptance import pin_execution_directory
+
+        parent = safe_path(host["parent"])
+        protected = [workspace.root, sandbox.root, self._trajectory_dir]
+        from dataclasses import fields
+
+        from Sprout.storage.local.sqlite.driver import SqliteDatabase
+
+        for field in fields(self.storage):
+            db = getattr(getattr(self.storage, field.name), "_db", None)
+            if isinstance(db, SqliteDatabase) and not db._memory:
+                if not db._registry_key:
+                    raise PermissionError("verification_storage_location_unproved")
+                protected.append(Path(db._registry_key).parent)
+        if self._settings is not None:
+            from Sprout.storage.bundle import _parse_dsn
+
+            settings = self._settings.storage
+            for field in fields(settings):
+                value = getattr(settings, field.name)
+                if isinstance(value, str) and value.startswith("sqlite:///"):
+                    _, path = _parse_dsn(value)
+                    if path and path != ":memory:":
+                        protected.append(Path(path).parent)
+            protected.extend((Path(settings.blobs_dir), Path(settings.trajectory_dir)))
+        for root in protected:
+            root = Path(root).resolve()
+            if parent.is_relative_to(root) or root.is_relative_to(parent):
+                raise PermissionError("verification_export_protected_overlap")
+        with pin_execution_directory(parent) as pin:
+            if pin.identity != host.get("parent_identity"):
+                raise PermissionError("verification_export_parent_changed")
+        return parent
+
+    async def _verification_snapshot_request(self, frame, sandbox, path):
+        from Sprout.execution.verification_manifest import current_frame
+        from Sprout.security.access import ActionRequest, ActionType
+        from Sprout.workspace.models import ResourceRef
+
+        if (getattr(self, "_verification_stopping", False)
+                or current_frame() is not frame or frame.issuer is not self):
+            raise PermissionError("verification_frame_mismatch")
+        record = self._verification_frames[frame]
+        task, workspace = await self._project_analysis_subject(frame.scope)
+        registered = self._frozen_sandboxes.get(task.id)
+        if (task != record["task"] or workspace != record["workspace"]
+                or registered is None or registered[0] is not sandbox
+                or sandbox is not frame.sandbox or record["pin"].identity != registered[3]):
+            raise PermissionError("verification_subject_changed")
+        if frame.scope.node.type is NodeType.EVALUATION:
+            from Sprout.execution.node_result_source import payload_digest
+
+            node = await self._metadata_or_raise().get_execution_node(registered[1])
+            source = await self._metadata_or_raise().get_node_result_source(registered[1])
+            if (node is None or source is None or node.status is not NodeStatus.COMPLETED
+                    or node.task_id != task.id or source.owner != registered[2]
+                    or node.metadata.get("execution_guard", {}).get("owner") != registered[2]
+                    or node.metadata.get("execution_guard", {}).get("state") != "completed"
+                    or source.subject_digest != self._node_subject_digest(frame.scope)
+                    or source.output_digest != payload_digest(node.metadata.get("output"))
+                    or node.metadata.get("output", {}).get("root") != str(sandbox.root)
+                    or node.metadata.get("output", {}).get("id") != sandbox.id):
+                raise PermissionError("verification_sandbox_provenance_denied")
+        target = self._file_broker._safe_target(sandbox, path)
+        if target is None:
+            raise PermissionError("verification_path_denied")
+        relative = target.relative_to(sandbox.root).as_posix()
+        if relative not in record["paths"]:
+            raise PermissionError("verification_path_unselected")
+        record["pin"].check()
+        record["pin"].pin_file(relative)
+        scope = task.delegation_scope.bind_paths(str(sandbox.root))
+        return ActionRequest(task_id=task.id, actor=task.actor, action=ActionType.FILE_READ,
+            scope=scope, resource=ResourceRef(sandbox.id, target.as_posix(),
+                kind=self._file_broker._classify(target, sandbox)))
+
+    async def _capture_verification_view(self, scope, paths, *, exporting=False, expected=None,
+                                         export_paths=None):
+        if getattr(self, "_verification_stopping", False):
+            raise PermissionError("verification_runtime_stopping")
+        import asyncio
+        import time
+        from uuid import uuid4
+
+        from Sprout.execution.host_acceptance import check_binding, pin_execution_directory
+        from Sprout.execution.verification_manifest import _FRAME, _VerificationFrame
+        from Sprout.workspace.authorized_content import AuthorizedContentView, AuthorizedEntry
+
+        host = self._verification_hosts.get(scope.task.id)
+        task, workspace = await self._project_analysis_subject(scope)
+        if (scope.node.type not in {NodeType.SANDBOX, NodeType.EVALUATION}
+                or host is None or task.actor != host["task"].actor
+                or task.source != host["task"].source
+                or task.delegation_scope != host["task"].delegation_scope
+                or workspace != host["workspace"] or not set(paths) <= set(host["paths"])):
+            raise PermissionError("verification_host_changed")
+        check_binding(task, workspace, task.metadata.get("host_acceptance_v1"))
+        sandbox = self._frozen_sandboxes[task.id][0]
+        self._verification_export_boundary(host, workspace, sandbox)
+        with pin_execution_directory(sandbox.root) as pin:
+            frame = _VerificationFrame(self, scope, sandbox, asyncio.current_task(),
+                                       time.monotonic() + 60)
+            record = {"task": task, "workspace": workspace, "paths": paths, "pin": pin,
+                      "view": None, "parent": host["parent"],
+                      "parent_identity": host["parent_identity"],
+                      "destination": host["parent"] / ("verification-" + uuid4().hex)
+                                     / "coding-input"}
+            self._verification_frames[frame] = record
+            token = _FRAME.set(frame)
+            view = None
+            try:
+                entries = []
+                for path in paths:
+                    result = await self._file_broker.read_worktree_snapshot(sandbox, path)
+                    if not result.ok:
+                        raise PermissionError(result.reason)
+                    if sum(len(e.data) for e in entries) + len(result.data) > 1_000_000:
+                        raise PermissionError("verification_capture_budget")
+                    entries.append(AuthorizedEntry(path, self._file_broker._classify(
+                        sandbox.root / path, sandbox), result.data, result.digest, result.identity))
+                view = AuthorizedContentView(
+                    workspace.id, tuple(entries), revision=workspace.revision)
+                if expected is not None and tuple(entries) != expected:
+                    raise PermissionError("verification_capture_changed")
+                for path in paths:
+                    await self._verification_snapshot_request(
+                        frame, sandbox, str(sandbox.root / path))
+                record["view"] = view
+                if exporting:
+                    from Sprout.execution.verification_export import export_authorized_view
+
+                    if export_paths is not None:
+                        if not export_paths or not set(export_paths) <= set(paths):
+                            raise PermissionError("verification_export_selection_denied")
+                        view.invalidate()
+                        view = AuthorizedContentView(workspace.id, tuple(
+                            entry for entry in entries if entry.relative_path in export_paths),
+                            revision=workspace.revision)
+                        record["view"] = view
+                    # Consumers may prepare only. They cannot serialize this frame as authority.
+                    self._verification_export_boundary(host, workspace, sandbox)
+                    receipt = export_authorized_view(
+                        view, record["destination"], receipt=frame)
+                    record["export"] = receipt
+                for path in paths:
+                    await self._verification_snapshot_request(
+                        frame, sandbox, str(sandbox.root / path))
+                self._verification_export_boundary(host, workspace, sandbox)
+                yield_data = (tuple(entries), dict(record), pin.identity)
+                # No frame escapes the synchronous consumer/lifecycle below.
+                return yield_data
+            finally:
+                if view is not None:
+                    view.invalidate()
+                frame.active = False
+                self._verification_frames.pop(frame, None)
+                _FRAME.reset(token)
+
+    async def _freeze_verification_oracles(self, scope):
+        host = self._verification_hosts.get(scope.task.id)
+        if host is not None:
+            from dataclasses import asdict
+
+            if scope.node.type is not NodeType.SANDBOX or host["oracles"] is not None:
+                raise PermissionError("verification_oracle_freeze_denied")
+            config = host["discovery"].get("config_files", ()) if host["discovery"] else ()
+            paths = tuple(dict.fromkeys((*scope.task.metadata["host_acceptance_v1"]["resources"],
+                                         *config)))
+            entries, _, _ = await self._capture_verification_view(scope, paths)
+            host["oracles"] = {e.relative_path: {"digest": e.digest, "identity": asdict(e.identity)}
+                               for e in entries}
+
+    async def _evaluate_host_verification(self, node):
+        """Prepare a new opt-in ordinary CODE evaluation. P1 cannot launch Docker."""
+        if getattr(self, "_verification_stopping", False):
+            raise PermissionError("verification_runtime_stopping")
+        import difflib
+        from copy import deepcopy
+        from dataclasses import asdict
+
+        from Sprout.execution.acceptance import render_acceptance_demo, render_acceptance_tests
+        from Sprout.execution.models import TestResult
+        from Sprout.execution.node_result_source import payload_digest
+        from Sprout.execution.verification import build_verification_report
+        from Sprout.execution.verification_manifest import VerificationManifestV1, digest
+        from Sprout.tools.context_keys import _current_project_node, _project_analysis_call
+
+        scope = _current_project_node()
+        if scope is None or scope.node.id != node.id or node.type is not NodeType.EVALUATION:
+            raise PermissionError("verification_evaluation_frame_denied")
+        task, workspace = await self._project_analysis_subject(scope)
+        node = await self._metadata_or_raise().get_execution_node(node.id)
+        host = self._verification_hosts[task.id]
+        if host["oracles"] is None:
+            raise PermissionError("verification_oracle_origin_unavailable")
+        agents = []
+        parent_links = {}
+        for dependency in node.dependencies:
+            parent = await self._metadata_or_raise().get_execution_node(dependency)
+            source = await self._metadata_or_raise().get_node_result_source(dependency)
+            if (parent is None or parent.task_id != task.id
+                    or parent.status is not NodeStatus.COMPLETED
+                    or parent.metadata.get("execution_guard", {}).get("state") != "completed"):
+                raise PermissionError("verification_upstream_origin_denied")
+            if source is None and parent.type is NodeType.AGENT:
+                await self._accept_verification_agent_completion(scope, parent)
+            elif (source is None or source.task_id != task.id or source.node_id != parent.id
+                    or source.node_type != parent.type.value
+                    or source.owner != parent.metadata["execution_guard"].get("owner")
+                    or source.subject_digest != self._node_subject_digest(scope)
+                    or source.output_digest != payload_digest(parent.metadata.get("output"))):
+                raise PermissionError("verification_upstream_origin_denied")
+            if parent.type is NodeType.AGENT:
+                agents.append(parent)
+            parent_links[parent.id] = {
+                "owner": parent.metadata["execution_guard"]["owner"],
+                "output": payload_digest(parent.metadata.get("output"))}
+        if not agents:
+            raise PermissionError("verification_agent_origin_unavailable")
+        paths = host["paths"]
+        # Original and modified byte/identity domains remain distinct.
+        tool = await self._issue_project_analysis_tool(paths=paths)
+        with _project_analysis_call(tool):
+            selection = await self._issue_project_analysis_selection(paths)
+            original = await self._capture_project_selection(selection,
+                content_project=lambda analysis, view: tuple(view.entries))
+        entries, record, root_identity = await self._capture_verification_view(scope, paths)
+        frozen = task.metadata["host_acceptance_v1"]
+        for entry in entries:
+            if entry.relative_path in host["oracles"]:
+                if {"digest": entry.digest, "identity": asdict(entry.identity)} != host["oracles"][
+                        entry.relative_path]:
+                    raise PermissionError("verification_frozen_worktree_changed")
+        for entry in original:
+            if entry.digest != host["source_digests"][entry.relative_path]:
+                raise PermissionError("verification_original_input_changed")
+            if entry.relative_path in frozen["resources"] and {
+                    "digest": entry.digest, "identity": asdict(entry.identity)
+                    } != frozen["resources"][entry.relative_path]:
+                raise PermissionError("verification_frozen_original_changed")
+        from Sprout.strategy.acceptance import AcceptanceSpec
+
+        spec = AcceptanceSpec.from_payload(frozen["spec"])
+        expected_texts = {frozen["test_path"]: render_acceptance_tests(spec),
+                          frozen["demo_path"]: render_acceptance_demo(spec)}
+        for entry in entries:
+            if (entry.relative_path in expected_texts and entry.text().replace("\r\n", "\n")
+                    != expected_texts[entry.relative_path]):
+                raise PermissionError("verification_frozen_spec_changed")
+        before = {entry.relative_path: entry for entry in original}
+        changed = [e.relative_path for e in entries if e.data != before[e.relative_path].data]
+        patch = "".join("".join(difflib.unified_diff(
+            before[e.relative_path].text().splitlines(True), e.text().splitlines(True),
+            fromfile="before/" + e.relative_path, tofile="after/" + e.relative_path))
+            for e in entries)
+        from Sprout.execution.verification_manifest import ordinary_obligations
+
+        obligations = ordinary_obligations(host, node, spec, frozen, changed)
+        requirements = {"paths": paths, "images": host["images"], "tools": host["tools"],
+                        "docker": host.get("docker"),
+                        "discovery": host["discovery"], "frozen": frozen["sha256"],
+                        "source_digests": host["source_digests"],
+                        "declarations": {k: node.metadata.get(k) for k in
+                            ("test_commands", "build_commands", "verification_commands")}}
+        _, exported, _ = await self._capture_verification_view(
+            scope, paths, exporting=True, expected=entries)
+        python_changes = tuple(path for path in changed if path.endswith(".py"))
+        if python_changes:
+            _, disposable, _ = await self._capture_verification_view(
+                scope, paths, exporting=True, expected=entries, export_paths=python_changes)
+            exported["export"]["compileall"] = disposable["export"]
+        manifest = VerificationManifestV1.from_payload({
+            "version": 1, "task": task.id, "workspace": workspace.id, "node": node.id,
+            "owner": scope.guard_owner, "principal": asdict(task.actor), "source": task.source,
+            "scope": json.loads(json.dumps(asdict(task.delegation_scope), default=lambda v:
+                sorted(v) if isinstance(v, (set, frozenset)) else v.isoformat())),
+            "sandbox": {"id": self._frozen_sandboxes[task.id][0].id,
+                        "kind": self._frozen_sandboxes[task.id][0].kind,
+                        "root": str(record["pin"].root),
+                        "worktree_ref": self._frozen_sandboxes[task.id][0].worktree_ref},
+            "worktree_identity": root_identity, "acceptance": frozen,
+            "diff": digest({"patch": patch, "inputs": [e.digest for e in entries]}),
+            "inputs": {e.relative_path: {"digest": e.digest, "identity": asdict(e.identity),
+                "size": len(e.data), "kind": e.kind.value} for e in entries},
+            "obligations": obligations, "budgets": {"max_seconds": 60, "max_output": 65536,
+                "cpus": 1, "memory": "512m", "pids": 64},
+            "approval": {"task": task.id, "requester": task.actor.user_id,
+                         "source": task.source, "session": scope.session_id},
+            "host_requirements": digest(requirements), "export": exported["export"]})
+        # This private, current-frame check cannot be supplied by model JSON.
+        import asyncio
+        import time
+
+        self._verification_preparations[manifest] = {
+            "owner": asyncio.current_task(), "scope": scope, "task": task,
+            "workspace": workspace, "entries": entries, "export": exported["export"],
+            "expires": time.monotonic() + 60,
+            "manifest_sha": manifest.sha256, "plans": {},
+            "node_metadata": deepcopy(node.metadata), "node_budget": node.budget,
+            "parents": parent_links,
+            "host_execution_sha": digest({k: host.get(k) for k in
+                ("docker", "images", "tools", "discovery")}),
+        }
+        try:
+            prepared = await self._process_broker.prepare_verification(
+                manifest, self, scope, exported["export"])
+            executed = {}
+            if host.get("docker") is not None:
+                for item in obligations:
+                    await self._verification_preparation_record(
+                        manifest, self._process_broker, scope,
+                        exported["export"], allow_expired=True)
+                    key = VerificationManifestV1.from_payload(manifest.to_payload())
+                    self._verification_preparations[key] = {
+                        **self._verification_preparations[manifest],
+                        "expires": time.monotonic() + 60,
+                        "plans": deepcopy(self._verification_preparations[manifest]["plans"])}
+                    try:
+                        result = await self._process_broker.execute_verification_obligation(
+                            key, self, scope, exported["export"], item["id"], wait=True)
+                        executed[item["id"]] = result
+                    finally:
+                        self._release_verification_preparation(key)
+                    if executed[item["id"]].get("outcome") == "UNKNOWN":
+                        break  # No further effects while an earlier container is unconfirmed.
+                await self._verification_preparation_record(manifest, self._process_broker, scope,
+                    exported["export"], allow_expired=True)
+        finally:
+            self._release_verification_preparation(manifest)
+        rows = []
+        tests = []
+        for item in obligations:
+            state = prepared[item["id"]]
+            actual = executed.get(item["id"], {})
+            name = item["name"]
+            rows.append({"kind": item["id"], "name": name, "command": item["argv"],
+                "cwd": item["cwd"], "outcome": actual.get("outcome", state["outcome"]),
+                "passed": actual.get("passed", False), "executed": actual.get("executed", False),
+                "allowed": actual.get("executed", False), "exit_code": actual.get("exit_code"),
+                "error": actual.get("reason", "" if actual.get("executed") else state["reason"]),
+                "execution": actual,
+                "preparation": state.get("prepared")})
+            tests.append(TestResult(name, actual.get("passed", False),
+                executed=actual.get("executed", False),
+                output=(actual.get("stdout", "") + actual.get("stderr", "")
+                        if actual.get("executed") else state["reason"])))
+        output = {"status": "unverified", "waiting": True, "waiting_kind": "configuration",
+            "reason": "verification_native_commissioning_required", "verified": False,
+            "manifest": manifest.to_payload(), "manifest_sha256": manifest.sha256,
+            "export": exported["export"], "results": rows,
+            "test_results": [asdict(t) for t in tests], "acceptance_spec": frozen["spec"],
+            "demo_path": frozen["demo_path"], "code_diff": patch}
+        output["original_declarations"] = requirements["declarations"]
+        output["verification_report"] = build_verification_report(tests, output).to_payload()
+        if executed:
+            # Status must be derived from every required row, never preparation.
+            complete = (all(t.executed and t.passed for t in tests)
+                        and all(row["outcome"] == "passed" for row in rows))
+            output["status"] = "passed" if complete else "unverified"
+            output["verification_report"] = build_verification_report(tests, output).to_payload()
+            output["verified"] = output["verification_report"]["verified"]
+            output["waiting"] = not output["verified"]
+            output["waiting_kind"] = "" if output["verified"] else "verification"
+            output["reason"] = "" if output["verified"] else "verification_result_unconfirmed"
+        return output
+
+    @staticmethod
+    def _verification_custody_busy(record):
+        native = record.get("native", {})
+        helper = native.get("cleanup_task")
+        return (native.get("manual_intervention_required", False)
+            or any(not task.done() for task in native.get("pending_operations", ()))
+            or any(p.returncode is None for p in native.get("cli_processes", {}).values())
+            or helper is not None and not helper.done())
+
+    def _release_verification_preparation(self, manifest):
+        record = self._verification_preparations.get(manifest)
+        if record is not None and not self._verification_custody_busy(record):
+            self._verification_preparations.pop(manifest, None)
+
+    async def _verification_preparation_record(self, manifest, broker, scope, exported,
+                                               *, allow_expired=False):
+        import asyncio
+        import time
+
+        record = self._verification_preparations.get(manifest)
+        if (record is None or record["owner"] is not asyncio.current_task()
+                or getattr(self, "_verification_stopping", False)
+                or broker is not self._process_broker or record["scope"] is not scope
+                or record["export"] != exported or record["manifest_sha"] != manifest.sha256
+                or (not allow_expired and time.monotonic() >= record["expires"])):
+            raise PermissionError("verification_preparation_unavailable")
+        task, workspace = await self._project_analysis_subject(scope)
+        if task != record["task"] or workspace != record["workspace"]:
+            raise PermissionError("verification_preparation_authority_changed")
+        from Sprout.execution.verification_manifest import digest
+
+        if digest(record["export"]) != digest(manifest.to_payload()["export"]):
+            raise PermissionError("verification_export_manifest_changed")
+        host_identity = {k: self._verification_hosts[task.id].get(k)
+                         for k in ("docker", "images", "tools", "discovery")}
+        if record["host_execution_sha"] != digest(host_identity):
+            raise PermissionError("verification_host_execution_changed")
+        node = await self._metadata_or_raise().get_execution_node(scope.node.id)
+        if node.metadata != record["node_metadata"] or node.budget != record["node_budget"]:
+            raise PermissionError("verification_node_plan_changed")
+        from Sprout.execution.node_result_source import payload_digest
+
+        for parent_id, expected in record["parents"].items():
+            parent = await self._metadata_or_raise().get_execution_node(parent_id)
+            if (parent is None or parent.task_id != task.id
+                    or parent.status is not NodeStatus.COMPLETED
+                    or parent.metadata.get("execution_guard", {}).get("state") != "completed"
+                    or parent.metadata["execution_guard"].get("owner") != expected["owner"]
+                    or payload_digest(parent.metadata.get("output")) != expected["output"]):
+                raise PermissionError("verification_parent_changed")
+        await self._capture_verification_view(scope, self._verification_hosts[task.id]["paths"],
+                                              expected=record["entries"])
+        from Sprout.execution.verification_export import check_export_receipt
+
+        async def fresh():
+            from Sprout.security.access import AccessDecision, ActionRequest, ActionType
+            from Sprout.workspace.models import ResourceRef
+
+            current_task, current_workspace = await self._project_analysis_subject(scope)
+            if (current_task != record["task"] or current_workspace != record["workspace"]
+                    or current_task.delegation_scope.is_expired()
+                    or (not allow_expired and time.monotonic() >= record["expires"])):
+                raise PermissionError("verification_export_authority_changed")
+            self._verification_export_boundary(self._verification_hosts[task.id], workspace,
+                                               self._frozen_sandboxes[task.id][0])
+            sandbox = self._frozen_sandboxes[task.id][0]
+            bound = current_task.delegation_scope.bind_paths(str(sandbox.root))
+            for entry in record["entries"]:
+                target = sandbox.root / entry.relative_path
+                request = ActionRequest(task_id=task.id, actor=current_task.actor,
+                    action=ActionType.FILE_READ, scope=bound,
+                    resource=ResourceRef(sandbox.id, target.as_posix(),
+                        kind=self._file_broker._classify(target, sandbox)))
+                if (not bound.permits("file.read", target.as_posix())
+                        or self._file_broker._policy.decide(request).decision
+                        is not AccessDecision.ALLOW):
+                    raise PermissionError("verification_export_authorization_denied")
+
+        record["inventories"] = {record["export"]["root"]:
+            await check_export_receipt(record["export"], revalidate=fresh)}
+        if record["export"].get("compileall"):
+            copy = record["export"]["compileall"]
+            record["inventories"][copy["root"]] = await check_export_receipt(
+                copy, revalidate=fresh)
+        from Sprout.execution.verification_run import DockerVerificationRun
+
+        for plan in record["plans"].values():
+            DockerVerificationRun.check_preparation(plan)
+        return record
+
+    async def _accept_verification_agent_completion(self, scope, node):
+        from Sprout.execution.node_result_source import payload_digest
+        from Sprout.execution.verification_manifest import _AgentCompletionCandidate, scope_digest
+
+        host = self._verification_hosts.get(scope.task.id)
+        candidates = host.get("agent_candidates", {}) if host else {}
+        candidate = candidates.get(node.id)
+        try:
+            task, _ = await self._project_analysis_subject(scope)
+            current = await self._metadata_or_raise().get_execution_node(node.id)
+            guard = current.metadata.get("execution_guard", {}) if current else {}
+            if (type(candidate) is not _AgentCompletionCandidate or candidate.issuer is not self
+                    or candidate.scope.runtime is not self or candidate.scope.active
+                    or candidate.scope.task.id != task.id or current is None
+                    or current.task_id != task.id or current.id != candidate.scope.node.id
+                    or current.type is not NodeType.AGENT
+                    or current.status is not NodeStatus.COMPLETED
+                    or task.delegation_scope.is_expired()
+                    or guard.get("state") != "completed" or guard.get("owner") != candidate.owner
+                    or candidate.subject_digest != self._node_subject_digest(scope)
+                    or candidate.scope_digest != scope_digest(task.delegation_scope)
+                    or candidate.output_digest != payload_digest(current.metadata.get("output"))):
+                raise PermissionError("verification_agent_completion_unavailable")
+        except BaseException:
+            candidates.pop(node.id, None)
+            raise
+        # Returning a boolean here confers neither file visibility nor execution.
+        return True
+
+    async def _issue_frozen_execution(self, cwd, spec, path, case_id, executor):
+        import time
+        from copy import deepcopy
+
+        from Sprout.execution.host_acceptance import _FrozenExecutionContract, check_binding
+        from Sprout.execution.node_result_source import payload_digest
+        from Sprout.tools.context_keys import _current_project_node
+
+        scope = _current_project_node()
+        if scope is None or scope.runtime is not self:
+            raise PermissionError("frozen_execution_subject_unavailable")
+        task, workspace = await self._project_analysis_subject(scope)
+        frozen = task.metadata.get("host_acceptance_v1")
+        if task.delegation_scope != scope.task.delegation_scope:
+            raise PermissionError("frozen_execution_scope_changed")
+        expected = check_binding(task, workspace, frozen)
+        registered = self._frozen_sandboxes.get(task.id)
+        if (registered is None or Path(cwd) != registered[0].root
+                or spec.to_payload() != expected.to_payload() or path != frozen["test_path"]
+                or case_id not in {case.id for case in expected.cases}
+                or scope.node.type not in {NodeType.TEST_DESIGN, NodeType.EVALUATION}):
+            raise PermissionError("frozen_execution_target_unavailable")
+        sandbox_node = await self._metadata_or_raise().get_execution_node(registered[1])
+        source = await self._metadata_or_raise().get_node_result_source(registered[1])
+        if (sandbox_node is None or source is None
+                or sandbox_node.status is not NodeStatus.COMPLETED
+                or source.owner != registered[2] or source.task_id != task.id
+                or source.subject_digest != self._node_subject_digest(scope)
+                or source.output_digest != payload_digest(sandbox_node.metadata.get("output"))
+                or sandbox_node.metadata.get("execution_guard", {}).get("owner") != registered[2]
+                or sandbox_node.metadata.get("execution_guard", {}).get("state") != "completed"
+                or sandbox_node.metadata.get("output") != {
+                    "id": registered[0].id, "kind": registered[0].kind,
+                    "root": str(registered[0].root), "worktree_ref": registered[0].worktree_ref}):
+            raise PermissionError("frozen_sandbox_origin_unavailable")
+        permit = _FrozenExecutionContract(self)
+        self._frozen_executions[permit] = {
+            "scope": scope, "owner": asyncio.current_task(), "task": deepcopy(task),
+            "workspace": workspace, "sandbox": registered[0], "root_identity": registered[3],
+            "spec": expected, "path": path, "case_id": case_id, "executor": deepcopy(executor),
+            "expires": time.monotonic() + 60, "used": False, "inputs": None,
+        }
+        return permit
+
+    def _frozen_execution_record(self, permit, broker, *, claim=False):
+        import time
+
+        from Sprout.execution.host_acceptance import _FrozenExecutionContract
+        from Sprout.tools.context_keys import _current_project_node
+
+        record = (self._frozen_executions.get(permit)
+                  if type(permit) is _FrozenExecutionContract else None)
+        if (record is None or permit.issuer is not self or self._process_broker is not broker
+                or record["scope"] is not _current_project_node()
+                or record["owner"] is not asyncio.current_task()
+                or time.monotonic() >= record["expires"] or (claim and record["used"])):
+            raise PermissionError("frozen_execution_contract_unavailable")
+        if claim:
+            record["used"] = True
+        return record
+
+    async def _refresh_frozen_execution(self, permit, broker, pin):
+        from dataclasses import asdict
+        from hashlib import sha256
+
+        from Sprout.execution.acceptance import render_acceptance_demo, render_acceptance_tests
+        from Sprout.execution.host_acceptance import check_binding, check_module_dependencies
+        from Sprout.execution.node_result_source import payload_digest
+        from Sprout.security.access import AccessDecision, ActionRequest, ActionType
+        from Sprout.tools.context_keys import _project_analysis_call
+        from Sprout.workspace.models import ResourceRef
+
+        record = self._frozen_execution_record(permit, broker)
+        task, workspace = await self._project_analysis_subject(record["scope"])
+        if (task != record["task"] or workspace != record["workspace"]
+                or pin.identity != record["root_identity"]
+                or self._frozen_sandboxes.get(task.id, (None,))[0] is not record["sandbox"]):
+            raise PermissionError("frozen_execution_authority_changed")
+        frozen = task.metadata["host_acceptance_v1"]
+        spec = check_binding(task, workspace, frozen)
+        paths = task.metadata.get("required_paths")
+        if (type(paths) not in {list, tuple} or not paths or len(paths) > 64
+                or any(type(path) is not str for path in paths)):
+            raise PermissionError("frozen_execution_inputs_unavailable")
+        effective = task.delegation_scope.bind_paths(str(pin.root))
+        inputs, contents, total = {}, {}, 0
+        for path in paths:
+            target = self._file_broker._safe_target(record["sandbox"], path)
+            if target is None:
+                raise PermissionError("frozen_input_boundary_denied")
+            request = ActionRequest(task_id=task.id, actor=task.actor, action=ActionType.FILE_READ,
+                scope=effective, resource=ResourceRef(workspace.id, target.as_posix(),
+                    kind=self._file_broker._classify(target, record["sandbox"])))
+            decision = self._policy_engine.decide(request)
+            await self._record_project_capture_policy(request, decision)
+            if (decision.decision is not AccessDecision.ALLOW
+                    or not effective.permits("file.read", target.as_posix())):
+                raise PermissionError("frozen_input_authorization_denied")
+            identity = pin.pin_file(path)
+            if identity.size > 100_000:
+                raise PermissionError("frozen_input_budget_exceeded")
+            read = await self._file_broker.read_text(record["sandbox"], path,
+                task_id=task.id, scope=task.delegation_scope, actor=task.actor)
+            if not read.wrote:
+                raise PermissionError("frozen_input_read_denied")
+            contents[path] = read.content
+            total += len(read.content.encode())
+            if total > 1_000_000:
+                raise PermissionError("frozen_input_budget_exceeded")
+            inputs[path] = {"digest": sha256(read.content.encode()).hexdigest(),
+                            "identity": asdict(identity)}
+            pin.check()
+        check_module_dependencies(spec, contents)
+        expected = {frozen["test_path"]: render_acceptance_tests(spec),
+                    frozen["demo_path"]: render_acceptance_demo(spec)}
+        for path, content in expected.items():
+            if path not in inputs or contents[path].replace("\r\n", "\n") != content:
+                raise PermissionError("frozen_execution_content_changed")
+        # Same handle-bound Snapshot identity convention as the original binding,
+        # not Windows pathname stat (whose ctime can mean a different OS field).
+        tool = await self._issue_project_analysis_tool(paths=tuple(expected))
+        with _project_analysis_call(tool):
+            selection = await self._issue_project_analysis_selection(tuple(expected))
+            originals = await self._capture_project_selection(selection, content_project=(
+                lambda analysis, view: {entry.relative_path: {
+                    "digest": entry.digest, "identity": asdict(entry.identity)}
+                    for entry in view.entries}))
+        for path in expected:
+            if originals.get(path) != frozen["resources"][path]:
+                raise PermissionError("frozen_original_source_changed")
+        protected = {path: inputs[path] for path in (frozen["test_path"], frozen["demo_path"])}
+        prior = self._frozen_worktree_inputs.setdefault(task.id, protected)
+        if prior != protected or (record["inputs"] is not None and record["inputs"] != inputs):
+            raise PermissionError("frozen_execution_input_changed")
+        record["inputs"] = inputs
+        current, current_workspace = await self._project_analysis_subject(record["scope"])
+        if current != task or current_workspace != workspace:
+            raise PermissionError("frozen_execution_authority_changed")
+        record["approval_binding"] = payload_digest({
+            "task": task.id, "node": record["scope"].node.id,
+            "owner": record["scope"].guard_owner, "cwd_identity": pin.identity,
+            "binding": frozen["sha256"], "executor": record["executor"], "inputs": inputs})
+        return ActionRequest(task_id=task.id, actor=task.actor, action=ActionType.PROCESS_RUN,
+            resource=ResourceRef(workspace.id, (pin.root / record["path"]).as_posix(),
+                kind=self._file_broker._classify(pin.root / record["path"], record["sandbox"])),
+            scope=effective)
+
+    async def _node_tool_request(self, tool, arguments):
+        from Sprout.execution.sandbox_tool import SandboxReadTool
+        from Sprout.security.access import ActionRequest, ActionType
+        from Sprout.tools.context_keys import _current_project_node
+        from Sprout.workspace.classifier import classify
+        from Sprout.workspace.models import ResourceRef
+
+        scope = _current_project_node()
+        from Sprout.tools.database_tool import DatabaseQueryTool
+
+        if type(tool) is DatabaseQueryTool and self.tools.get("database_query") is tool:
+            _, _, request = await self._database_query_request(
+                tool, arguments.get("database"), arguments.get("sql"),
+                arguments.get("workspace_id"))
+            return request
+        if scope is None or self._node_tool_scopes.get(tool) is not scope:
+            raise PermissionError("node_tool_binding_unavailable")
+        task, workspace = await self._project_analysis_subject(scope)
+        if task.delegation_scope.is_expired():
+            raise PermissionError("node_tool_binding_expired")
+        if task.metadata.get("host_acceptance_v1") != scope.task.metadata.get("host_acceptance_v1"):
+            raise PermissionError("node_tool_acceptance_binding_changed")
+        resource = None
+        paths = task.delegation_scope.bind_paths(str(workspace.root)).narrow(
+            scope.task.delegation_scope.bind_paths(str(workspace.root)))
+        sandbox = getattr(tool, "_sandbox", None)
+        if sandbox is not None:
+            from Sprout.workspace.authorized_content import relative_label
+
+            nodes = await self._metadata_or_raise().list_execution_nodes(task.id)
+            valid = any(n.type is NodeType.SANDBOX and n.status is NodeStatus.COMPLETED
+                        and n.metadata.get("output", {}).get("root") == str(sandbox.root)
+                        and n.metadata.get("output", {}).get("id") == sandbox.id for n in nodes)
+            if (not valid or getattr(tool, "_task_id", None) != task.id
+                    or getattr(tool, "_scope", None) != scope.task.delegation_scope):
+                raise PermissionError("node_tool_sandbox_unavailable")
+            path = relative_label(arguments.get("path", ""))
+            # Relative grants bind to the registered Worktree; absolute grants
+            # are never rebased into a different resource domain.
+            paths = task.delegation_scope.bind_paths(str(sandbox.root)).narrow(
+                scope.task.delegation_scope.bind_paths(str(sandbox.root)))
+            resource = ResourceRef(workspace.id, (sandbox.root / path).as_posix(),
+                                   kind=classify(path))
+            if not isinstance(tool, SandboxReadTool):
+                frozen = task.metadata.get("host_acceptance_v1", {}).get("resources", {})
+                if path in frozen:
+                    raise PermissionError("frozen_acceptance_write_denied")
+        return ActionRequest(task_id=task.id, actor=task.actor, action=ActionType.TOOL_INVOKE,
+                             resource=resource, scope=paths)
+
+    async def _node_file_request(self, request, sandbox):
+        from Sprout.task.paths import scope_path
+        from Sprout.tools.context_keys import _current_node_tool_call
+
+        frame = _current_node_tool_call()
+        if frame is None or getattr(frame[0], "_sandbox", None) != sandbox:
+            raise PermissionError("node_file_binding_unavailable")
+        subject = await self._node_tool_request(frame[0], frame[2])
+        if (request.task_id != subject.task_id or scope_path(request.resource.path) is None
+                or scope_path(request.resource.path) != scope_path(subject.resource.path)):
+            raise PermissionError("node_file_resource_mismatch")
+        return replace(request, actor=subject.actor, scope=subject.scope,
+                       resource=replace(request.resource,
+                                        workspace_id=subject.resource.workspace_id))
+
+    def _same_admitted_read(self, scope, tool, arguments, result):
+        from Sprout.execution.sandbox_tool import SandboxReadTool
+
+        if (type(tool) is not SandboxReadTool or not result.ok
+                or arguments.get("offset") or arguments.get("limit")):
+            return False
+        for record in self._node_products.values():
+            if (len(record) == 7 and record[0] == scope.task and record[5] is self
+                    and record[2].type is NodeType.READ
+                    and record[2].id in scope.parent_receipts):
+                if any(item.get("path") == arguments.get("path")
+                       and item.get("content", "").replace("\r\n", "\n")
+                       == result.content.replace("\r\n", "\n") for item in record[3]):
+                    return True
+        return False
+
     async def _issue_project_analysis_tool(self, *, paths=None, discover=False):
         from Sprout.tools.context_keys import _current_project_node
         from Sprout.tools.project_analyze_tool import ProjectAnalyzeTool
@@ -745,9 +1552,9 @@ class Runtime:
             relative_label(path)
         self._project_tool_paths[tool] = paths
 
-    async def _invoke_database_query(self, tool, database, sql, workspace_id):
+    async def _database_query_request(self, tool, database, sql, workspace_id):
         """Use the existing live node authority, never JSON attribution."""
-        from Sprout.security.access import AccessDecision, ActionRequest, ActionType
+        from Sprout.security.access import ActionRequest, ActionType
         from Sprout.task.paths import bound_scope_path, scope_path
         from Sprout.tools.context_keys import _current_project_node
         from Sprout.workspace.models import ResourceKind, ResourceRef
@@ -771,13 +1578,23 @@ class Runtime:
             action=ActionType.TOOL_INVOKE, scope=effective,
             resource=ResourceRef(workspace.id, target.text(), ResourceKind.DATA),
             arguments={"tool": tool.spec.name, "sql": sql})
+        return task, workspace, request
+
+    async def _invoke_database_query(self, tool, database, sql, workspace_id):
+        from Sprout.security.access import AccessDecision
+        from Sprout.tools.context_keys import _current_project_node
+
+        task, workspace, request = await self._database_query_request(
+            tool, database, sql, workspace_id)
+        scope = _current_project_node()
         decision = self._policy_engine.decide(request)
         await self._record_project_capture_policy(request, decision)
         if decision.decision is not AccessDecision.ALLOW:
             raise PermissionError("database_tool_invocation_denied")
         scope.untracked_tool_use = True
         result = await self._database_broker.query(
-            workspace, target.text(), sql, task_id=task.id, scope=effective, actor=task.actor)
+            workspace, request.resource.path, sql, task_id=task.id,
+            scope=request.scope, actor=task.actor)
         current, current_workspace = await self._project_analysis_subject(scope)
         if current.delegation_scope != task.delegation_scope or current_workspace != workspace:
             raise PermissionError("database_authority_changed")
@@ -1418,9 +2235,30 @@ class Runtime:
     def _remember_node_product(self, scope, output):
         from copy import deepcopy
 
+        from Sprout.tools.context_keys import _current_project_node
+
+        host = getattr(self, "_verification_hosts", {}).get(scope.task.id)
+        if (host is not None and scope.node.type is NodeType.AGENT
+                and _current_project_node() is scope and scope.runtime is self
+                and self._node_publications.get(scope.node.id) is scope and scope.active
+                and isinstance(output, dict) and not output.get("waiting")
+                and not output.get("pending_approvals") and not output.get("pending_tool_calls")):
+            from Sprout.execution.node_result_source import payload_digest
+            from Sprout.execution.verification_manifest import (
+                _AgentCompletionCandidate,
+                scope_digest,
+            )
+
+            host.setdefault("agent_candidates", {})[scope.node.id] = _AgentCompletionCandidate(
+                self, scope, scope.guard_owner, self._node_subject_digest(scope),
+                scope_digest(scope.task.delegation_scope), payload_digest(output))
         if scope.untracked_tool_use:
             return  # Tool effects have no transitive resource receipt yet.
         allowed = scope.node.type in {NodeType.PLAN, NodeType.SUBTASK, NodeType.AGENT}
+        if scope.node.type is NodeType.TEST_DESIGN:
+            binding = scope.task.metadata.get("host_acceptance_v1", {})
+            allowed = (not output.get("waiting") and binding.get("sha256")
+                       and output.get("binding_sha256") == binding["sha256"])
         if not (scope.read_captured or scope.node.type is NodeType.SANDBOX
                 or (allowed and self._node_publications.get(scope.node.id) is scope)):
             return
@@ -1600,6 +2438,8 @@ class Runtime:
 
     # -- lifecycle ---------------------------------------------------------
     async def start(self) -> None:
+        if getattr(self, "_verification_shutdown", {}).get("state") == "UNKNOWN":
+            raise RuntimeError("verification_shutdown_requires_manual_intervention")
         if self._started:
             return
         if self._settings is not None:
@@ -1607,6 +2447,7 @@ class Runtime:
 
             await ensure_storage_ready(self._settings)
         self._started = True
+        self._verification_stopping = False
         await self.events.publish(Event(RUNTIME_STARTED, {"version": _package_version()}))
         await self._sandbox_lifecycle.reconcile_orphans()
         await self._sweep_stale_approvals()
@@ -1639,6 +2480,52 @@ class Runtime:
             self._record_security("approval.swept_at_startup", {"count": swept})
 
     async def stop(self) -> None:
+        # Preserve stop-only custody until native owners finish their bounded
+        # cancellation handlers. New business preparations are already denied.
+        self._verification_stopping = True
+        owners = {p["owner"] for p in getattr(self, "_verification_preparations", {}).values()
+                  if p["owner"] is not asyncio.current_task()}
+        for owner in owners:
+            owner.cancel()
+        operations = set(owners)
+        for preparation in getattr(self, "_verification_preparations", {}).values():
+            native = preparation.get("native", {})
+            operations.update(t for t in native.get("pending_operations", ()) if not t.done())
+            helper = native.get("cleanup_task")
+            if helper is not None and not helper.done():
+                operations.add(helper)
+        pending = set()
+        if operations:
+            _, pending = await asyncio.wait(operations, timeout=30)
+        retained = [p for p in getattr(self, "_verification_preparations", {}).values()
+                    if p["owner"] in pending or self._verification_custody_busy(p)]
+        if retained:
+            # Bounded stop cannot truthfully claim completion while uncancellable
+            # I/O remains. Keep both private custody and storage; never reconstruct
+            # permission from this diagnostic snapshot or silently restart.
+            self._verification_shutdown = {"state": "UNKNOWN",
+                "manual_intervention_required": True, "storage_retained": True,
+                "reason": "verification_cleanup_unresolved", "executions": [
+                    {"execution_id": p.get("native", {}).get("execution_id"),
+                     "container_id": p.get("native", {}).get("container_id"),
+                     "container_name": p.get("native", {}).get("container_name"),
+                     "task_id": getattr(p.get("task"), "id", None),
+                     "node_id": getattr(getattr(p.get("scope"), "node", None), "id", None),
+                     "owner": getattr(p.get("scope"), "guard_owner", None),
+                     "manifest": p.get("manifest_sha"),
+                     "docker": p.get("native", {}).get("host", {}).get("docker"),
+                     "image": p.get("native", {}).get("image"),
+                     "pending_operations": sum(not t.done() for t in
+                         p.get("native", {}).get("pending_operations", ()))} for p in retained]}
+            logger.error("Runtime shutdown incomplete: verification cleanup unresolved; "
+                         "private custody and storage retained, manual intervention required")
+            return
+        self._verification_shutdown = {"state": "completed", "storage_retained": False}
+        getattr(self, "_verification_hosts", {}).clear()
+        for frame in getattr(self, "_verification_frames", {}):
+            frame.active = False
+        getattr(self, "_verification_frames", {}).clear()
+        getattr(self, "_verification_preparations", {}).clear()
         # Workers can be started independently of start(). Join them even when
         # there is no started Runtime/storage lifecycle to close.
         try:
@@ -3541,6 +4428,8 @@ class Runtime:
         execution_mode: str = TaskExecutionMode.CODE,
     ) -> Task:
         """Create and persist a task without starting orchestration yet."""
+        if metadata and "host_acceptance_v1" in metadata:
+            raise PermissionError("host_acceptance_requires_explicit_host_binding")
         store = self.storage.metadata
         if store is None:
             raise RuntimeError("MetadataStore is not configured")
@@ -3564,6 +4453,56 @@ class Runtime:
         )
         await store.save_task(task)
         return task
+
+    async def bind_task_acceptance(self, task_id, *, principal, spec, test_path, demo_path):
+        """Explicit Python host input, before any graph exists. No Scope expansion."""
+        from dataclasses import asdict
+
+        from Sprout.execution.acceptance import render_acceptance_demo, render_acceptance_tests
+        from Sprout.execution.host_acceptance import binding_subject
+        from Sprout.execution.node_result_source import payload_digest
+        from Sprout.strategy.acceptance import AcceptanceSpec
+        from Sprout.workspace.authorized_content import relative_label
+
+        store = self._metadata_or_raise()
+        task = await store.get_task(task_id)
+        if (task is None or task.actor != principal or principal.authenticated is not True
+                or task.source != principal.source
+                or task.execution_mode is not TaskExecutionMode.CODE
+                or task.status is not TaskStatus.CREATED or task.delegation_scope.is_expired()
+                or task.metadata.get("host_acceptance_v1")
+                or await store.list_execution_nodes(task_id)):
+            raise PermissionError("host_acceptance_subject_unavailable")
+        workspace = await store.get_workspace(task.workspace_id)
+        spec = AcceptanceSpec.from_payload(spec)
+        test_path, demo_path = relative_label(test_path), relative_label(demo_path)
+        if test_path == demo_path:
+            raise ValueError("Acceptance test and Demo must be distinct")
+        expected = {test_path: render_acceptance_tests(spec),
+                    demo_path: render_acceptance_demo(spec)}
+
+        def capture(analysis, view):
+            resources = {}
+            for path, text in expected.items():
+                entry = view.get(path)
+                if entry.identity is None or entry.text().replace("\r\n", "\n") != text:
+                    raise PermissionError("host_acceptance_source_mismatch")
+                resources[path] = {"digest": entry.digest, "identity": asdict(entry.identity)}
+            return resources
+
+        resources = await self._capture_preparation(
+            replace(workspace, manifest=None), actor=principal, source=principal.source,
+            scope=task.delegation_scope, instruction="Capture frozen host acceptance",
+            metadata={"required_paths": [test_path, demo_path]}, project=capture)
+        if task != await store.get_task(task.id) or await store.list_execution_nodes(task.id):
+            raise PermissionError("host_acceptance_subject_changed")
+        binding = {"version": 1, "subject": binding_subject(task, workspace),
+                   "spec": spec.to_payload(), "spec_sha256": payload_digest(spec.to_payload()),
+                   "test_path": test_path, "demo_path": demo_path, "resources": resources}
+        binding["sha256"] = payload_digest(binding)
+        bound = replace(task, metadata={**task.metadata, "host_acceptance_v1": binding})
+        await store.save_task(bound)
+        return bound
 
     async def confirm_task_mode(self, task_id: str, execution_mode: str) -> Task:
         """Confirm an untouched historical task, never reinterpret executed work."""
@@ -3989,6 +4928,7 @@ class Runtime:
             return
         TaskStateMachine.validate(task.status, TaskStatus.CANCELLED)
         await metadata.update_task_status(task_id, TaskStatus.CANCELLED)
+        self._verification_hosts.pop(task_id, None)
 
     async def cancel_task(self, task_id: str, *, reason: str = "") -> Task:
         """Stop a task that is waiting on, or running for, a human.
@@ -4021,6 +4961,7 @@ class Runtime:
         if not TaskStateMachine.can_transition(task.status, TaskStatus.CANCELLED):
             raise ValueError(f"Task {task_id} is {task.status.value}; it cannot be cancelled")
         await metadata.update_task_status(task_id, TaskStatus.CANCELLED)
+        self._verification_hosts.pop(task_id, None)
         self._record_security(
             "task.cancelled",
             {"task_id": task_id, "from": task.status.value, "reason": reason},

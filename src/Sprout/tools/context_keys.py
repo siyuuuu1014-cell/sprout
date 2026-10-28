@@ -83,6 +83,23 @@ class _ProjectAnalysisCall:
 
 _PROJECT_NODE: ContextVar[_ProjectNodeScope | None] = ContextVar("project_node_b1", default=None)
 _PROJECT_CALL: ContextVar[_ProjectAnalysisCall | None] = ContextVar("project_call_b1", default=None)
+_NODE_TOOL_CALL = ContextVar("node_tool_call_f1", default=None)
+
+
+@contextmanager
+def _node_tool_call(tool, subject, arguments):
+    frame = (tool, subject, arguments, _current_project_node(), asyncio.current_task())
+    token = _NODE_TOOL_CALL.set(frame)
+    try:
+        yield frame
+    finally:
+        _NODE_TOOL_CALL.reset(token)
+
+
+def _current_node_tool_call():
+    frame = _NODE_TOOL_CALL.get()
+    return frame if frame is not None and frame[3] is _current_project_node() and (
+        frame[3] is not None and frame[4] is asyncio.current_task()) else None
 
 
 def _current_project_node():
