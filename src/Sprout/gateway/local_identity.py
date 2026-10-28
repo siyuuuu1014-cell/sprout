@@ -14,9 +14,12 @@ def _windows_sid() -> str:
     length = ctypes.windll.kernel32.GetSystemDirectoryW(buffer, len(buffer))
     if not length or length >= len(buffer):
         raise ValueError("System identity executable unavailable")
+    from Sprout.security.secret_broker import SecretBroker
+
     result = subprocess.run(
         [os.path.join(buffer.value, "whoami.exe"), "/user", "/fo", "csv", "/nh"],
         capture_output=True, text=True, check=True, timeout=5,
+        env=SecretBroker().child_env(base_env=os.environ),
     )
     rows = list(csv.reader(result.stdout.splitlines()))
     if len(rows) != 1 or len(rows[0]) != 2:

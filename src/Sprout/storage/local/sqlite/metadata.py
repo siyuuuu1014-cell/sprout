@@ -382,6 +382,61 @@ class SqliteMetadataStore:
         return changed == 1
 
     async def claim_verification_execution(self, record: dict[str, Any]) -> bool:
+        if record.get("schema_version") == 3:
+            authority = record.get("authority", {})
+            if (type(record.get("schema_version")) is not int
+                    or any(not isinstance(record.get(key), str) or not record[key]
+                           for key in ("id", "task_id", "node_id", "owner", "workspace_id"))
+                    or not isinstance(authority, dict)
+                    or set(authority) != {"actor", "scope", "task_metadata", "node_metadata",
+                                          "workspace_root", "workspace_revision", "instruction"}):
+                return False
+            if (any(type(authority[k]) is not dict for k in
+                    ("actor", "scope", "task_metadata", "node_metadata"))
+                    or type(authority["workspace_root"]) is not str
+                    or type(authority["instruction"]) is not str
+                    or authority["workspace_revision"] is not None
+                    and type(authority["workspace_revision"]) is not str):
+                return False
+            # One writer statement checks the actual Task and persisted Guard
+            # and inserts once. No pre-query grants, state transition or schema migration.
+            changed = await self._db.execute(
+                "INSERT OR IGNORE INTO verification_executions "
+                "(id, task_id, owner, state, record_json) "
+                "SELECT ?, ?, ?, 'active', ? FROM tasks t JOIN execution_nodes n "
+                "ON n.task_id=t.id JOIN workspaces w ON w.id=t.workspace_id "
+                "WHERE t.id=? AND t.workspace_id=? AND t.status='running' "
+                "AND w.root=? AND w.revision IS ? AND t.instruction=? "
+                "AND json_extract(t.metadata_json,'$.execution_mode')='code' "
+                "AND json_extract(t.actor_json,'$.authenticated')=1 "
+                "AND json_type(t.actor_json,'$.authenticated')='true' "
+                "AND t.source=json_extract(t.actor_json,'$.source') "
+                "AND json_extract(t.actor_json,'$.user_id')!='' "
+                "AND t.source!='' AND json(t.actor_json)=json(?) "
+                "AND json(t.delegation_scope_json)=json(?) "
+                "AND json(t.metadata_json)=json(?) "
+                "AND (json_extract(t.delegation_scope_json,'$.expires_at') IS NULL "
+                "OR ((json_extract(t.delegation_scope_json,'$.expires_at') LIKE '%Z' "
+                "OR json_extract(t.delegation_scope_json,'$.expires_at') GLOB '*[+-]??:??') "
+                "AND julianday(json_extract(t.delegation_scope_json,'$.expires_at')) "
+                "> julianday('now'))) "
+                "AND n.id=? AND n.type='evaluation' AND n.status='running' "
+                "AND json(n.metadata_json)=json(?) "
+                "AND json_extract(n.metadata_json,'$.execution_guard.state')='active' "
+                "AND json_extract(n.metadata_json,'$.execution_guard.owner')=? "
+                "AND (julianday('now')-julianday(json_extract(n.metadata_json, "
+                "'$.execution_guard.started_at')))*86400 "
+                "< json_extract(n.budget_json,'$.timeout_seconds')",
+                (record["id"], record["task_id"], record["owner"], _json_dumps(record),
+                 record["task_id"], record["workspace_id"], authority["workspace_root"],
+                 authority["workspace_revision"], authority["instruction"],
+                 _json_dumps(authority["actor"]),
+                 _json_dumps(authority["scope"]), _json_dumps(authority["task_metadata"]),
+                 record["node_id"], _json_dumps(authority["node_metadata"]), record["owner"]),
+            )
+            return changed == 1
+        if record.get("schema_version", 2) != 2:
+            return False
         changed = await self._db.execute(
             "INSERT OR IGNORE INTO verification_executions "
             "(id, task_id, owner, state, record_json) SELECT ?, ?, ?, 'active', ? "

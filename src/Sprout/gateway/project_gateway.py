@@ -128,17 +128,24 @@ class ProjectGateway:
         execution_mode: str = "code",
         principal: Principal | None = None,
         delegation_scope: DelegationScope | None = None,
+        preparation_paths: tuple[str, ...] | None = None,
+        host_acceptance: dict | None = None,
     ) -> Task:
         # Goes through strategy planning so plan steps drive the execution
         # graph; falls back to a plain task if planning is unavailable.
-        return await self._runtime.create_task_planned(
+        task = await self._runtime.create_task_planned(
             workspace_id,
             instruction,
             actor=principal or Principal(user_id=user_id or self._default_user),
             source=principal.source if principal is not None else self._transport,
             execution_mode=execution_mode,
             delegation_scope=delegation_scope,
+            **({"preparation_paths": preparation_paths} if preparation_paths is not None else {}),
         )
+        if host_acceptance is not None:
+            task = await self._runtime.bind_task_acceptance(
+                task.id, principal=principal, **host_acceptance)
+        return task
 
     async def confirm_task_mode(self, task_id: str, execution_mode: str) -> Task:
         return await self._runtime.confirm_task_mode(task_id, execution_mode)

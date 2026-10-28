@@ -48,7 +48,7 @@ class DockerVerificationBackend:
     workspace. No mutable image tags, host-writable mounts or automatic pull.
     """
 
-    def plan(self, request: VerificationRequest) -> tuple[str, ...]:
+    def plan(self, request: VerificationRequest, *, ownership=None) -> tuple[str, ...]:
         validate_image(request.image)
         root = safe_path(request.input_root)
         source = safe_path(request.source_root)
@@ -76,7 +76,7 @@ class DockerVerificationBackend:
         if not request.arguments:
             raise ValueError("Explicit pytest arguments are required")
         name = "sprout-verification-" + uuid4().hex
-        return (
+        command = (
             "docker",
             "run",
             "--pull=never",
@@ -111,6 +111,17 @@ class DockerVerificationBackend:
             "/observer.py",
             *request.arguments,
         )
+        if ownership is not None:
+            if (set(ownership) != {"task", "node", "owner", "manifest"}
+                    or ownership["task"] != request.task_id
+                    or any(not isinstance(v, str) or not v or "\0" in v
+                           for v in ownership.values())):
+                raise ValueError("verification_container_ownership")
+            labels = tuple(part for key, value in ownership.items()
+                           for part in ("--label", "sprout.verification." + key + "=" + value))
+            index = command.index("--network=none")
+            command = (*command[:index], *labels, *command[index:])
+        return command
 
     async def inspect_image(self, runtime: AuthorizedProcessRunner, task_id: str, image: str):
         validate_image(image)

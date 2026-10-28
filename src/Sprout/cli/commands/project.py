@@ -548,13 +548,58 @@ def task_create(
     instruction: Annotated[str, typer.Argument(help="Task instruction.")],
     mode: Annotated[str, typer.Option("--mode", help="code or read_only.")] = "code",
     config: Annotated[str | None, typer.Option("--config", help="Path to sprout.toml.")] = None,
+    read_path: Annotated[list[str] | None, typer.Option(
+        "--read-path", help="Known Workspace-relative input file; repeat for each file.")] = None,
+    write_path: Annotated[list[str] | None, typer.Option(
+        "--write-path", help="Workspace-relative write target; policy still applies.")] = None,
+    allow_pytest: Annotated[bool, typer.Option(
+        "--allow-pytest", help="Request process.run; no approval bypass.")] = False,
+    acceptance_spec: Annotated[str | None, typer.Option("--acceptance-spec")] = None,
+    acceptance_test: Annotated[str | None, typer.Option("--acceptance-test")] = None,
+    acceptance_demo: Annotated[str | None, typer.Option("--acceptance-demo")] = None,
 ) -> None:
     """Create a project task."""
+    from Sprout.task.models import DelegationScope
+    from Sprout.workspace.authorized_content import relative_label
+
+    try:
+        inputs = tuple(dict.fromkeys(relative_label(p) for p in (read_path or ())))
+        writes = tuple(dict.fromkeys(relative_label(p) for p in (write_path or ())))
+    except ValueError as exc:
+        raise typer.BadParameter("Use explicit Workspace-relative file paths") from exc
+    if (writes or allow_pytest) and not inputs:
+        raise typer.BadParameter("--write-path/--allow-pytest require --read-path")
+    frozen = None
+    if any(value is not None for value in (acceptance_spec, acceptance_test, acceptance_demo)):
+        if any(value is None for value in (acceptance_spec, acceptance_test, acceptance_demo)):
+            raise typer.BadParameter("Provide frozen spec, test and Demo together")
+        from pathlib import Path
+
+        from Sprout.strategy.acceptance import AcceptanceSpec
+
+        test, demo = relative_label(acceptance_test), relative_label(acceptance_demo)
+        if mode != "code" or test not in inputs or demo not in inputs:
+            raise typer.BadParameter("Frozen test and Demo must be explicit CODE read inputs")
+        frozen = {"spec": AcceptanceSpec.from_payload(json.loads(
+            Path(acceptance_spec).read_text(encoding="utf-8"))).to_payload(),
+            "test_path": test, "demo_path": demo}
+    principal = current_cli_principal()
+    actions = {"tool.invoke", "file.read"}
+    if writes:
+        actions.add("file.write")
+    if allow_pytest:
+        actions.add("process.run")
+    scope = (DelegationScope(allowed_paths=tuple(dict.fromkeys((*inputs, *writes))),
+        allowed_actions=frozenset(actions), issued_by=principal.source+":"+principal.user_id)
+        if inputs else None)
     gateway = _gateway(config)
 
     async def run() -> None:
         task = await gateway.create_task(
-            workspace_id, instruction, execution_mode=mode, principal=current_cli_principal(),
+            workspace_id, instruction, execution_mode=mode, principal=principal,
+            delegation_scope=scope,
+            **({"preparation_paths": inputs} if inputs else {}),
+            **({"host_acceptance": frozen} if frozen is not None else {}),
         )
         typer.echo(task.id)
 

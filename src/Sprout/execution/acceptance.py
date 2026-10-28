@@ -156,9 +156,12 @@ def _local_acceptance_main():
     This is a Local logical boundary, not protection against hostile Python
     introspection or pytest plugins. Restricted execution retains its own runner.
     """
+    import sys
+
+    sys.dont_write_bytecode = True
     import importlib.machinery
     import json
-    import sys
+    import types
     from hashlib import sha256
     from pathlib import Path
 
@@ -245,6 +248,21 @@ def _local_acceptance_main():
                 exc = call.excinfo.value
                 if line.startswith("assert actual ==") and not tail and type(exc) is AssertionError:
                     evidence["category"] = "assertion_failed"
+                elif line.startswith("actual = target(") and type(exc) is TypeError:
+                    imported = sys.modules.get(module)
+                    target = vars(imported).get(function) if imported is not None else None
+                    # A binding/argument error has no target frame. Only a direct
+                    # call into this unchanged source function is a known RED;
+                    # imports, framework frames and unknown callees stay unknown.
+                    if (not missing and type(target) is types.FunctionType and len(tail) == 1
+                            and isinstance(vars(imported).get("__loader__"),
+                                           importlib.machinery.SourceFileLoader)
+                            and Path(vars(imported).get("__file__", "")).resolve() == target_file
+                            and entry.frame.f_locals.get("target") is target
+                            and tail[0].frame.code.raw is target.__code__
+                            and Path(str(tail[0].path)).resolve() == target_file
+                            and Path(target.__code__.co_filename).resolve() == target_file):
+                        evidence["category"] = "target_exception"
                 elif line.startswith("target = importlib.import_module("):
                     imported = sys.modules.get(module)
                     if (type(exc) is AttributeError and not tail and imported is not None
@@ -313,7 +331,8 @@ def local_acceptance_evidence(result, binding: dict) -> str:
             or local_executor_applicability(binding) != "match"):
         return "unknown"
     category = evidence.get("category")
-    red = {"assertion_failed", "requirement_not_implemented", "target_module_not_implemented"}
+    red = {"assertion_failed", "requirement_not_implemented", "target_module_not_implemented",
+           "target_exception"}
     if category == "passed" and result.exit_code == 0:
         return "passed"
     return category if category in red and result.exit_code == 1 else "unknown"
