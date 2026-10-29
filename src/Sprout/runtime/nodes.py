@@ -1265,10 +1265,23 @@ class NodeExecutor:
         return []
 
     async def _approval(self, workspace: Workspace, task: Task) -> dict:
+        from Sprout.tools.context_keys import _current_project_node
+
+        runtime = getattr(self._project_analysis_scope, "__self__", None)
         nodes = await self._metadata.list_execution_nodes(task.id)
-        sandbox_ref = self._sandbox_ref_from(
-            self._output_for(nodes, NodeType.SANDBOX)
-        )
+        recorded = self._output_for(nodes, NodeType.EVALUATION)
+        review = None
+        # Persisted evidence may require a live origin, never supply one. Losing
+        # the Host registry must not fall back to legacy Git on restart.
+        if ((runtime is not None and task.id in runtime._verification_hosts)
+                or isinstance(recorded, dict) and "manifest_sha256" in recorded):
+            scope = _current_project_node()
+            if (runtime is None or scope is None or scope.runtime is not runtime
+                    or scope.task.id != task.id):
+                raise PermissionError("verification_review_frame_unavailable")
+            review = await runtime._review_proposal_context(scope)
+        sandbox_ref = (review[1] if review else self._sandbox_ref_from(
+            self._output_for(nodes, NodeType.SANDBOX)))
         existing = await self._metadata.list_change_proposals(task.id)
         if existing:
             # Approval is resumable: never mint a second proposal for the same
@@ -1281,7 +1294,7 @@ class NodeExecutor:
                 "waiting": proposal.status is not ChangeProposalStatus.APPROVED,
             }
 
-        evaluation = self._output_for(nodes, NodeType.EVALUATION)
+        evaluation = review[0] if review else self._output_for(nodes, NodeType.EVALUATION)
         test_results = self._test_results_from(evaluation)
         # Commands the policy withheld. Distinct from a failure: nobody looked.
         # They must be removed from ``failed`` before it is used for risk
@@ -1300,8 +1313,15 @@ class NodeExecutor:
         ]
 
         diffs = []
-        files_changed: tuple[str, ...] = ()
-        if sandbox_ref is not None:
+        git_evidence = evaluation.get("git_diff", {}) if review else {}
+        if git_evidence.get("status") == "available":
+            from Sprout.execution.models import DiffResult
+
+            text = git_evidence["patches"]["tracked"] + git_evidence["patches"]["untracked"]
+            if text:
+                diffs.append(DiffResult(path="authorized_git_view", diff_text=text))
+        files_changed: tuple[str, ...] = tuple(evaluation["files_changed"]) if review else ()
+        if sandbox_ref is not None and review is None:
             provider = (IsolatedGitWorktreeSandbox if self._isolated_coding_required
                         else GitWorktreeSandbox)
             sandbox = provider(workspace)
@@ -1310,7 +1330,7 @@ class NodeExecutor:
                 diffs.append(diff)
             files_changed = await sandbox.changed_files(sandbox_ref)
 
-        if not files_changed and not diffs:
+        if not files_changed and not diffs and review is None:
             # A turn that produced no file changes has nothing to apply, so it
             # must not park on a change proposal. Read-only and conversational
             # tasks finish here and return the agent's answer instead.
@@ -1342,13 +1362,29 @@ class NodeExecutor:
         )
         proposal = replace(
             proposal,
-            rollback_plan=(
+            rollback_plan=("Review-only; Apply/Rollback unavailable." if review else
                 f"Roll back the applied commit for change proposal {proposal.id} "
                 f"with `sprout project rollback {proposal.id}`. "
                 f"Files: {', '.join(files_changed) or '(none)'}."
             ),
             metadata={
                 "summary": task.instruction,
+                **({"review_only": True, "workspace_id": workspace.id,
+                    "git_diff_status": ("available" if git_evidence.get("status") == "available"
+                                        else "git_diff_unavailable"),
+                    **({"git_diff": git_evidence} if git_evidence else {}),
+                    "change_coverage": (git_evidence["coverage"]
+                        if git_evidence.get("status") == "available" else {
+                            "status": "authorized_snapshot_paths_only",
+                            "paths": list(evaluation["manifest"]["inputs"]),
+                            "untracked_and_deleted_files": "not_established"}),
+                    "snapshot_sources": {"original": evaluation["original_inputs"],
+                        "modified": evaluation["manifest"]["inputs"]},
+                    "content_diff": {"format": "unified_content_diff",
+                        "text": evaluation["code_diff"],
+                        "sha256": sha256(evaluation["code_diff"].encode("utf-8")).hexdigest(),
+                        "binding_sha256": evaluation["manifest"]["diff"]},
+                    "verification_manifest": evaluation["manifest"]} if review else {}),
                 # An approver must be able to tell "this passed", "this failed"
                 # and "nobody checked" apart — they are different decisions.
                 "verification": {
@@ -1366,6 +1402,10 @@ class NodeExecutor:
                         "acceptance_spec", "baseline", "demo_path", "results", "cwd",
                         "verification_report",
                     )} if isinstance(evaluation, dict) else {}),
+                    **({key: evaluation[key] for key in (
+                        "collection_complete", "verified", "manifest_sha256",
+                        "original_declarations",
+                    )} if review else {}),
                     **({"local_executor": evaluation["local_executor"]}
                        if isinstance(evaluation, dict) and "local_executor" in evaluation else {}),
                     **({"local_baseline_valid": evaluation["local_baseline_valid"]}

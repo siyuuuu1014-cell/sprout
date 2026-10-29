@@ -191,7 +191,7 @@ class ProcessBroker:
             if not reason and not obligation["tool_identity"]:
                 reason = "verification_tool_identity_unproved"
             host = issuer._verification_hosts[task.id]
-            if (prepared is not None and host.get("docker") is not None
+            if (prepared is not None and host.get("docker") is not None and not reason
                     and prepared.get("protocol") != "observed-command-v1"):
                 selected = (exported.get("compileall")
                             if obligation["id"] == "compileall" else exported)
