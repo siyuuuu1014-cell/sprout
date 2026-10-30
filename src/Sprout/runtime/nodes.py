@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import shutil
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import nullcontext
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
@@ -178,6 +179,7 @@ class NodeExecutor:
         coding_session_factory=None,
         coding_commands=None,
         local_acceptance: bool = True,
+        project_analysis_scope=None,
     ) -> None:
         self._metadata = metadata
         self._router = router
@@ -194,6 +196,7 @@ class NodeExecutor:
         self._coding_session_factory = coding_session_factory
         self._coding_commands = coding_commands
         self._local_acceptance = local_acceptance
+        self._project_analysis_scope = project_analysis_scope
         self._change_builder = ChangeProposalBuilder()
 
     def handler(
@@ -202,7 +205,22 @@ class NodeExecutor:
         """Build the callable the orchestrator invokes per node."""
 
         async def execute(node: ExecutionNode) -> Any:
-            return await self.execute_node(node, workspace, read_plan, task)
+            current = task
+            if self._project_analysis_scope is not None:
+                # Local scheduling changes CREATED/READY to RUNNING before
+                # dispatch. Re-read that authority instead of binding the
+                # pre-submission snapshot as the producer of every result.
+                current = await self._metadata.get_task(task.id)
+                registered = await self._metadata.get_workspace(workspace.id)
+                if (current is None or registered is None
+                        or current.workspace_id != task.workspace_id
+                        or current.actor != task.actor or current.source != task.source
+                        or current.delegation_scope != task.delegation_scope
+                        or current.metadata.get("session_id") != task.metadata.get("session_id")
+                        or (registered.id, registered.root, registered.kind, registered.revision)
+                        != (workspace.id, workspace.root, workspace.kind, workspace.revision)):
+                    raise PermissionError("node_task_subject_changed")
+            return await self.execute_node(node, workspace, read_plan, current)
 
         return execute
 
@@ -216,8 +234,25 @@ class NodeExecutor:
         """Bind the persistent task allowance across planning and coding nodes."""
         from Sprout.llm.task_budget import task_model_budget
 
-        with task_model_budget(self._metadata, task.id, node.id, task.budget.max_model_calls):
-            return await self._execute_node(node, workspace, read_plan, task)
+        domain = (self._project_analysis_scope(task, workspace, node)
+                  if self._project_analysis_scope is not None else nullcontext())
+        with domain as scope:
+            if scope is not None:
+                from Sprout.task.paths import bound_scope_path, scope_path
+
+                root = scope_path(str(workspace.root))
+                paths = []
+                for resource in read_plan.resources:
+                    target = scope_path(bound_scope_path(resource.path, str(workspace.root)))
+                    if target is None or not root.contains(target):
+                        raise PermissionError("node_read_plan_unavailable")
+                    paths.append(target.text()[len(root.text().rstrip("/")) + 1:])
+                scope.known_paths = tuple(paths)
+            with task_model_budget(self._metadata, task.id, node.id, task.budget.max_model_calls):
+                result = await self._execute_node(node, workspace, read_plan, task)
+                if scope is not None:
+                    scope.runtime._remember_node_product(scope, result)
+                return result
 
     async def _execute_node(self, node, workspace, read_plan, task):
         """Run one node and return its persisted output."""
@@ -230,10 +265,22 @@ class NodeExecutor:
         if node.type is NodeType.SUBTASK:
             return await self._subtask(node, workspace, task)
         if node.type is NodeType.AGENT:
+            from Sprout.tools.context_keys import _current_project_node
+
+            scope = _current_project_node()
+            if scope is not None and node.id in scope.runtime._online_analysis_requests:
+                return await self._online_project_analysis(node, workspace, task, scope)
             return await self._agent(node, workspace, task)
         if node.type is NodeType.SANDBOX:
             return await self._sandbox(workspace)
         if node.type is NodeType.EVALUATION:
+            from Sprout.execution.local_receipt import evaluate
+            from Sprout.tools.context_keys import _current_project_node
+
+            scope = _current_project_node()
+            if scope is not None:
+                return await evaluate(scope.runtime, scope,
+                                      lambda: self._evaluation(node, workspace, task))
             return await self._evaluation(node, workspace, task)
         if node.type is NodeType.APPROVAL:
             return await self._approval(workspace, task)
@@ -287,9 +334,70 @@ class NodeExecutor:
         return pinned
 
     # -- node branches -----------------------------------------------------
+    async def _check_model_publication(self, node, workspace, task):
+        """Old persisted outputs have no resource/subject receipt: refuse reuse.
+
+        This does not bless an old ALLOW or reconstruct a view from stored
+        text. Only original task input with no upstream artifact dependencies
+        can pass until a separately reviewed provenance contract exists.
+        """
+        from Sprout.tools.context_keys import _current_project_node
+
+        scope = _current_project_node()
+        if (scope is None or scope.node.id != node.id
+                or scope.runtime._metadata_or_raise() is not self._metadata):
+            raise PermissionError("node_publication_subject_unavailable")
+        current, authoritative_workspace = await scope.runtime._project_analysis_subject(scope)
+        persisted = await self._metadata.get_execution_node(node.id)
+        if (current != task or persisted != node
+                or (authoritative_workspace.id, authoritative_workspace.root,
+                    authoritative_workspace.kind, authoritative_workspace.revision)
+                != (workspace.id, workspace.root, workspace.kind, workspace.revision)
+                or current.delegation_scope.is_expired()):
+            raise PermissionError("node_publication_authority_changed")
+        nodes = await self._metadata.list_execution_nodes(current.id)
+        admitted = await scope.runtime._admit_node_products(scope, nodes)
+        if (not admitted and (node.dependencies or node.result_ref is not None
+                or any(item.task_id != current.id or item.result_ref is not None
+                       or item.metadata.get("output") is not None for item in nodes)
+                or set(node.metadata) - {"execution_guard", "read_only", "tool_names"})):
+            raise PermissionError("node_artifact_provenance_unavailable")
+        # Registry identity, not a flag carried in the model's metadata.
+        scope.runtime._node_publications[node.id] = scope
+
+    async def _publish_node_model(self, node, workspace, task, agent, message, context):
+        # Recheck after all asynchronous preparation, before handing ANY text
+        # to an agent/planner. No silent empty replacement on a denied input.
+        await self._check_model_publication(node, workspace, task)
+        from Sprout.tools.context_keys import _current_project_node
+
+        scope = _current_project_node()
+        if "db.read" in scope.task.delegation_scope.allowed_actions:
+            tools = dict(context.tools)
+            database = scope.runtime.tools.get("database_query")
+            tools[database.spec.name] = database
+            context = replace(context, tools=tools)
+        if scope.known_paths:
+            tools = dict(context.tools)
+            for tool in (await scope.runtime._issue_project_analysis_tool(paths=scope.known_paths),
+                         await scope.runtime._issue_project_query_tool(paths=scope.known_paths)):
+                tools[tool.spec.name] = tool
+            context = replace(context, tools=tools)
+        for tool in context.tools.values():
+            scope.runtime._node_tool_scopes[tool] = scope
+        return await agent.run(message, context)
+
     async def _read(
         self, workspace: Workspace, read_plan: ReadPlan, task: Task
     ) -> list[dict]:
+        from Sprout.tools.context_keys import _current_project_node
+
+        scope = _current_project_node()
+        if scope is not None:
+            if not scope.known_paths:
+                scope.read_captured = True
+                return []
+            return await scope.runtime._read_node_selection(scope.known_paths)
         # The task's delegation scope travels with every read (AUTHZ §2.2); a
         # channel that granted read-only access must not get more than that.
         results = await self._read_broker.read(
@@ -305,13 +413,42 @@ class NodeExecutor:
             for item in results
         ]
 
+    async def _online_project_analysis(self, node, workspace, task, scope):
+        """Only a Runtime-owned admission supplies this node's initial tool call."""
+        await self._check_model_publication(node, workspace, task)
+        admission = scope.runtime._online_analysis_requests[node.id]
+        paths = admission["paths"]
+        tool = await scope.runtime._issue_project_analysis_tool(
+            paths=paths or None, discover=not paths,
+        )
+        tools = {tool.spec.name: tool}
+        query = await scope.runtime._issue_project_query_tool(
+            paths=paths or None, discover=not paths)
+        tools[query.spec.name] = query
+        context = self._contexts.build_node_context(
+            user_id=task.actor.user_id, node_id=node.id, tools=tools,
+            metadata={"task_id": task.id},
+        )
+        # This private host instruction is not recovered from JSON or metadata.
+        context = replace(context, metadata={**context.metadata, "resume_tool_calls": [{
+            "id": "host-project-analysis", "name": tool.spec.name,
+            "arguments": {"path": admission["target"],
+                          "instruction": admission["message"].content},
+        }]})
+        message = Message(content=admission["message"].content, channel="task",
+                          user_id=task.actor.user_id)
+        result = await self._publish_node_model(
+            node, workspace, task, self._router.route(message), message, context,
+        )
+        return {"content": result.content, "analysis_ok": admission["analysis_result"] is not None}
+
     async def _agent(
         self, node: ExecutionNode, workspace: Workspace, task: Task
     ) -> dict:
+        await self._check_model_publication(node, workspace, task)
         if node.metadata.get("read_only"):
             result = await self._plan(
                 node, workspace, task,
-                prompt="Analyze the project without modifying any files.\n" + task.instruction,
             )
             return {"content": result["plan"], "read_only": True}
         nodes = await self._metadata.list_execution_nodes(task.id)
@@ -443,7 +580,7 @@ class NodeExecutor:
         # ``context.tools`` and the executor dispatches from there, so two
         # nodes running at once cannot unregister each other's tools.
         agent = self._router.route(message)
-        result = await agent.run(message, context)
+        result = await self._publish_node_model(node, workspace, task, agent, message, context)
         return {
             "content": result.content[:_NODE_OUTPUT_LIMIT],
             "node_id": node.id,
@@ -458,6 +595,9 @@ class NodeExecutor:
         *, prompt: str | None = None,
     ) -> dict:
         """Run a read-only planning pass before the first edit round."""
+        await self._check_model_publication(node, workspace, task)
+        if prompt is not None:
+            raise PermissionError("node_artifact_provenance_unavailable")
         nodes = await self._metadata.list_execution_nodes(task.id)
         sandbox_ref = self._sandbox_ref_from(self._output_for(nodes, NodeType.SANDBOX))
         plan_tools: list = []
@@ -498,7 +638,7 @@ class NodeExecutor:
             },
         )
         agent = self._router.route(message)
-        result = await agent.run(message, context)
+        result = await self._publish_node_model(node, workspace, task, agent, message, context)
         return {
             "plan": result.content[:_NODE_OUTPUT_LIMIT],
             "node_id": node.id,
@@ -533,6 +673,8 @@ class NodeExecutor:
             return {**measured, "isolated_design": True, "acceptance_spec": spec.to_payload(),
                     "acceptance_fingerprint": fingerprint, "baseline": measured.get("results", []),
                     "baseline_failed": measured.get("status") == "failed"}
+        if task.metadata.get("host_acceptance_v1") is not None:
+            return await self._host_test_design(node, workspace, task, sandbox)
         payload = previous.get("acceptance_spec")
         binding = None
         if self._local_acceptance:
@@ -599,13 +741,65 @@ class NodeExecutor:
         if binding is not None:
             output["local_executor"] = binding
             red = {"assertion_failed", "requirement_not_implemented",
-                   "target_module_not_implemented"}
+                   "target_module_not_implemented", "target_exception"}
             output["baseline_failed"] = any(item["category"] in red for item in baseline)
             output["local_baseline_valid"] = (not pending and all(
                 item["category"] in red | {"passed"} for item in baseline))
             if not pending and not output["local_baseline_valid"]:
                 output.update(self._acceptance_wait("local_baseline_invalid"))
         return output
+
+    async def _host_test_design(self, node, workspace, task, sandbox):
+        from Sprout.execution.host_acceptance import check_binding
+        from Sprout.tools.context_keys import _current_project_node
+
+        # This admits READ/SANDBOX/PLAN with fresh authority and real source
+        # receipts. A host specification cannot excuse an untracked model effect.
+        await self._check_model_publication(node, workspace, task)
+        frozen = task.metadata["host_acceptance_v1"]
+        spec = check_binding(task, workspace, frozen)
+        scope = _current_project_node()
+        receipts = {entry["path"]: entry for entry in scope.resource_receipts}
+        expected = {frozen["test_path"]: render_acceptance_tests(spec),
+                    frozen["demo_path"]: render_acceptance_demo(spec)}
+        for path, text in expected.items():
+            pinned = frozen["resources"][path]
+            latest = receipts.get(path)
+            if latest is None or any(latest[k] != pinned[k] for k in ("digest", "identity")):
+                raise PermissionError("host_acceptance_source_changed")
+            read = await self._file_broker.read_text(
+                sandbox, path, task_id=task.id, scope=task.delegation_scope, actor=task.actor)
+            if not read.wrote or read.content.replace("\r\n", "\n") != text:
+                raise PermissionError("host_acceptance_worktree_changed")
+        executor = local_executor_binding()
+        baseline = []
+        for case in spec.cases:
+            outcome = await self._local_acceptance_run(
+                workspace, task, sandbox.root, spec, frozen["test_path"], case.id, executor)
+            if outcome.allowed and outcome.exit_code is None and outcome.started is not False:
+                from Sprout.tools.result import ToolExecutionUnconfirmed
+
+                raise ToolExecutionUnconfirmed("Frozen pytest execution result unconfirmed")
+            if not outcome.allowed:
+                return {**self._acceptance_wait(outcome.error or "acceptance_execution_denied"),
+                        "waiting_kind": "approval" if outcome.approval_id else "resource",
+                        "pending_approvals": [outcome.approval_id] if outcome.approval_id else [],
+                        "baseline": baseline, "binding_sha256": frozen["sha256"]}
+            baseline.append({"case_id": case.id, "exit_code": outcome.exit_code,
+                "executed": True, "output": _clamp_test_output(
+                    outcome.stdout, outcome.stderr, outcome.error),
+                "category": local_acceptance_evidence(outcome, executor)})
+        valid = all(r["category"] in {
+            "passed", "assertion_failed", "requirement_not_implemented",
+            "target_module_not_implemented", "target_exception"} for r in baseline)
+        return {"acceptance_spec": spec.to_payload(), "test_path": frozen["test_path"],
+                "test_hash": sha256(render_acceptance_tests(spec).encode()).hexdigest(),
+                "demo_path": frozen["demo_path"],
+                "demo_hash": sha256(render_acceptance_demo(spec).encode()).hexdigest(),
+                "binding_sha256": frozen["sha256"], "local_executor": executor,
+                "baseline": baseline, "baseline_failed": any(r["exit_code"] == 1 for r in baseline),
+                "local_baseline_valid": valid, "waiting": False,
+                **(self._acceptance_wait("local_baseline_invalid") if not valid else {})}
 
     @staticmethod
     def _acceptance_wait(reason):
@@ -615,13 +809,48 @@ class NodeExecutor:
     async def _local_acceptance_run(self, workspace, task, cwd, spec, path, case_id, binding):
         if self._isolated_coding_required or not self._local_acceptance:
             raise RuntimeError("Local acceptance unavailable for this backend")
-        return await self._process_broker.run_local_acceptance(
-            workspace, spec, path, case_id, binding, cwd=cwd, task_id=task.id,
-            scope=task.delegation_scope, command_origin="manifest",
-            source=str(task.actor.source or "interactive"),
-            requested_by=task.actor.user_id or "system",
-            resource_scope=task.workspace_id,
-        )
+        contract = None
+        if task.metadata.get("host_acceptance_v1"):
+            from Sprout.execution.models import ProcessResult
+            from Sprout.tools.context_keys import _current_project_node
+
+            scope = _current_project_node()
+            try:
+                if scope is None:
+                    raise PermissionError("Frozen acceptance node unavailable")
+                contract = await scope.runtime._issue_frozen_execution(
+                    cwd, spec, path, case_id, binding)
+            except (OSError, ValueError) as exc:
+                return ProcessResult(command=(), allowed=False, started=False, error=str(exc))
+        for attempt in range(2):
+            execution = (scope.runtime._frozen_execution_record(contract, self._process_broker)
+                         if contract is not None else None)
+            outcome = await self._process_broker.run_local_acceptance(
+                workspace, spec, path, case_id, binding, cwd=cwd, task_id=task.id,
+                scope=task.delegation_scope, command_origin="manifest",
+                source=str(task.actor.source or "interactive"),
+                requested_by=task.actor.user_id or "system",
+                actor=task.actor,
+                resource_scope=task.workspace_id,
+                **({"execution_contract": contract, "session_id": scope.session_id}
+                   if contract is not None else {}),
+            )
+            if execution is None or not outcome.approval_id or attempt:
+                break
+            try:
+                await self._process_broker._wait_frozen_approval(execution, outcome.approval_id)
+                contract = await scope.runtime._issue_frozen_execution(
+                    cwd, spec, path, case_id, binding)
+                fresh = scope.runtime._frozen_execution_record(contract, self._process_broker)
+                fresh["approved_record"] = outcome.approval_id
+            except (OSError, ValueError) as exc:
+                return replace(outcome, error=str(exc), approval_id=None)
+        if (contract is not None and outcome.allowed and outcome.exit_code is None
+                and outcome.started is not False):
+            from Sprout.tools.result import ToolExecutionUnconfirmed
+
+            raise ToolExecutionUnconfirmed("Frozen pytest execution result unconfirmed")
+        return outcome
 
     async def _subtask(
         self, node: ExecutionNode, workspace: Workspace, task: Task
@@ -632,6 +861,7 @@ class NodeExecutor:
         subtask cannot write even if the model asks it to. Its output is
         evidence for the edit round, not a change.
         """
+        await self._check_model_publication(node, workspace, task)
         metadata = node.metadata
         description = str(metadata.get("description") or "").strip()
         if not description:
@@ -693,7 +923,7 @@ class NodeExecutor:
             },
         )
         agent = self._router.route(message)
-        result = await agent.run(message, context)
+        result = await self._publish_node_model(node, workspace, task, agent, message, context)
         return {
             "node_id": node.id,
             "index": metadata.get("index"),
@@ -704,6 +934,10 @@ class NodeExecutor:
 
     def _model_access(self, task, sandbox, tools, resources):
         if not self._isolated_coding_required:
+            if task.execution_mode == "code":
+                # These legacy tools access the host without per-resource Broker checks.
+                tools = [tool for tool in tools if not isinstance(
+                    tool, (SandboxListTool, SandboxSearchTool, SandboxGitTool))]
             return tools, resources
         if sandbox is None:
             raise ValueError("Isolated model tools require a managed sandbox")
@@ -712,6 +946,11 @@ class NodeExecutor:
                 tuple(item for item in resources if guard.allows(item["path"])))
 
     async def _sandbox(self, workspace: Workspace) -> dict:
+        from Sprout.tools.context_keys import _current_project_node
+
+        scope = _current_project_node()
+        if scope is not None:
+            _, workspace = await scope.runtime._project_analysis_subject(scope)
         if workspace.kind is not WorkspaceKind.GIT_REPOSITORY:
             return {
                 "status": "not_applicable",
@@ -720,6 +959,12 @@ class NodeExecutor:
         provider = (IsolatedGitWorktreeSandbox if self._isolated_coding_required
                     else GitWorktreeSandbox)
         ref = await provider(workspace).create()
+        if not self._isolated_coding_required:
+            from Sprout.tools.context_keys import _current_project_node
+
+            scope = _current_project_node()
+            if scope is not None and scope.task.metadata.get("host_acceptance_v1"):
+                await scope.runtime._register_frozen_sandbox(ref)
         return {
             "id": ref.id,
             "kind": ref.kind,
@@ -737,6 +982,11 @@ class NodeExecutor:
         nothing about the diff waiting for approval. It now runs where the agent
         wrote. ``build_commands`` was carried in node metadata and never read.
         """
+        from Sprout.tools.context_keys import _current_project_node
+
+        scope = _current_project_node()
+        if scope is not None and task.id in scope.runtime._verification_hosts:
+            return await scope.runtime._evaluate_host_verification(node)
         nodes = await self._metadata.list_execution_nodes(task.id)
         sandbox_ref = self._sandbox_ref_from(self._output_for(nodes, NodeType.SANDBOX))
         cwd = sandbox_ref.root if sandbox_ref is not None else workspace.root
@@ -842,6 +1092,13 @@ class NodeExecutor:
             raise RuntimeError("Requirement acceptance tests are missing")
         if not planned:
             planned = self._fallback_verification(workspace)
+        from Sprout.tools.context_keys import _current_project_node
+
+        local_scope = _current_project_node()
+        if local_scope is not None:
+            from copy import deepcopy
+
+            local_scope.runtime._local_receipt_plans[(task.id, node.id)] = deepcopy(planned)
         attempts = max(1, int(node.metadata.get("verification_attempts", 1)))
 
         records: list[dict] = []
@@ -890,6 +1147,7 @@ class NodeExecutor:
                     "command": list(outcome.command if kind in local_cases else parts),
                     "exit_code": outcome.exit_code,
                     "allowed": outcome.allowed,
+                    "started": outcome.started,
                     "allowlisted": outcome.allowlisted,
                     "passed": passed,
                     "attempts": attempts,
@@ -972,6 +1230,7 @@ class NodeExecutor:
                 parts,
                 cwd=cwd,
                 task_id=task.id,
+                actor=task.actor,
                 scope=task.delegation_scope,
                 command_origin="manifest",
                 # Carried so a withheld command can be attributed to the task
@@ -995,7 +1254,13 @@ class NodeExecutor:
         """Build changed-file scoped lint/typecheck commands when tools exist."""
         if sandbox_ref is None or workspace.kind is not WorkspaceKind.GIT_REPOSITORY:
             return []
-        changed = await GitWorktreeSandbox(workspace).changed_files(sandbox_ref)
+        from Sprout.tools.context_keys import _current_project_node
+
+        scope = _current_project_node()
+        management_workspace = workspace
+        if scope is not None:
+            _, management_workspace = await scope.runtime._project_analysis_subject(scope)
+        changed = await GitWorktreeSandbox(management_workspace).changed_files(sandbox_ref)
         manifest = workspace.manifest
         languages = set(manifest.detected_languages) if manifest is not None else set()
         commands: list[tuple[str, tuple[str, ...]]] = []
@@ -1027,10 +1292,28 @@ class NodeExecutor:
         return []
 
     async def _approval(self, workspace: Workspace, task: Task) -> dict:
+        from Sprout.tools.context_keys import _current_project_node
+
+        runtime = getattr(getattr(self, "_project_analysis_scope", None), "__self__", None)
+        if (runtime is not None and task.id not in runtime._verification_hosts
+                and "file.apply" in task.delegation_scope.allowed_actions):
+            await runtime._persist_node_products()
+            if any(r.task_id == task.id for r in runtime._local_acceptance_receipts):
+                return await runtime._prepare_local_apply_proposal(_current_project_node())
         nodes = await self._metadata.list_execution_nodes(task.id)
-        sandbox_ref = self._sandbox_ref_from(
-            self._output_for(nodes, NodeType.SANDBOX)
-        )
+        recorded = self._output_for(nodes, NodeType.EVALUATION)
+        review = None
+        # Persisted evidence may require a live origin, never supply one. Losing
+        # the Host registry must not fall back to legacy Git on restart.
+        if ((runtime is not None and task.id in runtime._verification_hosts)
+                or isinstance(recorded, dict) and "manifest_sha256" in recorded):
+            scope = _current_project_node()
+            if (runtime is None or scope is None or scope.runtime is not runtime
+                    or scope.task.id != task.id):
+                raise PermissionError("verification_review_frame_unavailable")
+            review = await runtime._review_proposal_context(scope)
+        sandbox_ref = (review[1] if review else self._sandbox_ref_from(
+            self._output_for(nodes, NodeType.SANDBOX)))
         existing = await self._metadata.list_change_proposals(task.id)
         if existing:
             # Approval is resumable: never mint a second proposal for the same
@@ -1043,7 +1326,7 @@ class NodeExecutor:
                 "waiting": proposal.status is not ChangeProposalStatus.APPROVED,
             }
 
-        evaluation = self._output_for(nodes, NodeType.EVALUATION)
+        evaluation = review[0] if review else self._output_for(nodes, NodeType.EVALUATION)
         test_results = self._test_results_from(evaluation)
         # Commands the policy withheld. Distinct from a failure: nobody looked.
         # They must be removed from ``failed`` before it is used for risk
@@ -1062,17 +1345,22 @@ class NodeExecutor:
         ]
 
         diffs = []
-        files_changed: tuple[str, ...] = ()
-        if sandbox_ref is not None:
-            provider = (IsolatedGitWorktreeSandbox if self._isolated_coding_required
-                        else GitWorktreeSandbox)
-            sandbox = provider(workspace)
-            diff = await sandbox.diff(sandbox_ref)
-            if diff.diff_text:
-                diffs.append(diff)
-            files_changed = await sandbox.changed_files(sandbox_ref)
+        git_evidence = evaluation.get("git_diff", {}) if review else {}
+        if git_evidence.get("status") == "available":
+            from Sprout.execution.models import DiffResult
 
-        if not files_changed and not diffs:
+            text = git_evidence["patches"]["tracked"] + git_evidence["patches"]["untracked"]
+            if text:
+                diffs.append(DiffResult(path="authorized_git_view", diff_text=text))
+        files_changed: tuple[str, ...] = tuple(evaluation["files_changed"]) if review else ()
+        if sandbox_ref is not None and review is None:
+            # Only the live Host-bound review above can supply authenticated
+            # Git evidence. A serialized Evaluation output is not a Git View.
+            # Refuse before building/saving a proposal; never use retired
+            # sandbox.diff or infer a clean tree from unavailable evidence.
+            raise PermissionError("git_diff_unavailable: Task-owned GitBroker review required")
+
+        if not files_changed and not diffs and review is None:
             # A turn that produced no file changes has nothing to apply, so it
             # must not park on a change proposal. Read-only and conversational
             # tasks finish here and return the agent's answer instead.
@@ -1104,13 +1392,29 @@ class NodeExecutor:
         )
         proposal = replace(
             proposal,
-            rollback_plan=(
+            rollback_plan=("Review-only; Apply/Rollback unavailable." if review else
                 f"Roll back the applied commit for change proposal {proposal.id} "
                 f"with `sprout project rollback {proposal.id}`. "
                 f"Files: {', '.join(files_changed) or '(none)'}."
             ),
             metadata={
                 "summary": task.instruction,
+                **({"review_only": True, "workspace_id": workspace.id,
+                    "git_diff_status": ("available" if git_evidence.get("status") == "available"
+                                        else "git_diff_unavailable"),
+                    **({"git_diff": git_evidence} if git_evidence else {}),
+                    "change_coverage": (git_evidence["coverage"]
+                        if git_evidence.get("status") == "available" else {
+                            "status": "authorized_snapshot_paths_only",
+                            "paths": list(evaluation["manifest"]["inputs"]),
+                            "untracked_and_deleted_files": "not_established"}),
+                    "snapshot_sources": {"original": evaluation["original_inputs"],
+                        "modified": evaluation["manifest"]["inputs"]},
+                    "content_diff": {"format": "unified_content_diff",
+                        "text": evaluation["code_diff"],
+                        "sha256": sha256(evaluation["code_diff"].encode("utf-8")).hexdigest(),
+                        "binding_sha256": evaluation["manifest"]["diff"]},
+                    "verification_manifest": evaluation["manifest"]} if review else {}),
                 # An approver must be able to tell "this passed", "this failed"
                 # and "nobody checked" apart — they are different decisions.
                 "verification": {
@@ -1128,6 +1432,10 @@ class NodeExecutor:
                         "acceptance_spec", "baseline", "demo_path", "results", "cwd",
                         "verification_report",
                     )} if isinstance(evaluation, dict) else {}),
+                    **({key: evaluation[key] for key in (
+                        "collection_complete", "verified", "manifest_sha256",
+                        "original_declarations",
+                    )} if review else {}),
                     **({"local_executor": evaluation["local_executor"]}
                        if isinstance(evaluation, dict) and "local_executor" in evaluation else {}),
                     **({"local_baseline_valid": evaluation["local_baseline_valid"]}
@@ -1160,6 +1468,17 @@ class NodeExecutor:
                 raise RuntimeError("Coding task produced no verified change proposal")
             return {"status": "no_change_proposal"}
         proposal = proposals[0]
+        runtime = getattr(getattr(self, "_project_analysis_scope", None), "__self__", None)
+        if "apply_plan" in proposal.metadata:
+            if runtime is None or self._changes is None:
+                raise PermissionError("local_apply_runtime_required")
+            result = await self._changes.apply(proposal.id, principal=task.actor)
+            if not result.applied:
+                uncertain = result.reason.startswith(("UNKNOWN:", "PARTIAL:"))
+                return {"proposal_id": proposal.id, "applied": False, "waiting": True,
+                        "waiting_kind": "resource" if uncertain else "configuration",
+                        "reason": result.reason}
+            return {"proposal_id": proposal.id, "applied": True, "reason": result.reason}
         verification = proposal.metadata.get("verification")
         applicability = verification_evidence_applicability(
             verification, local_execution_available=self._local_acceptance)
@@ -1281,29 +1600,22 @@ class NodeExecutor:
     def _resources(
         read_output: Any, workspace: Workspace
     ) -> tuple[dict[str, str], ...]:
-        """Turn READ node output into bounded resource previews for one node."""
-        if not isinstance(read_output, list):
+        """No old nonempty or malformed READ payload has publication authority."""
+        if read_output is None or read_output == []:
             return ()
-        items: list[dict[str, str]] = []
-        for entry in read_output:
-            if not isinstance(entry, dict):
-                continue
-            raw_path = str(entry.get("path", ""))
-            if not raw_path:
-                continue
-            decision = str(entry.get("decision", ""))
-            want_content = decision not in {"deny", "AccessDecision.DENY"}
-            content = ""
-            if want_content:
-                content = str(entry.get("content") or "")[:_RESOURCE_PREVIEW_CHARS]
-            items.append(
-                {
-                    "path": NodeExecutor._display_path(raw_path, workspace),
-                    "decision": decision,
-                    "content": content,
-                }
-            )
-        return tuple(items)
+        from copy import deepcopy
+
+        from Sprout.tools.context_keys import _current_node_publication
+
+        scope = _current_node_publication()
+        if scope is None or scope.workspace != workspace:
+            raise PermissionError("node_artifact_provenance_unavailable")
+        records = scope.runtime._node_products.values()
+        if not any(record[0] == scope.task and record[2].type is NodeType.READ
+                   and record[3] == read_output and record[5] is scope.runtime
+                   for record in records):
+            raise PermissionError("node_artifact_provenance_unavailable")
+        return tuple(deepcopy(read_output))
 
     @staticmethod
     def _display_path(raw_path: str, workspace: Workspace) -> str:
@@ -1327,6 +1639,11 @@ class NodeExecutor:
         findings: tuple[dict[str, Any], ...] = (),
     ) -> str:
         """Compose the node-level instruction: task plus only its own resources."""
+        if resources or feedback or plan or findings:
+            from Sprout.tools.context_keys import _current_node_publication
+
+            if _current_node_publication() is None:
+                raise PermissionError("node_artifact_provenance_unavailable")
         lines = [task.instruction]
         lines.extend(["", "Use the resource contents and planning findings supplied below first. "
             "Avoid listing or rereading unchanged files already shown in full; read again when "

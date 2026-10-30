@@ -8,6 +8,7 @@ from Sprout.gateway.task_adapter import GatewayRequest, TaskAdapter
 from Sprout.llm.messages import LLMResponse, ToolCall
 from Sprout.orchestration.models import ExecutionNode, NodeType
 from Sprout.task.models import Task, TaskExecutionMode, TaskStatus, execution_metadata
+from Sprout.tests.readonly_host_fixtures import authorized_read_host as authorized_read_host
 from Sprout.tests.test_workspace_consent import _runtime, _runtime_with_agent
 from Sprout.tools.result import ToolResult
 from Sprout.tools.spec import ToolSpec
@@ -60,7 +61,7 @@ async def test_non_git_requires_explicit_read_only_and_legacy_confirmation(tmp_p
 
 
 @pytest.mark.parametrize("git", [False, True])
-async def test_read_only_analysis_never_offers_write_tools(tmp_path, git):
+async def test_read_only_analysis_never_offers_write_tools(tmp_path, git, authorized_read_host):
     class RecordingModel:
         name = "recording"
 
@@ -80,12 +81,17 @@ async def test_read_only_analysis_never_offers_write_tools(tmp_path, git):
     runtime, model = _runtime_with_agent(tmp_path, RecordingModel())
     try:
         workspace = await runtime.open_workspace(root)
+        principal, scope = authorized_read_host(source, source="test-host")
         task = await runtime.create_task_planned(
             workspace.id, "overwrite app.py", execution_mode="read_only",
+            actor=principal, source=principal.source, delegation_scope=scope,
         )
         result = await runtime.execute(task)
         assert result.status == TaskStatus.COMPLETED
-        assert model.tools and all(not tools for tools in model.tools)
+        # B4 advertises bound read-only analysis/query tools, never write tools.
+        assert model.tools and all(
+            set(tools) <= {"project_analyze", "workspace_query"} for tools in model.tools
+        )
         assert source.read_text(encoding="utf-8") == "value = 1\n"
         nodes = await runtime.storage.metadata.list_execution_nodes(task.id)
         assert {node.type for node in nodes} == {NodeType.READ, NodeType.AGENT}
@@ -125,7 +131,7 @@ async def test_mcp_task_creation_preserves_explicit_mode_and_source(tmp_path):
         await runtime.stop()
 
 
-async def test_read_only_rejects_unadvertised_global_tool_calls(tmp_path):
+async def test_read_only_rejects_unadvertised_global_tool_calls(tmp_path, authorized_read_host):
     class HiddenWrite:
         spec = ToolSpec(name="hidden_write", description="test", risk_level="low")
         invoked = False
@@ -139,7 +145,7 @@ async def test_read_only_rejects_unadvertised_global_tool_calls(tmp_path):
         calls = 0
 
         async def chat(self, messages, *, tools=()):
-            assert not tools
+            assert {tool.name for tool in tools} <= {"project_analyze", "workspace_query"}
             self.calls += 1
             if self.calls == 1:
                 return LLMResponse(content=None, tool_calls=(
@@ -152,7 +158,13 @@ async def test_read_only_rejects_unadvertised_global_tool_calls(tmp_path):
     runtime.tools.register(tool)
     try:
         workspace = await runtime.open_workspace(tmp_path)
-        task = await runtime.create_task(workspace.id, "analyze", execution_mode="read_only")
+        selected = tmp_path / "app.py"
+        selected.write_text("value = 1\n", encoding="utf-8")
+        principal, scope = authorized_read_host(selected, source="test-host")
+        task = await runtime.create_task(
+            workspace.id, "analyze", execution_mode="read_only", actor=principal,
+            source=principal.source, delegation_scope=scope,
+        )
         result = await runtime.execute(task)
         assert result.status == TaskStatus.COMPLETED, result.error
         assert not tool.invoked, "Read-only scope fell back to the global tool registry"

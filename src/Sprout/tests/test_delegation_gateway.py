@@ -8,10 +8,10 @@ from pathlib import Path
 from Sprout.config.loader import default_settings
 from Sprout.gateway.delegation_gateway import DelegationGateway
 from Sprout.runtime.factory import create_runtime
-from Sprout.task.models import DelegationScope
+from Sprout.tests.readonly_host_fixtures import authorized_read_host as authorized_read_host
 
 
-def test_delegation_gateway_uses_scope(tmp_path: Path) -> None:
+def test_delegation_gateway_uses_scope(tmp_path: Path, authorized_read_host) -> None:
     (tmp_path / "pyproject.toml").write_text(
         "[project]\nname='demo'\nversion='0.1.0'\n",
         encoding="utf-8",
@@ -38,12 +38,14 @@ def test_delegation_gateway_uses_scope(tmp_path: Path) -> None:
         runtime = create_runtime(settings)
         workspace = await runtime.open_workspace(tmp_path)
         gateway = DelegationGateway(runtime)
+        principal, scope = authorized_read_host(tmp_path / "src/main.py", source="delegate-host")
         response = await gateway.execute(
             "explain this project",
             workspace_id=workspace.id,
             caller_id="external-agent",
             execution_mode="read_only",
-            scope=DelegationScope(allowed_actions=frozenset({"file.read"})),
+            scope=scope,
+            principal=principal,
         )
         assert response.status in {"waiting_approval", "completed"}
         assert response.task_id

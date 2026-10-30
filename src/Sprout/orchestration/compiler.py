@@ -183,6 +183,9 @@ class ExecutionGraphBuilder:
             task_id=task.id,
             type=NodeType.APPROVAL,
             dependencies=(previous_evaluation_id or "",),
+            budget=(NodeBudget(max_attempts=1, timeout_seconds=evaluation_timeout_seconds)
+                    if {"file.apply", "git.diff"}.issubset(task.delegation_scope.allowed_actions)
+                    else NodeBudget()),
         )
         apply_node = ExecutionNode(
             id=apply_id,

@@ -211,7 +211,7 @@ def test_git_tools_expose_common_inspect_and_write_operations() -> None:
 
 
 @pytest.mark.asyncio
-async def test_git_inspect_diff_builds_structured_command(monkeypatch) -> None:
+async def test_git_inspect_without_broker_refuses_host_execution(monkeypatch) -> None:
     calls = []
 
     async def fake_run_git(args):
@@ -231,14 +231,13 @@ async def test_git_inspect_diff_builds_structured_command(monkeypatch) -> None:
         }
     )
 
-    assert result.ok
-    assert calls == [
-        ["-C", "/repo", "diff", "--name-only", "main..HEAD", "--", "src/app.py"]
-    ]
+    assert not result.ok
+    assert "GitBroker" in result.to_text()
+    assert calls == []
 
 
 @pytest.mark.asyncio
-async def test_git_write_push_and_restore_build_structured_commands(monkeypatch) -> None:
+async def test_git_write_without_broker_refuses_host_execution(monkeypatch) -> None:
     calls = []
 
     async def fake_run_git(args):
@@ -265,15 +264,13 @@ async def test_git_write_push_and_restore_build_structured_commands(monkeypatch)
         }
     )
 
-    assert push.ok and restore.ok
-    assert calls == [
-        ["-C", "/repo", "push", "--set-upstream", "origin", "feature/git-tools"],
-        ["-C", "/repo", "restore", "--source", "HEAD", "--", "README.md"],
-    ]
+    assert not push.ok and not restore.ok
+    assert "GitBroker" in push.to_text() and "GitBroker" in restore.to_text()
+    assert calls == []
 
 
 @pytest.mark.asyncio
-async def test_git_tools_fall_back_when_broker_lacks_new_operations(monkeypatch) -> None:
+async def test_git_tools_refuse_unsupported_operations_without_host_fallback(monkeypatch) -> None:
     calls = []
 
     async def fake_run_git(args):
@@ -294,11 +291,9 @@ async def test_git_tools_fall_back_when_broker_lacks_new_operations(monkeypatch)
         }
     )
 
-    assert inspect.ok and write.ok
-    assert calls == [
-        ["-C", "/repo", "rev-parse", "--verify", "HEAD"],
-        ["-C", "/repo", "push", "origin", "main"],
-    ]
+    assert not inspect.ok and not write.ok
+    assert "not supported" in inspect.to_text() and "not supported" in write.to_text()
+    assert calls == []
 
 
 @pytest.mark.asyncio

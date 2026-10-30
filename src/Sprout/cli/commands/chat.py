@@ -340,6 +340,149 @@ async def _execute_language_command(requested: str | None = None) -> None:
         _apply_language_request(selected)
 
 
+async def _provide_cli_analysis_task(runtime, workspace_id, *, message, session, principal):
+    """Explicit fixed resources; Workspace confirmation alone grants nothing."""
+    from Sprout.task.models import DelegationScope, TaskExecutionMode
+    from Sprout.task.paths import bound_scope_path, scope_path
+    from Sprout.workspace.authorized_content import ContentLimits, relative_label
+
+    if not principal.authenticated or principal.source != "cli":
+        raise PermissionError("cli_analysis_identity_unavailable")
+    workspace = await runtime.get_workspace(workspace_id) if workspace_id else None
+    if workspace is None:
+        raise PermissionError("cli_analysis_workspace_required")
+    if not sys.stdin.isatty():
+        raise PermissionError("cli_analysis_interactive_confirmation_required")
+    typer.echo(_L("本次只读分析工作区：", "Read-only analysis workspace: ")
+               + f"{workspace.id}  {workspace.root}")
+    typer.echo(_L(
+        "选择范围不替代 Policy/Scope 授权。", "Selection does not override Policy/Scope.",
+    ))
+    if any(term in message.content.casefold() for term in (
+            "整个项目", "完整项目", "whole project", "entire project")):
+        return await _provide_cli_directory_task(runtime, workspace, session, principal, message)
+    try:
+        raw = await questionary.text(_L(
+            "输入 Workspace 相对文件路径或 JSON 文件清单（空白取消）：",
+            "Enter a workspace-relative file or JSON file list (blank cancels):",
+        )).ask_async()
+        if not raw or not raw.strip():
+            return None
+        try:
+            if raw.lstrip().startswith("["):
+                selected = json.loads(raw)
+                if (type(selected) is not list or not selected
+                        or len(selected) > ContentLimits().max_files
+                        or any(type(path) is not str for path in selected)):
+                    raise ValueError("invalid_manifest")
+            else:
+                selected = [line.strip() for line in raw.splitlines() if line.strip()]
+                if len(selected) != 1:
+                    # Preserve the old plain-text format; multi-file input is
+                    # explicit JSON, never silently truncated to its first line.
+                    raise PermissionError("project_multi_file_analysis_unavailable")
+                if selected[0].casefold() in {"auto", "自动", "自动发现", "*", "**"}:
+                    raise PermissionError("project_auto_discovery_unavailable")
+            paths = tuple(relative_label(path.replace("\\", "/")) for path in selected)
+            if len({path.casefold() for path in paths}) != len(paths):
+                raise ValueError("duplicate_manifest_path")
+        except (ValueError, TypeError) as exc:
+            raise PermissionError("analysis_file_selection_invalid") from exc
+        root = scope_path(str(workspace.root))
+        for path in paths:
+            target = scope_path(bound_scope_path(path, str(workspace.root)))
+            if root is None or target is None or not root.contains(target):
+                raise PermissionError("analysis_file_selection_invalid")
+        typer.echo(_L("本次分析请求：", "Analysis request: ") + message.content)
+        typer.echo(_L("只读取所选文件：", "Selected files only: ") + "\n" + "\n".join(paths))
+        confirmed = await questionary.confirm(_L(
+            "确认请求分析以上文件？", "Confirm analysis of these files?",
+        ), default=False).ask_async()
+        if not confirmed:
+            return None
+    except (EOFError, KeyboardInterrupt):
+        return None
+    # Prompts can yield. Recheck the actual Session before creating the Task;
+    # --user and Message.user_id never become the authenticated actor.
+    owned = await runtime._sessions.require_owner(session.id, principal)
+    frozen = runtime._sessions.frozen_principal(owned)
+    if (frozen.user_id, frozen.source, frozen.authenticated) != (
+            principal.user_id, principal.source, principal.authenticated):
+        raise PermissionError("cli_analysis_identity_unavailable")
+    return await runtime.create_task(
+        workspace.id, message.content, actor=principal, source=principal.source,
+        execution_mode=TaskExecutionMode.READ_ONLY,
+        delegation_scope=DelegationScope(
+            allowed_actions=frozenset({"tool.invoke", "file.read"}),
+            allowed_paths=tuple(str(workspace.root / path) for path in paths),
+        ),
+        metadata={"session_id": owned.id, "required_paths": list(paths)},
+    )
+
+
+async def _provide_cli_directory_task(runtime, workspace, session, principal, message):
+    """Confirm a finite directory request; only server policy grants enumeration."""
+    from Sprout.security.access import AccessDecision, ActionRequest, ActionType
+    from Sprout.task.models import DelegationScope, TaskExecutionMode
+    from Sprout.workspace.authorized_content import relative_label
+    from Sprout.workspace.models import ResourceKind, ResourceRef
+
+    try:
+        raw = await questionary.text(_L(
+            "本次自动分析目录（Workspace 相对路径，. 表示项目根；空白取消）：",
+            "Analysis directory (workspace-relative, . for root; blank cancels):",
+        )).ask_async()
+        if not raw or not raw.strip():
+            return None
+        label = raw.strip().replace("\\", "/")
+        try:
+            label = "." if label == "." else relative_label(label)
+        except (ValueError, TypeError) as exc:
+            raise PermissionError("analysis_directory_selection_invalid") from exc
+        target = workspace.root if label == "." else workspace.root / label
+        typer.echo(_L("自动分析授权范围：", "Automatic analysis scope: ") + str(target))
+        if not await questionary.confirm(_L(
+                "确认请求读取此目录下获准的项目文件？",
+                "Confirm analysis of authorized project files in this directory?"),
+                default=False).ask_async():
+            return None
+    except (EOFError, KeyboardInterrupt):
+        return None
+    owned = await runtime._sessions.require_owner(session.id, principal)
+    if runtime._sessions.frozen_principal(owned) != principal:
+        raise PermissionError("cli_analysis_identity_unavailable")
+    scope = DelegationScope(
+        allowed_actions=frozenset({"tool.invoke", "file.read", "directory.list"}),
+        allowed_paths=(str(target),),
+    )
+    decision = runtime._policy_engine.decide(ActionRequest(
+        actor=principal, action=ActionType.DIRECTORY_LIST,
+        resource=ResourceRef(workspace.id, str(target), ResourceKind.OTHER), scope=scope,
+    ))
+    if (decision.decision is not AccessDecision.ALLOW
+            or not any(rule.startswith("directory:grant:") for rule in decision.matched_rules)):
+        raise PermissionError("directory.list requires explicit server directory authorization")
+    return await runtime.create_task(
+        workspace.id, message.content, actor=principal, source=principal.source,
+        execution_mode=TaskExecutionMode.READ_ONLY, delegation_scope=scope,
+        metadata={"session_id": owned.id, "analysis_directory": label},
+    )
+
+
+def _cli_analysis_task_provider(runtime, workspace_id, live=None):
+    """Bind one turn's host and terminal, not mutable REPL loop variables."""
+    async def provide(**request):
+        # readline has completed; suspend Rich before questionary owns input.
+        if live is not None:
+            live.stop()
+        try:
+            return await _provide_cli_analysis_task(runtime, workspace_id, **request)
+        finally:
+            if live is not None:
+                live.start()
+    return provide
+
+
 async def _repl(
     gateway,
     *,
@@ -382,6 +525,18 @@ async def _repl(
         if _handle_natural_language_request(content):
             continue
         if content.startswith("/"):
+            if content == "/permissions":
+                from Sprout.cli.commands.security import session_permission_inventory
+
+                try:
+                    permissions = await session_permission_inventory(
+                        runtime, session_id=session,
+                        principal=current_cli_principal() if session else None)
+                except PermissionError as error:
+                    typer.echo(ui.warning(str(error)))
+                    continue
+                typer.echo(json.dumps(permissions, ensure_ascii=False, indent=2))
+                continue
             if content in {"/", "/help"}:
                 if content == "/help":
                     _show_slash_directory()
@@ -565,6 +720,11 @@ async def _repl(
         reply_metadata: dict = {}
         response_error: str | None = None
         console = Console(theme=_CLI_MARKDOWN_THEME)
+        try:
+            principal = current_cli_principal()
+        except ValueError:
+            typer.echo(ui.warning("cli_analysis_identity_unavailable"))
+            continue
         if console.is_terminal:
             with Live(
                 Spinner(
@@ -579,7 +739,8 @@ async def _repl(
                 vertical_overflow="crop",
             ) as live:
                 async for chunk in runtime.handle_stream(
-                    stream_message, principal=current_cli_principal(), foreground=True
+                    stream_message, principal=principal, foreground=True,
+                    analysis_task_provider=_cli_analysis_task_provider(runtime, workspace_id, live),
                 ):
                     if chunk.error is not None:
                         response_error = chunk.error
@@ -598,7 +759,8 @@ async def _repl(
         else:
             typer.echo(ui.muted(_L("  正在生成…", "  Generating…")))
             async for chunk in runtime.handle_stream(
-                stream_message, principal=current_cli_principal(), foreground=True
+                stream_message, principal=principal, foreground=True,
+                analysis_task_provider=_cli_analysis_task_provider(runtime, workspace_id),
             ):
                 if chunk.error is not None:
                     response_error = chunk.error
@@ -1185,7 +1347,8 @@ def _approval_action_lines(record: Any, pending: object) -> list[str]:
 def _print_approval_record(record: Any, pending: object = ()) -> None:
     typer.echo("")
     typer.echo(ui.text(_approval_text("title"), bold=True))
-    scope = "similar_scope" if getattr(record, "approval_class", "") else "exact_scope"
+    scope = ("similar_scope" if getattr(record, "approval_class", "")
+             and getattr(record, "session_id", "") else "exact_scope")
     rows = _approval_detail_rows(record)
     rows.extend(
         (_approval_text("action"), line)
@@ -1195,7 +1358,17 @@ def _print_approval_record(record: Any, pending: object = ()) -> None:
         _approval_text("scope"),
         _approval_text(scope, command=_approval_command(record)),
     ))
-    rendered = [f"{label}  {value or '-'}" for label, value in rows]
+    from rich.ansi import AnsiDecoder
+
+    available = max(20, shutil.get_terminal_size(fallback=(80, 24)).columns - 4)
+    console = Console(width=available, color_system=None)
+    rendered = []
+    for label, value in rows:
+        if not value or value == "-":
+            continue
+        # Literal text, never Rich markup. Strip control sequences before measuring.
+        clean = " ".join(part.plain for part in AnsiDecoder().decode(f"{label}  {value}"))
+        rendered.extend(part.plain for part in Text(clean).wrap(console, available))
     width = max((cell_len(line) for line in rendered), default=0)
     typer.echo("+" + "-" * (width + 2) + "+")
     for line in rendered:
@@ -1226,7 +1399,7 @@ def _approval_detail_rows(record: Any) -> list[tuple[str, str]]:
 
 async def _prompt_approval_decision(record: Any) -> str:
     choices = [questionary.Choice(_approval_text("yes_once"), "approve_once")]
-    if getattr(record, "approval_class", ""):
+    if getattr(record, "approval_class", "") and getattr(record, "session_id", ""):
         choices.append(
             questionary.Choice(_approval_text("yes_similar"), "approve_similar")
         )
@@ -1278,9 +1451,9 @@ _APPROVAL_TEXT: dict[str, dict[str, str]] = {
         "pt": "Permitir esta operação: {tool}?",
     },
     "yes_once": {
-        "zh": "Yes，只为本轮对话",
+        "zh": "仅本次操作",
         "zh-Hant": "Yes，僅限本輪對話",
-        "en": "Yes, this turn only",
+        "en": "This operation only",
         "ja": "Yes、このターンのみ",
         "ko": "Yes, 이번 대화만",
         "ru": "Yes, только для этого хода",
@@ -1288,9 +1461,9 @@ _APPROVAL_TEXT: dict[str, dict[str, str]] = {
         "pt": "Yes, somente esta rodada",
     },
     "yes_similar": {
-        "zh": "Yes，整个此类都同意",
-        "zh-Hant": "Yes，同類全部同意",
-        "en": "Yes, allow this similar class",
+        "zh": "当前Session，相同命令与资源",
+        "zh-Hant": "目前Session，相同命令與資源",
+        "en": "This session, same operation and resources",
         "ja": "Yes、この同種の操作を許可",
         "ko": "Yes, 같은 유형 허용",
         "ru": "Yes, разрешить этот похожий класс",
@@ -1308,10 +1481,11 @@ _APPROVAL_TEXT: dict[str, dict[str, str]] = {
         "pt": "No, negar",
     },
     "similar_scope": {
-        "zh": "说明：{command} 同类授权仅适用于当前任务和会话，不是全局授权。",
+        "zh": ("说明：{command} 仅复用当前Session、相同主体的相同命令、参数与资源授权。"
+               "Task权限仍逐次核验。"),
         "zh-Hant": "說明：{command} 同類授權僅適用於目前任務和對話，不是全域授權。",
         "en": (
-            "Note: {command} class approval covers this task and session; "
+            "Note: {command}, same session, principal, exact arguments and resources; "
             "it is not a global grant."
         ),
         "ja": (
@@ -1975,6 +2149,7 @@ _SLASH_ROWS = [
     ("/remote", "远程操作", "Remote operations"),
     ("/evolution", "成长平面", "Evolution"),
     ("/approvals", "审批操作", "Approvals"),
+    ("/permissions", "当前工具权限与审批范围", "Effective tool gates and approval scope"),
     ("/audit", "审计验证", "Audit verification"),
     ("/serve", "启动 Web 控制台", "Start web console"),
     ("/web", "打开 Web 控制台", "Open web console"),

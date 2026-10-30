@@ -44,12 +44,292 @@ class FileBroker:
         self._classify_overrides = dict(classify_overrides or {})
         self._events = events
         self._approvals = approvals
+        self._apply_resolver = None  # Installed only by the trusted Apply coordinator.
 
     def _classify(self, target: Path, sandbox: SandboxRef) -> ResourceKind:
         return classify(
             target.relative_to(self._root(sandbox)).as_posix(),
             overrides=self._classify_overrides,
         )
+
+    async def _node_attribution(self, request, sandbox):
+        from Sprout.tools.context_keys import _NODE_TOOL_CALL, _current_node_tool_call
+
+        if _NODE_TOOL_CALL.get() is None:
+            return request  # Existing explicit host Broker contract is unchanged.
+        frame = _current_node_tool_call()
+        if frame is None:
+            raise PermissionError("node_file_binding_unavailable")
+        return await frame[3].runtime._node_file_request(request, sandbox)
+
+    async def enumerate_readable(
+        self, sandbox=None, relative_directory=None, *, subject=None, limits=None,
+    ):
+        """B1-bound scoped names, no approval consumption or content reads.
+
+        Each visited directory and visible child needs an exact server grant.
+        Revocation is checked before accesses and publication, not linearized.
+        """
+        from dataclasses import replace
+
+        from Sprout.execution.file_access import directory_entries
+        from Sprout.execution.file_snapshot import (
+            DirectoryEntry,
+            DirectoryListingResult,
+            DirectoryReadLimits,
+            current_read_subject,
+            valid_identity,
+        )
+
+        limits = limits or DirectoryReadLimits()
+        if sandbox is None or relative_directory is None or subject is None:
+            return DirectoryListingResult(reason="directory_enumeration_unavailable")
+        if (type(limits) is not DirectoryReadLimits
+                or any(type(x) is not int or x < 1 for x in
+                       (limits.max_entries, limits.max_depth, limits.max_files))
+                or limits.max_entries > 10000 or limits.max_depth > 32
+                or limits.max_files > 2048):
+            return DirectoryListingResult(reason="directory_invalid_budget")
+        try:
+            target = self._safe_target(sandbox, relative_directory)
+            if target is None or type(subject) is not ActionRequest:
+                raise PermissionError("directory_subject_unavailable")
+            initial = await current_read_subject(str(target))
+            if (subject.actor != initial.actor or subject.task_id != initial.task_id
+                    or subject.scope != initial.scope or subject.resource != initial.resource):
+                raise PermissionError("directory_subject_mismatch")
+            from Sprout.tools.context_keys import _current_project_analysis_call
+
+            frame = _current_project_analysis_call()
+            if (initial.resource.workspace_id != sandbox.id
+                    or self._root(sandbox) != Path(frame.node_scope.workspace.root)):
+                raise PermissionError("directory_workspace_mismatch")
+
+            async def authorize(path):
+                try:
+                    await frame.node_scope.runtime._check_project_selection(
+                        (frame, initial, frame.node_scope.workspace), resource_path=str(path),
+                    )
+                    fresh = await current_read_subject(str(path))
+                except PermissionError:
+                    return False
+                if fresh.actor != initial.actor or fresh.scope != initial.scope:
+                    raise PermissionError("directory_authority_changed")
+                request = replace(fresh, action=ActionType.DIRECTORY_LIST,
+                                  resource=ResourceRef(sandbox.id, path.as_posix(),
+                                                       self._classify(path, sandbox)))
+                decision = self._policy.decide(request)
+                await emit_policy_decision(self._events, request, decision)
+                return (decision.decision is AccessDecision.ALLOW
+                        and any(rule.startswith("directory:grant:")
+                                for rule in decision.matched_rules)
+                        and not request.scope.is_expired()
+                        and request.scope.permits(request.action.value, path.as_posix()))
+
+            pending, visible, checked, count, files = [(target, 0)], [], [], 0, 0
+            async def observe(path):
+                nonlocal count
+                count += 1
+                if count > limits.max_entries:
+                    raise PermissionError("directory_budget_exceeded")
+                return await authorize(path)
+
+            while pending:
+                directory, depth = pending.pop()
+                if not await authorize(directory):
+                    raise PermissionError("directory_authorization_denied")
+                checked.append(directory)
+                before_count = count
+                entries = await directory_entries(self._root(sandbox), directory,
+                                                  limits.max_entries - count, observe)
+                if type(entries) is not tuple:
+                    raise PermissionError("directory_result_invalid")
+                count = max(count, before_count + len(entries))
+                if count > limits.max_entries:
+                    raise PermissionError("directory_budget_exceeded")
+                for entry in entries:
+                    if (type(entry) is not DirectoryEntry
+                            or type(entry.relative_path) is not str
+                            or type(entry.is_directory) is not bool
+                            or not valid_identity(entry.identity)):
+                        raise PermissionError("directory_result_invalid")
+                    path = self._root(sandbox) / entry.relative_path
+                    if (self._safe_target(sandbox, entry.relative_path) != path
+                            or path.parent != directory
+                            or any(item.relative_path == entry.relative_path for item in visible)):
+                        raise PermissionError("directory_result_invalid")
+                    if not await authorize(path):
+                        continue  # No denied name, count or identity is published.
+                    checked.append(path)
+                    visible.append(entry)
+                    if entry.is_directory:
+                        if depth >= limits.max_depth:
+                            raise PermissionError("directory_budget_exceeded")
+                        pending.append((path, depth + 1))
+                    else:
+                        files += 1
+                        if files > limits.max_files:
+                            raise PermissionError("directory_budget_exceeded")
+            for path in checked:
+                if not await authorize(path):
+                    raise PermissionError("directory_authorization_changed")
+            return DirectoryListingResult(True, entries=tuple(visible))
+        except (OSError, ValueError):
+            return DirectoryListingResult(reason="directory_enumeration_unavailable")
+
+    async def read_snapshot(
+        self, sandbox, relative_path, *, subject: ActionRequest, max_bytes, expected_identity=None,
+    ):
+        return await self._read_snapshot_impl(sandbox, relative_path, subject=subject,
+            max_bytes=max_bytes, expected_identity=expected_identity)
+
+    async def read_worktree_snapshot(self, sandbox, relative_path, *, max_bytes=100_000):
+        """F3-only raw bytes: the issuer registry supplies every authority field."""
+        from Sprout.execution.verification_manifest import snapshot_subject
+
+        try:
+            target = self._safe_target(sandbox, relative_path)
+            if target is None:
+                raise PermissionError("verification_snapshot_boundary")
+            subject = await snapshot_subject(sandbox, str(target))
+            return await self._read_snapshot_impl(sandbox, relative_path, subject=subject,
+                max_bytes=max_bytes, verification=True)
+        except (OSError, ValueError):
+            from Sprout.execution.file_snapshot import SnapshotResult
+
+            return SnapshotResult(reason="verification_snapshot_unavailable")
+
+    async def _read_snapshot_impl(self, sandbox, relative_path, *, subject, max_bytes,
+                                  expected_identity=None, verification=False):
+        """Internal B1-bound single-file capture; no partial result on failure.
+
+        Authority is refreshed before access and before return. This is not a
+        linearizable revocation fence. Cancellation joins the worker before
+        propagating, so cancelling the await is not mistaken for handle closure.
+        """
+        from dataclasses import replace
+        from threading import Event
+
+        from Sprout.execution.file_snapshot import (
+            SnapshotResult,
+            _ReadOptions,
+            checked_snapshot,
+            current_read_subject,
+            valid_identity,
+        )
+
+        if (type(max_bytes) is not int or not 0 < max_bytes <= 16 * 1024 * 1024
+                or (expected_identity is not None
+                    and not valid_identity(expected_identity))):
+            return SnapshotResult(reason="snapshot_invalid_budget_or_identity")
+        stopped = Event()
+        try:
+            if type(subject) is not ActionRequest:
+                return SnapshotResult(reason="snapshot_subject_unavailable")
+            target = self._safe_target(sandbox, relative_path)
+            if target is None:
+                return SnapshotResult(reason="snapshot_boundary_denied")
+            async def resolve_subject():
+                if verification:
+                    from Sprout.execution.verification_manifest import snapshot_subject
+
+                    return await snapshot_subject(sandbox, str(target))
+                return await current_read_subject(str(target))
+
+            canonical = await resolve_subject()
+            if (subject.actor != canonical.actor or subject.task_id != canonical.task_id
+                    or subject.resource != canonical.resource or subject.scope != canonical.scope
+                    or subject.action != canonical.action):
+                return SnapshotResult(reason="snapshot_subject_mismatch")
+            subject = canonical  # Caller fields constrain; only the issuer supplies authority.
+            if subject.resource.workspace_id != sandbox.id:
+                return SnapshotResult(reason="snapshot_workspace_mismatch")
+            # The B1 request has checked the authoritative workspace root/path.
+            # Require exactly that root, not a caller-selected broader sandbox.
+            from Sprout.tools.context_keys import _current_project_analysis_call
+
+            if not verification:
+                frame = _current_project_analysis_call()
+                if self._root(sandbox) != Path(frame.node_scope.workspace.root):
+                    return SnapshotResult(reason="snapshot_workspace_mismatch")
+            kind = self._classify(target, sandbox)
+            request = replace(subject, action=ActionType.FILE_READ,
+                              resource=ResourceRef(workspace_id=sandbox.id,
+                                                   path=target.as_posix(), kind=kind))
+            if kind not in {ResourceKind.SOURCE, ResourceKind.TEST, ResourceKind.CONFIG,
+                            ResourceKind.PUBLIC, ResourceKind.DOCUMENTATION}:
+                await emit_policy_decision(self._events, request, PolicyDecision(
+                    AccessDecision.DENY, "snapshot_classification_denied",
+                    matched_rules=("broker:snapshot:classification",),
+                ))
+                return SnapshotResult(reason="snapshot_classification_denied")
+
+            def evaluate(req):
+                decision = self._policy.decide(req)
+                if (req.scope.is_expired()
+                        or not req.scope.permits(ActionType.FILE_READ.value, req.resource.path)):
+                    return PolicyDecision(
+                        AccessDecision.DENY, "DelegationScope expired or outside resource boundary",
+                        matched_rules=("scope:expired" if req.scope.is_expired()
+                                       else "scope:denied",),
+                    )
+                return decision
+
+            async def decide(req):
+                decision = evaluate(req)
+                await emit_policy_decision(self._events, req, decision)
+                if (decision.decision is not AccessDecision.ALLOW
+                        or req.scope.is_expired()
+                        or not req.scope.permits(ActionType.FILE_READ.value, req.resource.path)):
+                    raise PermissionError("snapshot_authorization_denied")
+
+            await decide(request)
+            final_decisions = []
+
+            def final_authorize():
+                decision = evaluate(request)
+                final_decisions.append(decision)
+                if (stopped.is_set() or decision.decision is not AccessDecision.ALLOW
+                        or request.scope.is_expired()
+                        or not request.scope.permits(
+                            ActionType.FILE_READ.value, target.as_posix())):
+                    raise FileBoundaryError("snapshot_authorization_denied")
+
+            worker = asyncio.create_task(asyncio.to_thread(
+                file_operation, self._root(sandbox), target, "snapshot", final_authorize,
+                content=_ReadOptions(max_bytes, expected_identity, stopped, final_authorize),
+            ))
+            try:
+                result = await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                stopped.set()
+                # Repeated cancellation must not abandon a live fd-owning worker.
+                while not worker.done():
+                    try:
+                        await asyncio.shield(worker)
+                    except asyncio.CancelledError:
+                        continue
+                    except (OSError, ValueError):
+                        break
+                if worker.done() and not worker.cancelled():
+                    worker.exception()
+                raise
+            finally:
+                if final_decisions:
+                    await emit_policy_decision(self._events, request, final_decisions[-1])
+            result = checked_snapshot(result, max_bytes, expected_identity)
+            if not result.ok:
+                return result
+            latest = await resolve_subject()
+            if (latest.actor != subject.actor or latest.task_id != subject.task_id
+                    or latest.resource != subject.resource or latest.scope != subject.scope):
+                return SnapshotResult(reason="snapshot_authority_changed")
+            await decide(replace(request, scope=latest.scope, actor=latest.actor))
+            return result
+        except (OSError, ValueError):
+            return SnapshotResult(reason="snapshot_unavailable")
+        finally:
+            stopped.set()
 
     @staticmethod
     def _root(sandbox: SandboxRef) -> Path:
@@ -128,6 +408,7 @@ class FileBroker:
                 str(self._root(sandbox)),
             ),
         )
+        request = await self._node_attribution(request, sandbox)
         decision = self._policy.decide(request)
         await emit_policy_decision(self._events, request, decision)
         if decision.decision is not AccessDecision.SANDBOX_ONLY:
@@ -143,6 +424,160 @@ class FileBroker:
         return FileResult(path=str(relative_path), wrote=ok, resource_kind=kind.value,
                           reason="" if ok else value)
 
+    async def _local_receipt_snapshot(self, scope, sandbox, path, *, pin_stack=None):
+        """Only the live Local EVALUATION owner can capture a registered input."""
+        import os
+        from dataclasses import asdict
+        from threading import Event
+
+        from Sprout.execution.file_snapshot import _ReadOptions, checked_snapshot
+        from Sprout.tools.context_keys import _current_project_node
+
+        if os.name != "nt" or scope is not _current_project_node():
+            raise PermissionError("local_receipt_frame_unavailable")
+        task, workspace = await scope.runtime._project_analysis_subject(scope)
+        registered = scope.runtime._frozen_sandboxes.get(task.id)
+        if (scope.node.type.value != "evaluation" or not registered
+                or registered[0] is not sandbox or scope.runtime._file_broker is not self
+                or path not in task.metadata.get("required_paths", ())):
+            raise PermissionError("local_receipt_source_unavailable")
+        target = self._safe_target(sandbox, path)
+        if target is None:
+            raise PermissionError("local_receipt_path_denied")
+        request = ActionRequest(task_id=task.id, actor=task.actor, action=ActionType.FILE_READ,
+            scope=task.delegation_scope.bind_paths(str(sandbox.root)),
+            resource=ResourceRef(workspace.id, target.as_posix(),
+                                 kind=self._classify(target, sandbox)))
+
+        def authorize():
+            if (request.scope.is_expired()
+                    or not request.scope.permits("file.read", target.as_posix())
+                    or self._policy.decide(request).decision is not AccessDecision.ALLOW):
+                raise PermissionError("local_receipt_read_denied")
+
+        decision = self._policy.decide(request)
+        await emit_policy_decision(self._events, request, decision)
+        authorize()
+        if pin_stack is not None:
+            from Sprout.execution import file_access
+
+            # Attributes-only handles do not exclude Windows data writers.
+            # Hold actual READ custody after Policy/Scope, through settlement.
+            handle = file_access._win_open(target, 0x80000000)
+            pin_stack.callback(file_access._kernel().CloseHandle, handle)
+            file_access._win_name(handle, target)
+            info = file_access._win_info(handle)
+            if info.attributes & 0x10 or info.links != 1:
+                raise PermissionError("local_receipt_input_not_regular")
+            authorize()
+        result = file_operation(sandbox.root, target, "snapshot", authorize,
+                                content=_ReadOptions(100_000, None, Event(), authorize))
+        result = checked_snapshot(result, 100_000, None)
+        if not result.ok:
+            raise PermissionError("local_receipt_snapshot_unproved")
+        await scope.runtime._project_analysis_subject(scope)
+        return {"path": path, "identity": asdict(result.identity), "sha256": result.digest}
+
+    async def _apply_snapshot(self, permit):
+        """Coordinator-only exact source/target capture, never a public read grant."""
+        from threading import Event
+
+        from Sprout.execution.file_snapshot import _ReadOptions, checked_snapshot
+
+        if self._apply_resolver is None:
+            raise PermissionError("apply_coordinator_unavailable")
+        request, root, path, _, _, _ = await self._apply_resolver(permit)
+        target = root.root / path
+        if (request.action is not ActionType.FILE_READ or not request.actor.authenticated
+                or request.resource.path != target.as_posix()
+                or request.resource.kind != classify(target, workspace_root=root.root,
+                                                     overrides=self._classify_overrides)):
+            raise PermissionError("apply_snapshot_binding_invalid")
+
+        def authorize():
+            if (request.scope.is_expired()
+                    or not request.scope.permits("file.read", target.as_posix())
+                    or self._policy.decide(request).decision is not AccessDecision.ALLOW):
+                raise PermissionError("apply_snapshot_denied")
+
+        await emit_policy_decision(self._events, request, self._policy.decide(request))
+        authorize()
+        result = file_operation(root.root, target, "snapshot", authorize,
+                                content=_ReadOptions(100_000, None, Event(), authorize))
+        result = checked_snapshot(result, 100_000, None)
+        if not result.ok:
+            raise PermissionError("apply_snapshot_unconfirmed")
+        await self._apply_resolver(permit)
+        return result
+
+    async def _conditional_apply_write(self, permit):
+        """Host-only adapter; resolver must be the registered Apply coordinator.
+
+        Not registered as a tool. The coordinator supplies the opaque permit,
+        authoritative subject and a durable write-start, never model arguments.
+        Until that coordinator exists no public Apply entry calls this method.
+        """
+        import hashlib
+        import os
+
+        from Sprout.execution.file_snapshot import ResourceIdentity
+        from Sprout.workspace.authorized_content import relative_label
+
+        if os.name != "nt":
+            raise PermissionError("conditional_apply_platform_unavailable")
+        resolve = self._apply_resolver
+        if resolve is None:
+            raise PermissionError("conditional_apply_coordinator_unavailable")
+        record = await resolve(permit)
+        request, workspace, path, identity, old_sha, data = record
+        path = relative_label(path)
+        target = workspace.root / path
+        if (type(request) is not ActionRequest or not request.actor.authenticated
+                or not request.actor.source or not request.task_id
+                or request.action not in {ActionType.FILE_WRITE, ActionType.FILE_APPLY}
+                or request.resource is None or request.resource.workspace_id != workspace.id
+                or request.resource.path != target.as_posix()
+                or request.resource.kind != classify(
+                    target, workspace_root=workspace.root, overrides=self._classify_overrides)
+                or type(identity) is not ResourceIdentity or type(data) is not bytes):
+            raise PermissionError("conditional_apply_subject_invalid")
+        expected = (request, workspace, path, identity, old_sha, data)
+        # Policy remains authoritative. SANDBOX_ONLY is not host-write authority.
+        decision = self._policy.decide(request)
+        await emit_policy_decision(self._events, request, decision)
+        acceptable = ({AccessDecision.ALLOW, AccessDecision.REQUIRE_APPROVAL}
+                      if request.action is ActionType.FILE_APPLY else {AccessDecision.ALLOW})
+        if (decision.decision not in acceptable
+                or not request.scope.permits(request.action.value, target.as_posix())
+                or request.scope.is_expired()):
+            raise PermissionError("conditional_apply_policy_denied")
+        if await resolve(permit) != expected:
+            raise PermissionError("conditional_apply_binding_changed")
+
+        def authorize():
+            from dataclasses import replace
+
+            denied_write = (request.action is ActionType.FILE_APPLY and (
+                not request.scope.permits("file.write", target.as_posix())
+                or self._policy.decide(replace(request, action=ActionType.FILE_WRITE)).decision
+                is AccessDecision.DENY))
+            if (denied_write or request.scope.is_expired()
+                    or not request.scope.permits(request.action.value, target.as_posix())
+                    or self._policy.decide(request).decision not in acceptable):
+                from Sprout.execution.file_access import ConditionalWriteRefused
+
+                raise ConditionalWriteRefused("conditional_apply_authorization_changed")
+
+        # Synchronous bounded native call: no worker may outlive cancellation.
+        # Coordinator must record write-start BEFORE this call and settle any
+        # exception as UNKNOWN unless independent no-write proof exists.
+        result = file_operation(workspace.root, target, "conditional_write", authorize,
+                                content=(identity, old_sha, data, authorize))
+        if (result != {"sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}
+                or await resolve(permit) != expected):
+            raise PermissionError("conditional_apply_result_unconfirmed")
+        return result
+
     async def read_text(
         self,
         sandbox: SandboxRef,
@@ -150,6 +585,7 @@ class FileBroker:
         *,
         task_id: str = "",
         scope: DelegationScope | None = None,
+        actor=None,
     ) -> FileResult:
         target = self._safe_target(sandbox, relative_path)
         if target is None:
@@ -158,6 +594,7 @@ class FileBroker:
         kind = self._classify(target, sandbox)
         request = ActionRequest(
             task_id=task_id,
+            **({"actor": actor} if actor is not None else {}),
             action=ActionType.FILE_READ,
             resource=ResourceRef(
                 workspace_id=sandbox.id,
@@ -168,6 +605,7 @@ class FileBroker:
                 str(self._root(sandbox)),
             ),
         )
+        request = await self._node_attribution(request, sandbox)
         decision = self._policy.decide(request)
         await emit_policy_decision(self._events, request, decision)
         if decision.decision not in {AccessDecision.ALLOW, AccessDecision.ALLOW_REDACTED}:

@@ -21,10 +21,70 @@ class FileBoundaryError(OSError):
     """A secure resource identity could not be established; never retry loosely."""
 
 
+class ConditionalWriteRefused(FileBoundaryError):
+    """The pinned conditional primitive proved refusal before any write."""
+
+
+async def directory_entries(root: Path, target: Path, limit: int, authorize_entry):
+    """Private handle-bound listing. No ordinary pathname traversal fallback.
+
+    Names remain broker-internal until separately authorized. Child metadata is
+    not opened before its visibility check. No worker thread outlives cancellation;
+    ExitStack closes pinned descriptors even across a cancelled authority await.
+    """
+    from Sprout.execution.file_snapshot import DirectoryEntry, ResourceIdentity
+
+    if os.name == "nt":
+        try:
+            return await _windows_directory_entries(root, target, limit, authorize_entry)
+        except FileBoundaryError as exc:
+            if str(exc) == "local_volume_identity_unproved":
+                raise FileBoundaryError("directory_enumeration_unavailable") from exc
+            raise
+    if (os.name != "posix" or os.scandir not in os.supports_fd
+            or os.open not in os.supports_dir_fd or os.stat not in os.supports_dir_fd
+            or os.stat not in os.supports_follow_symlinks
+            or not all(hasattr(os, flag) for flag in ("O_NOFOLLOW", "O_DIRECTORY"))):
+        raise FileBoundaryError("directory_enumeration_unavailable")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    with ExitStack() as stack:
+        fd = os.open("/", flags)
+        stack.callback(os.close, fd)
+        for part in (*root.parts[1:], *target.relative_to(root).parts):
+            fd = os.open(part, flags, dir_fd=fd)
+            stack.callback(os.close, fd)
+        before = ResourceIdentity.from_stat(os.fstat(fd))
+        entries = []
+        # scandir(fd) streams bounded entries; listdir would allocate unbounded names.
+        with os.scandir(fd) as stream:
+            for index, entry in enumerate(stream):
+                if index >= limit:
+                    raise FileBoundaryError("directory_budget_exceeded")
+                name = entry.name
+                if name in {".", ".."} or "/" in name or "\\" in name:
+                    raise FileBoundaryError("directory_entry_invalid")
+                if not await authorize_entry(target / name):
+                    continue
+                info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+                    raise FileBoundaryError("directory_link_or_special_file")
+                if stat.S_ISREG(info.st_mode) and info.st_nlink != 1:
+                    raise FileBoundaryError("directory_shared_file")
+                entries.append(DirectoryEntry(
+                    (target / name).relative_to(root).as_posix(), stat.S_ISDIR(info.st_mode),
+                    ResourceIdentity.from_stat(info),
+                ))
+        if ResourceIdentity.from_stat(os.fstat(fd)) != before:
+            raise FileBoundaryError("directory_identity_changed")
+        return tuple(entries)
+
+
 def file_operation(
     root: Path, target: Path, operation: str, authorize: Callable[[], None],
     *, content: str = "", newline: str | None = None,
 ):
+    if operation == "conditional_write" and os.name != "nt":
+        raise FileBoundaryError("conditional_write_platform_unavailable")
     if os.name == "nt":
         return _windows(root, target, operation, authorize, content, newline)
     if (os.name == "posix"
@@ -41,6 +101,12 @@ def _missing(operation, authorize):
 
 
 def _stream(fd: int, operation: str, content: str, newline: str | None):
+    if operation == "conditional_write":
+        return _conditional_write_fd(fd, content)
+    if operation == "snapshot":
+        from Sprout.execution.file_snapshot import read_fd
+
+        return read_fd(fd, content)
     if operation == "write":
         # Never truncate at pathname-open time: identity must already be proved.
         os.ftruncate(fd, 0)
@@ -50,6 +116,56 @@ def _stream(fd: int, operation: str, content: str, newline: str | None):
             return stream.read()
         stream.write(content)
     return True
+
+
+def _conditional_write_fd(fd, options):
+    """Private R03 primitive, not authority; caller must persist write-start first.
+
+    Windows secure-open holds no SHARE_WRITE/DELETE throughout this operation.
+    Any exception after write-start is an uncertain effect to the caller.
+    """
+    import hashlib
+
+    from Sprout.execution.file_snapshot import ResourceIdentity
+
+    if not isinstance(options, tuple) or len(options) != 4:
+        raise ConditionalWriteRefused("conditional_write_options_invalid")
+    expected, old_digest, data, check = options
+    if (type(expected) is not ResourceIdentity or type(data) is not bytes
+            or len(data) > 16 * 1024 * 1024 or not callable(check)
+            or type(old_digest) is not str or len(old_digest) != 64):
+        raise ConditionalWriteRefused("conditional_write_options_invalid")
+    before = ResourceIdentity.from_stat(os.fstat(fd))
+    if before != expected or before.size > 16 * 1024 * 1024:
+        raise ConditionalWriteRefused("conditional_write_identity_changed")
+    os.lseek(fd, 0, os.SEEK_SET)
+    old = bytearray()
+    while chunk := os.read(fd, 65536):
+        old.extend(chunk)
+        if len(old) > before.size:
+            raise ConditionalWriteRefused("conditional_write_identity_changed")
+    if (ResourceIdentity.from_stat(os.fstat(fd)) != before
+            or hashlib.sha256(old).hexdigest() != old_digest):
+        raise ConditionalWriteRefused("conditional_write_version_changed")
+    check()  # Final authority check on the same exclusive, verified handle.
+    os.lseek(fd, 0, os.SEEK_SET)
+    view = memoryview(data)
+    while view:
+        count = os.write(fd, view)
+        if count <= 0:
+            raise FileBoundaryError("conditional_write_unconfirmed")
+        view = view[count:]
+    os.ftruncate(fd, len(data))
+    os.fsync(fd)
+    os.lseek(fd, 0, os.SEEK_SET)
+    actual = bytearray()
+    while chunk := os.read(fd, 65536):
+        actual.extend(chunk)
+        if len(actual) > len(data):
+            raise FileBoundaryError("conditional_write_unconfirmed")
+    if actual != data:
+        raise FileBoundaryError("conditional_write_unconfirmed")
+    return {"sha256": hashlib.sha256(actual).hexdigest(), "size": len(actual)}
 
 
 def _posix(root, target, operation, authorize, content, newline):
@@ -200,20 +316,135 @@ def _win_name(handle, expected):
         raise FileBoundaryError("final_path_alias_mismatch")
 
 
+def _win_volume(root):
+    if root.drive.startswith("\\\\"):
+        raise FileBoundaryError("remote_filesystem_not_supported")
+    device = ctypes.create_unicode_buffer(1024)
+    if (not _kernel().QueryDosDeviceW(root.drive, device, len(device))
+            or not re.fullmatch(r"\\Device\\HarddiskVolume\d+", device.value)):
+        raise FileBoundaryError("local_volume_identity_unproved")
+
+
+def _win_directory_records(handle):
+    """Bounded FILE_ID_BOTH_DIR_INFO pages, obtained from the pinned handle.
+
+    FileIdBothDirectoryRestartInfo=11, continuation=10 (Win32 API).
+    Records are broker-internal; caller must authorize names before opening or
+    publishing child resources. Unsupported drivers fail closed.
+    """
+    from ctypes import wintypes as w
+
+    class Entry(ctypes.Structure):
+        _fields_ = [("next", w.DWORD), ("index", w.DWORD),
+                    ("created", ctypes.c_longlong), ("accessed", ctypes.c_longlong),
+                    ("written", ctypes.c_longlong), ("changed", ctypes.c_longlong),
+                    ("size", ctypes.c_longlong), ("allocated", ctypes.c_longlong),
+                    ("attributes", w.DWORD), ("name_length", w.DWORD),
+                    ("ea", w.DWORD), ("short_length", ctypes.c_byte),
+                    ("short_name", w.WCHAR * 12), ("file_id", ctypes.c_longlong),
+                    ("name", w.WCHAR * 1)]
+
+    if Entry.name.offset != 104:
+        raise FileBoundaryError("directory_layout_unavailable")
+    buffer = ctypes.create_string_buffer(65536)
+    info_class = 11
+    while True:
+        if not _kernel().GetFileInformationByHandleEx(handle, info_class, buffer, len(buffer)):
+            if ctypes.get_last_error() == 18:  # ERROR_NO_MORE_FILES, not a guessed empty list.
+                return
+            raise FileBoundaryError("directory_enumeration_unavailable")
+        info_class = 10
+        offset = 0
+        while True:
+            if offset + ctypes.sizeof(Entry) > len(buffer):
+                raise FileBoundaryError("directory_record_invalid")
+            item = Entry.from_buffer(buffer, offset)
+            size = item.name_length
+            end = offset + Entry.name.offset + size
+            if (size == 0 or size % 2 or size > 32760 or end > len(buffer)
+                    or (item.next and (item.next % 8 or item.next < Entry.name.offset + size
+                                       or offset + item.next >= len(buffer)))):
+                raise FileBoundaryError("directory_record_invalid")
+            name = bytes(buffer[offset + Entry.name.offset:end]).decode("utf-16-le", "strict")
+            yield name, item.attributes, item.file_id & ((1 << 64) - 1)
+            if not item.next:
+                break
+            offset += item.next
+
+
+async def _windows_directory_entries(root, target, limit, authorize_entry):
+    import msvcrt
+
+    from Sprout.execution.file_snapshot import DirectoryEntry, ResourceIdentity
+
+    _win_volume(root)
+    relative = target.relative_to(root).parts
+    with ExitStack() as stack:
+        parent = Path(root.anchor)
+        _win_directory(parent, stack)
+        for part in (*root.parts[1:], *relative):
+            parent /= part
+            _win_directory(parent, stack)
+        handle = _win_open(target, 0x81)  # FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES
+        stack.callback(_kernel().CloseHandle, handle)
+        _win_name(handle, target)
+
+        def signature():
+            info = _win_info(handle)
+            if not info.attributes & 0x10:
+                raise FileBoundaryError("ancestor_not_directory")
+            return (info.attributes, info.volume, info.index_high, info.index_low,
+                    info.written.dwHighDateTime, info.written.dwLowDateTime)
+
+        before = signature()
+        entries, count = [], 0
+        for name, attributes, file_id in _win_directory_records(handle):
+            if name in {".", ".."}:
+                continue
+            count += 1
+            if count > limit:
+                raise FileBoundaryError("directory_budget_exceeded")
+            if (any(c in name for c in ("/", "\\", ":", "\x00"))
+                    or name.endswith((".", " "))):
+                raise FileBoundaryError("directory_entry_invalid")
+            child = target / name
+            if not await authorize_entry(child):
+                continue
+            if attributes & (0x400 | 0x40):  # reparse or device; never traverse.
+                raise FileBoundaryError("directory_link_or_special_file")
+            child_handle = _win_open(child, 0x80)
+            try:
+                info = _win_info(child_handle)
+                _win_name(child_handle, child)
+                if (info.volume != before[1] or info.attributes != attributes
+                        or (info.index_high << 32 | info.index_low) != file_id
+                        or (not attributes & 0x10 and info.links != 1)):
+                    raise FileBoundaryError("directory_identity_changed")
+                fd = msvcrt.open_osfhandle(child_handle, os.O_RDONLY | os.O_BINARY)
+                child_handle = None
+                try:
+                    identity = ResourceIdentity.from_stat(os.fstat(fd))
+                finally:
+                    os.close(fd)
+            finally:
+                if child_handle is not None:
+                    _kernel().CloseHandle(child_handle)
+            entries.append(DirectoryEntry(child.relative_to(root).as_posix(),
+                                          bool(attributes & 0x10), identity))
+        if signature() != before:
+            raise FileBoundaryError("directory_identity_changed")
+        return tuple(entries)
+
+
 def _windows(root, target, operation, authorize, content, newline):
     import msvcrt
     from ctypes import wintypes as w
 
-    if root.drive.startswith("\\\\"):
-        raise FileBoundaryError("remote_filesystem_not_supported")
+    _win_volume(root)
     relative = target.relative_to(root).parts
     if not relative and operation != "exists":
         raise FileBoundaryError("sandbox_root_is_not_a_file")
     kernel = _kernel()
-    device = ctypes.create_unicode_buffer(1024)
-    if (not kernel.QueryDosDeviceW(root.drive, device, len(device))
-            or not re.fullmatch(r"\\Device\\HarddiskVolume\d+", device.value)):
-        raise FileBoundaryError("local_volume_identity_unproved")
     with ExitStack() as stack:
         parent = Path(root.anchor)
         _win_directory(parent, stack)
@@ -235,7 +466,8 @@ def _windows(root, target, operation, authorize, content, newline):
                     raise FileBoundaryError("secure_directory_creation_refused") from None
                 _win_directory(parent, stack)
         authorize()  # Recheck before OPEN_ALWAYS may create a leaf.
-        access = {"write": 0x40000000, "read": 0x80000000,
+        access = {"conditional_write": 0xC0000000, "write": 0x40000000,
+                  "read": 0x80000000, "snapshot": 0x80000000,
                   "delete": 0x10080, "probe": 0x80, "exists": 0x80}[operation]
         try:
             handle = _win_open(parent / relative[-1], access,
@@ -260,6 +492,7 @@ def _windows(root, target, operation, authorize, content, newline):
                     raise FileBoundaryError("handle_delete_refused")
                 return True
             fd = msvcrt.open_osfhandle(handle, os.O_BINARY | (
+                os.O_RDWR if operation == "conditional_write" else
                 os.O_WRONLY if operation == "write" else os.O_RDONLY
             ))
             handle = None  # Ownership transferred to the CRT fd.

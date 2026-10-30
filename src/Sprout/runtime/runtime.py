@@ -10,12 +10,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
+from contextlib import contextmanager
 from dataclasses import replace
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
+from weakref import WeakKeyDictionary
 
 from Sprout.agent.base import Agent, AgentResult
 from Sprout.agent.router import AgentRouter
@@ -122,6 +124,7 @@ _DEFAULT_TRAJECTORY_DIR = Path.home() / ".sprout" / "data" / "trajectory"
 
 _INTENT_EVENTS: dict[str, str] = {str(intent): event for intent, event in INTENT_EVENTS.items()}
 _PROJECT_ANALYZE_TERMS = (
+    "分析当前整个项目", "分析整个项目", "分析完整项目", "entire project", "whole project",
     "scan project",
     "analyze project",
     "inspect project",
@@ -134,6 +137,7 @@ _PROJECT_ANALYZE_TERMS = (
     "扫描项目",
     "掃描專案",
     "分析项目",
+    "分析当前项目",
     "分析專案",
     "项目结构",
     "專案結構",
@@ -324,6 +328,33 @@ class Runtime:
         settings: Settings | None = None,
     ) -> None:
         self.storage = storage
+        self._project_analysis_tools = WeakKeyDictionary()
+        # Host admissions live only for one local dispatch, never in model metadata.
+        self._online_analysis_requests = {}
+        # Temporary preparation Tasks are data, not portable read grants.
+        self._preparation_tasks = {}
+        self._project_analysis_selections = WeakKeyDictionary()
+        self._project_tool_paths = WeakKeyDictionary()
+        self._project_manifest_tools = WeakKeyDictionary()
+        # Live issuance receipts; side records require completed-owner checks
+        # and fresh resource capture before they may enter this local registry.
+        self._local_receipt_candidates = {}
+        self._local_receipt_plans = {}
+        self._local_acceptance_receipts = {}
+        self._local_apply_plans = {}
+        self._local_apply_permits = {}
+        self._local_git_reviews = {}
+        self._node_products = {}
+        self._node_publications = {}
+        self._node_tool_scopes = WeakKeyDictionary()
+        self._frozen_sandboxes = {}
+        self._frozen_executions = WeakKeyDictionary()
+        self._frozen_worktree_inputs = {}
+        self._verification_hosts = {}
+        self._verification_frames = WeakKeyDictionary()
+        self._verification_preparations = WeakKeyDictionary()
+        self._original_user_turns = {}
+        self._ordinary_assistant_turns = {}
         self._settings = settings
         self.models = models
         self.tools = tools
@@ -346,11 +377,12 @@ class Runtime:
         from Sprout.tools.project_analyze_tool import ProjectAnalyzeTool
         from Sprout.tools.workspace_query_tool import WorkspaceQueryTool
 
-        self.tools.register(WorkspaceQueryTool(self._workspaces.analyze))
+        self.tools.register(WorkspaceQueryTool())
         self.tools.register(ProjectAnalyzeTool(analyze=self._workspaces.analyze_path))
         self._contexts = ContextBuilder(
             storage,
-            workspace_analysis_provider=self._workspaces.analyze,
+            isolate_project_context=True,
+            conversation_provider=self._ordinary_conversation_context,
             skill_disclosure=(settings.skills.disclosure if settings is not None else ""),
         )
         self._sandbox_lifecycle = SandboxLifecycleService(storage.metadata)
@@ -382,8 +414,10 @@ class Runtime:
             approvals=self._approvals,
             classify_overrides=security.classify_overrides if security is not None else {},
         )
+        self._file_broker._apply_resolver = self._resolve_local_apply_resource
         self._apply_broker = ApplyBroker(
             self._policy_engine,
+            runtime=self,
             approvals=self._approvals,
         )
         self._network_broker = NetworkBroker(
@@ -405,7 +439,8 @@ class Runtime:
             GitWriteTool,
         )
 
-        self.tools.register(DatabaseQueryTool(self._database_broker))
+        self.tools.register(DatabaseQueryTool(
+            self._database_broker, invoke_query=self._invoke_database_query))
         self.tools.register(
             CliRunTool(
                 secrets=security.secrets if security is not None else None,
@@ -562,6 +597,23 @@ class Runtime:
             raise RuntimeError("MetadataStore is not configured")
         return metadata
 
+    async def _resolve_local_apply_resource(self, permit):
+        from Sprout.execution.apply_plan import resolve_resource
+
+        return await resolve_resource(self, permit)
+
+    async def _prepare_local_apply_proposal(self, scope):
+        from Sprout.execution.apply_plan import publish
+
+        output = await publish(self, scope)
+        state = self._local_git_reviews.get(scope.task.id)
+        if state is not None:
+            from Sprout.execution.node_result_source import payload_digest
+
+            state["publication_candidate"] = (
+                scope.node.id, scope.guard_owner, payload_digest(output))
+        return output
+
     def _changes(self, *, local_acceptance: bool | None = None) -> ChangeProposalService:
         """The change proposal state machine; built per call, it holds no state."""
         return ChangeProposalService(
@@ -570,6 +622,7 @@ class Runtime:
             self._apply_broker,
             events=self.events,
             approvals=self._approvals,
+            runtime=self,
             local_acceptance=(not isinstance(
                 self._orchestrator_backend, TemporalOrchestratorBackend)
                 and not getattr(self, "_isolated_coding_required", False)
@@ -623,7 +676,2065 @@ class Runtime:
             coding_commands=getattr(self, "_isolated_coding_commands", None),
             local_acceptance=not isinstance(
                 self._orchestrator_backend, TemporalOrchestratorBackend),
+            project_analysis_scope=self._project_analysis_scope,
         )
+
+    @contextmanager
+    def _project_analysis_scope(self, task, workspace, node):
+        """Only wraps host node execution; never expands its visible tool set."""
+        from Sprout.tools.context_keys import _project_node_scope
+
+        with _project_node_scope(self, task, workspace, node) as scope:
+            try:
+                yield scope
+            except BaseException:
+                host = self._verification_hosts.get(task.id)
+                if host is not None:
+                    host.get("agent_candidates", {}).clear()
+                raise
+            finally:
+                for key, preparation in tuple(self._verification_preparations.items()):
+                    if preparation["scope"] is scope:
+                        self._release_verification_preparation(key)
+                self._node_publications.pop(node.id, None)
+                for tool, issued in tuple(self._project_analysis_tools.items()):
+                    if issued is scope:
+                        del self._project_analysis_tools[tool]
+                        self._project_tool_paths.pop(tool, None)
+                        self._project_manifest_tools.pop(tool, None)
+                for selection, record in tuple(self._project_analysis_selections.items()):
+                    if record[0].node_scope is scope:
+                        del self._project_analysis_selections[selection]
+
+    async def _project_analysis_subject(self, scope):
+        from Sprout.tools.context_keys import _current_project_node
+
+        if scope is not _current_project_node() or scope.runtime is not self:
+            raise PermissionError("Project analysis execution domain unavailable")
+        metadata = self._metadata_or_raise()
+        task = await metadata.get_task(scope.task.id)
+        if task is not None and task.metadata.get("plan_kind") == "r04_preparation_v1":
+            issued = self._preparation_tasks.get(task.id)
+            if (issued is None or task.actor != issued[0].actor
+                    or task.delegation_scope != issued[0].delegation_scope):
+                raise PermissionError("preparation_instance_unavailable")
+            if issued[1] is not None:
+                await self._check_preparation_parent(issued[1], scope.workspace, issued[2])
+        if (task is None or task.id != scope.task.id or task.status is not TaskStatus.RUNNING
+                or task.workspace_id != scope.workspace.id
+                or task.actor != scope.task.actor or task.source != scope.task.source
+                or task.actor.authenticated is not True
+                or not isinstance(task.actor.user_id, str) or not task.actor.user_id
+                or not isinstance(task.actor.source, str) or not task.actor.source
+                or task.source != task.actor.source):
+            raise PermissionError("Project analysis task identity unavailable")
+        workspace = await metadata.get_workspace(task.workspace_id)
+        if (workspace is None or workspace.id != task.workspace_id
+                or workspace.root != scope.workspace.root):
+            raise PermissionError("Project analysis workspace identity changed")
+        node = await metadata.get_execution_node(scope.node.id)
+        guard = node.metadata.get("execution_guard", {}) if node is not None else {}
+        if (node is None or node.id != scope.node.id or node.task_id != task.id
+                or node.type != scope.node.type or node.status is not NodeStatus.RUNNING
+                or not isinstance(scope.guard_owner, str) or not scope.guard_owner
+                or guard.get("owner") != scope.guard_owner or guard.get("state") != "active"):
+            raise PermissionError("Project analysis node ownership unavailable")
+        if (not isinstance(scope.session_id, str)
+                or task.metadata.get("session_id", "") != scope.session_id):
+            raise PermissionError("Project analysis session association changed")
+        if scope.session_id:
+            session = await self._sessions.require_owner(scope.session_id, task.actor)
+            principal = self._sessions.frozen_principal(session)
+            if (principal.authenticated is not True or principal.user_id != task.actor.user_id
+                    or principal.source != task.actor.source):
+                raise PermissionError("Project analysis session identity unavailable")
+        return task, workspace
+
+    async def _register_frozen_sandbox(self, sandbox):
+        from Sprout.execution.host_acceptance import pin_execution_directory
+        from Sprout.tools.context_keys import _current_project_node
+
+        scope = _current_project_node()
+        task, workspace = await self._project_analysis_subject(scope)
+        if (scope.node.type is not NodeType.SANDBOX or sandbox.kind != "git_worktree"
+                or sandbox.root == workspace.root or task.id in self._frozen_sandboxes):
+            raise PermissionError("frozen_sandbox_registration_denied")
+        with pin_execution_directory(sandbox.root) as pin:
+            self._frozen_sandboxes[task.id] = (
+                sandbox, scope.node.id, scope.guard_owner, pin.identity)
+        if task.id in self._verification_hosts:
+            await self._freeze_verification_oracles(scope)
+        elif task.id in self._local_git_reviews:
+            from Sprout.execution.local_git_review import capture_source
+
+            await capture_source(self, scope, sandbox)
+
+    async def bind_task_verification(self, task_id, principal, *, paths, export_parent,
+                                     images, source_digests, discovery=None, tools=None,
+                                     docker=None):
+        """Explicit Python Host only. No metadata/JSON/CLI deserialization of grants."""
+        if getattr(self, "_verification_stopping", False):
+            raise PermissionError("verification_runtime_stopping")
+        from copy import deepcopy
+
+        from Sprout.execution.docker_verification import safe_path, validate_image
+        from Sprout.execution.host_acceptance import check_binding
+        from Sprout.workspace.authorized_content import relative_label
+
+        task = await self._metadata_or_raise().get_task(task_id)
+        if (task is None or task.status is not TaskStatus.CREATED or task.actor != principal
+                or principal.authenticated is not True or task.source != principal.source
+                or not principal.user_id or not principal.source
+                or task.execution_mode != "code" or task.id in self._verification_hosts
+                or task.id in self._local_git_reviews
+                or await self._metadata_or_raise().list_execution_nodes(task.id)):
+            raise PermissionError("verification_host_binding_denied")
+        workspace = await self._metadata_or_raise().get_workspace(task.workspace_id)
+        if (workspace is None or not task.delegation_scope.allowed_paths
+                or not task.delegation_scope.allowed_actions):
+            raise PermissionError("verification_host_workspace_or_scope_unavailable")
+        check_binding(task, workspace, task.metadata.get("host_acceptance_v1"))
+        if type(paths) is not tuple or not paths or len(paths) > 64:
+            raise ValueError("verification_host_paths")
+        for path in paths:
+            relative_label(path)
+            if not task.delegation_scope.bind_paths(str(workspace.root)).permits(
+                    "file.read", str(workspace.root / path)):
+                raise PermissionError("verification_host_scope_denied")
+        if (len(set(p.casefold() for p in paths)) != len(paths)
+                or not set(task.metadata["host_acceptance_v1"]["resources"]) <= set(paths)):
+            raise ValueError("verification_host_paths")
+        import re
+
+        if (type(source_digests) is not dict or set(source_digests) != set(paths)
+                or any(type(v) is not str or not re.fullmatch(r"[0-9a-f]{64}", v)
+                       for v in source_digests.values())):
+            raise ValueError("verification_host_source_digests")
+        if type(images) is not dict or set(images) != {"verification", "coding"}:
+            raise ValueError("verification_host_images")
+        for image in images.values():
+            validate_image(image)
+        parent = safe_path(Path(export_parent))
+        if (not parent.is_dir() or parent.is_relative_to(workspace.root.resolve())
+                or workspace.root.resolve().is_relative_to(parent)):
+            raise ValueError("verification_export_parent")
+        from Sprout.execution.host_acceptance import pin_execution_directory
+
+        with pin_execution_directory(parent) as parent_pin:
+            parent_identity = parent_pin.identity
+        self._verification_hosts[task.id] = {
+            "task": deepcopy(task), "workspace": deepcopy(workspace), "paths": paths,
+            "parent": parent, "images": deepcopy(images), "discovery": deepcopy(discovery),
+            "tools": deepcopy(tools or {}), "oracles": None,
+            "source_digests": deepcopy(source_digests),
+            "parent_identity": parent_identity,
+            "docker": deepcopy(docker),
+        }
+
+    def _git_review_state(self, task_id):
+        # Data/custody lookup only. _git_review_record grants fresh authority.
+        state = self._verification_hosts.get(task_id)
+        if state is None:
+            state = self._local_git_reviews.get(task_id)
+        return state
+
+    async def configure_local_git_review(self, task_id, principal, *, executable,
+                                         executable_sha256, export_parent, chain=()):
+        from Sprout.execution.local_git_review import configure
+
+        return await configure(self, task_id, principal, executable=executable,
+            executable_sha256=executable_sha256, export_parent=export_parent, chain=chain)
+
+    async def bind_task_git_view(self, task_id, principal, *, executable, executable_sha256,
+                                 baseline, metadata_root, paths, common_root=None, chain=(),
+                                 local_receipt=None):
+        """Python Host only; never exposed through message metadata or a model tool."""
+        if local_receipt is not None:
+            from Sprout.execution.local_git_review import bind
+
+            return await bind(self, task_id, principal, receipt=local_receipt,
+                executable=executable, executable_sha256=executable_sha256, baseline=baseline,
+                metadata_root=metadata_root, common_root=common_root, paths=paths, chain=chain)
+        import re
+        from pathlib import Path
+
+        from Sprout.execution.git_s1 import _ReviewView
+        from Sprout.execution.host_acceptance import binding_subject, pin_execution_directory
+        from Sprout.execution.verification_export import EXCLUDED
+        from Sprout.execution.verification_manifest import digest, scope_digest
+        from Sprout.workspace.authorized_content import relative_label
+
+        task = await self._metadata_or_raise().get_task(task_id)
+        host = self._verification_hosts.get(task_id)
+        registered = self._frozen_sandboxes.get(task_id)
+        if (getattr(self, "_verification_stopping", False) or task is None or host is None
+                or registered is None or task.status not in {TaskStatus.CREATED, TaskStatus.RUNNING}
+                or task.actor != principal or principal.authenticated is not True
+                or task.source != principal.source or task.execution_mode != "code"
+                or task.delegation_scope.is_expired() or "git" in host
+                or not task.delegation_scope.allowed_paths
+                or not task.delegation_scope.allowed_actions
+                or await self._metadata_or_raise().list_change_proposals(task_id)):
+            raise PermissionError("git_host_binding_denied")
+        workspace = await self._metadata_or_raise().get_workspace(task.workspace_id)
+        if workspace != host["workspace"] or type(paths) is not tuple or not 0 < len(paths) <= 64:
+            raise PermissionError("git_host_workspace_or_selection")
+        selected = tuple(relative_label(p) for p in paths)
+        if (len(set(p.casefold() for p in selected)) != len(selected)
+                or any(len(Path(p).parts) > 16 for p in selected)
+                or any(part.casefold() in EXCLUDED for p in selected for part in Path(p).parts)):
+            raise PermissionError("git_host_private_or_duplicate_path")
+        sandbox = registered[0]
+        self._git_broker._check_review_policy(task, selected, sandbox.root)
+        executable, metadata = Path(executable), Path(metadata_root)
+        common = Path(common_root) if common_root is not None else metadata
+        if (not all(p.is_absolute() for p in (executable, metadata, common))
+                or executable.name.casefold() not in {"git", "git.exe"}
+                or not re.fullmatch(r"[0-9a-f]{64}", executable_sha256)
+                or not re.fullmatch(r"[0-9a-f]{40}", baseline)
+                or type(chain) is not tuple or len(chain) > 8
+                or any(not Path(p).is_absolute() or not re.fullmatch(r"[0-9a-f]{64}", h)
+                       for p, h in chain)):
+            raise ValueError("git_host_installation_or_baseline")
+        self._verification_export_boundary(host, workspace, sandbox)
+        for protected in (metadata, common):
+            if (host["parent"].is_relative_to(protected)
+                    or protected.is_relative_to(host["parent"])):
+                raise PermissionError("git_view_metadata_overlap")
+        with pin_execution_directory(sandbox.root) as pin:
+            if pin.identity != registered[3]:
+                raise PermissionError("git_host_worktree_changed")
+        with pin_execution_directory(metadata) as metadata_pin:
+            metadata_identity = metadata_pin.identity
+        with pin_execution_directory(common) as common_pin:
+            common_identity = common_pin.identity
+        # The binding is a Runtime-private object; no persisted JSON is authority.
+        host["git"] = _ReviewView(executable, executable_sha256, chain, baseline,
+            metadata, common, selected, sandbox, registered[3], host["parent"],
+            host["parent_identity"], digest({"subject": binding_subject(task, workspace),
+                "scope": scope_digest(task.delegation_scope),
+                "session": task.metadata.get("session_id")}), metadata_identity, common_identity)
+
+    async def _git_review_record(self, binding, broker, frame):
+        from Sprout.execution.git_s1 import _ReviewView
+        from Sprout.execution.host_acceptance import binding_subject
+        from Sprout.execution.verification_manifest import digest, scope_digest
+        from Sprout.tools.context_keys import _current_project_node
+
+        if type(binding) is not _ReviewView:
+            raise PermissionError("git_view_binding_required")
+        task, workspace = await self._project_analysis_subject(frame)
+        host = self._git_review_state(task.id)
+        local = task.id in self._local_git_reviews
+        registered = self._frozen_sandboxes.get(task.id)
+        if (getattr(self, "_verification_stopping", False) or frame is not _current_project_node()
+                or frame.node.type not in ({NodeType.APPROVAL, NodeType.APPLY} if local
+                    else {NodeType.EVALUATION, NodeType.APPROVAL})
+                or broker is not self._git_broker or host is None or host.get("git") is not binding
+                or registered is None or registered[0] is not binding.sandbox
+                or registered[3] != binding.root_identity or task.delegation_scope.is_expired()
+                or binding.subject != digest({"subject": binding_subject(task, workspace),
+                    "scope": scope_digest(task.delegation_scope),
+                    "session": task.metadata.get("session_id")})):
+            raise PermissionError("git_current_binding_denied")
+        if local:
+            from Sprout.execution.local_git_review import authorize
+
+            await authorize(self, host, frame, task, workspace)
+        from Sprout.execution.node_result_source import payload_digest
+
+        producer = await self._metadata_or_raise().get_execution_node(registered[1])
+        origin = await self._metadata_or_raise().get_node_result_source(registered[1])
+        guard = producer.metadata.get("execution_guard", {}) if producer is not None else {}
+        if (producer is None or producer.task_id != task.id or producer.type is not NodeType.SANDBOX
+                or producer.status is not NodeStatus.COMPLETED or guard.get("state") != "completed"
+                or guard.get("owner") != registered[2] or origin is None
+                or origin.owner != registered[2]
+                or origin.subject_digest != self._node_subject_digest(frame)
+                or origin.output_digest != payload_digest(producer.metadata.get("output"))):
+            raise PermissionError("git_sandbox_origin_unavailable")
+        self._verification_export_boundary(host, workspace, binding.sandbox)
+        return task, workspace
+
+    def _verification_export_boundary(self, host, workspace, sandbox):
+        """Host-selected output is not permission to write into live resources."""
+        from Sprout.execution.docker_verification import safe_path
+        from Sprout.execution.host_acceptance import pin_execution_directory
+
+        parent = safe_path(host["parent"])
+        protected = [workspace.root, sandbox.root, self._trajectory_dir]
+        from dataclasses import fields
+
+        from Sprout.storage.local.sqlite.driver import SqliteDatabase
+
+        for field in fields(self.storage):
+            db = getattr(getattr(self.storage, field.name), "_db", None)
+            if isinstance(db, SqliteDatabase) and not db._memory:
+                if not db._registry_key:
+                    raise PermissionError("verification_storage_location_unproved")
+                protected.append(Path(db._registry_key).parent)
+        if self._settings is not None:
+            from Sprout.storage.bundle import _parse_dsn
+
+            settings = self._settings.storage
+            for field in fields(settings):
+                value = getattr(settings, field.name)
+                if isinstance(value, str) and value.startswith("sqlite:///"):
+                    _, path = _parse_dsn(value)
+                    if path and path != ":memory:":
+                        protected.append(Path(path).parent)
+            protected.extend((Path(settings.blobs_dir), Path(settings.trajectory_dir)))
+        for root in protected:
+            root = Path(root).resolve()
+            if parent.is_relative_to(root) or root.is_relative_to(parent):
+                raise PermissionError("verification_export_protected_overlap")
+        with pin_execution_directory(parent) as pin:
+            if pin.identity != host.get("parent_identity"):
+                raise PermissionError("verification_export_parent_changed")
+        return parent
+
+    async def _verification_snapshot_request(self, frame, sandbox, path):
+        from Sprout.execution.verification_manifest import current_frame
+        from Sprout.security.access import ActionRequest, ActionType
+        from Sprout.workspace.models import ResourceRef
+
+        if (getattr(self, "_verification_stopping", False)
+                or current_frame() is not frame or frame.issuer is not self):
+            raise PermissionError("verification_frame_mismatch")
+        record = self._verification_frames[frame]
+        task, workspace = await self._project_analysis_subject(frame.scope)
+        registered = self._frozen_sandboxes.get(task.id)
+        if (task != record["task"] or workspace != record["workspace"]
+                or registered is None or registered[0] is not sandbox
+                or sandbox is not frame.sandbox or record["pin"].identity != registered[3]):
+            raise PermissionError("verification_subject_changed")
+        if frame.scope.node.type is NodeType.EVALUATION:
+            from Sprout.execution.node_result_source import payload_digest
+
+            node = await self._metadata_or_raise().get_execution_node(registered[1])
+            source = await self._metadata_or_raise().get_node_result_source(registered[1])
+            if (node is None or source is None or node.status is not NodeStatus.COMPLETED
+                    or node.task_id != task.id or source.owner != registered[2]
+                    or node.metadata.get("execution_guard", {}).get("owner") != registered[2]
+                    or node.metadata.get("execution_guard", {}).get("state") != "completed"
+                    or source.subject_digest != self._node_subject_digest(frame.scope)
+                    or source.output_digest != payload_digest(node.metadata.get("output"))
+                    or node.metadata.get("output", {}).get("root") != str(sandbox.root)
+                    or node.metadata.get("output", {}).get("id") != sandbox.id):
+                raise PermissionError("verification_sandbox_provenance_denied")
+        target = self._file_broker._safe_target(sandbox, path)
+        if target is None:
+            raise PermissionError("verification_path_denied")
+        relative = target.relative_to(sandbox.root).as_posix()
+        if relative not in record["paths"]:
+            raise PermissionError("verification_path_unselected")
+        record["pin"].check()
+        record["pin"].pin_file(relative)
+        scope = task.delegation_scope.bind_paths(str(sandbox.root))
+        return ActionRequest(task_id=task.id, actor=task.actor, action=ActionType.FILE_READ,
+            scope=scope, resource=ResourceRef(sandbox.id, target.as_posix(),
+                kind=self._file_broker._classify(target, sandbox)))
+
+    async def _capture_verification_view(self, scope, paths, *, exporting=False, expected=None,
+                                         export_paths=None):
+        if getattr(self, "_verification_stopping", False):
+            raise PermissionError("verification_runtime_stopping")
+        import asyncio
+        import time
+        from uuid import uuid4
+
+        from Sprout.execution.host_acceptance import check_binding, pin_execution_directory
+        from Sprout.execution.verification_manifest import _FRAME, _VerificationFrame
+        from Sprout.workspace.authorized_content import AuthorizedContentView, AuthorizedEntry
+
+        host = self._verification_hosts.get(scope.task.id)
+        task, workspace = await self._project_analysis_subject(scope)
+        if (scope.node.type not in {NodeType.SANDBOX, NodeType.EVALUATION}
+                or host is None or task.actor != host["task"].actor
+                or task.source != host["task"].source
+                or task.delegation_scope != host["task"].delegation_scope
+                or workspace != host["workspace"] or not set(paths) <= set(host["paths"])):
+            raise PermissionError("verification_host_changed")
+        check_binding(task, workspace, task.metadata.get("host_acceptance_v1"))
+        sandbox = self._frozen_sandboxes[task.id][0]
+        self._verification_export_boundary(host, workspace, sandbox)
+        with pin_execution_directory(sandbox.root) as pin:
+            frame = _VerificationFrame(self, scope, sandbox, asyncio.current_task(),
+                                       time.monotonic() + 60)
+            record = {"task": task, "workspace": workspace, "paths": paths, "pin": pin,
+                      "view": None, "parent": host["parent"],
+                      "parent_identity": host["parent_identity"],
+                      "destination": host["parent"] / ("verification-" + uuid4().hex)
+                                     / "coding-input"}
+            self._verification_frames[frame] = record
+            token = _FRAME.set(frame)
+            view = None
+            try:
+                entries = []
+                for path in paths:
+                    result = await self._file_broker.read_worktree_snapshot(sandbox, path)
+                    if not result.ok:
+                        raise PermissionError(result.reason)
+                    if sum(len(e.data) for e in entries) + len(result.data) > 1_000_000:
+                        raise PermissionError("verification_capture_budget")
+                    entries.append(AuthorizedEntry(path, self._file_broker._classify(
+                        sandbox.root / path, sandbox), result.data, result.digest, result.identity))
+                view = AuthorizedContentView(
+                    workspace.id, tuple(entries), revision=workspace.revision)
+                if expected is not None and tuple(entries) != expected:
+                    raise PermissionError("verification_capture_changed")
+                for path in paths:
+                    await self._verification_snapshot_request(
+                        frame, sandbox, str(sandbox.root / path))
+                record["view"] = view
+                if exporting:
+                    from Sprout.execution.verification_export import export_authorized_view
+
+                    if export_paths is not None:
+                        if not export_paths or not set(export_paths) <= set(paths):
+                            raise PermissionError("verification_export_selection_denied")
+                        view.invalidate()
+                        view = AuthorizedContentView(workspace.id, tuple(
+                            entry for entry in entries if entry.relative_path in export_paths),
+                            revision=workspace.revision)
+                        record["view"] = view
+                    # Consumers may prepare only. They cannot serialize this frame as authority.
+                    self._verification_export_boundary(host, workspace, sandbox)
+                    receipt = export_authorized_view(
+                        view, record["destination"], receipt=frame)
+                    record["export"] = receipt
+                for path in paths:
+                    await self._verification_snapshot_request(
+                        frame, sandbox, str(sandbox.root / path))
+                self._verification_export_boundary(host, workspace, sandbox)
+                yield_data = (tuple(entries), dict(record), pin.identity)
+                # No frame escapes the synchronous consumer/lifecycle below.
+                return yield_data
+            finally:
+                if view is not None:
+                    view.invalidate()
+                frame.active = False
+                self._verification_frames.pop(frame, None)
+                _FRAME.reset(token)
+
+    async def _freeze_verification_oracles(self, scope):
+        host = self._verification_hosts.get(scope.task.id)
+        if host is not None:
+            from dataclasses import asdict
+
+            if scope.node.type is not NodeType.SANDBOX or host["oracles"] is not None:
+                raise PermissionError("verification_oracle_freeze_denied")
+            config = host["discovery"].get("config_files", ()) if host["discovery"] else ()
+            paths = tuple(dict.fromkeys((*scope.task.metadata["host_acceptance_v1"]["resources"],
+                                         *config)))
+            entries, _, _ = await self._capture_verification_view(scope, paths)
+            host["oracles"] = {e.relative_path: {"digest": e.digest, "identity": asdict(e.identity)}
+                               for e in entries}
+
+    async def _evaluate_host_verification(self, node):
+        """Prepare a new opt-in ordinary CODE evaluation. P1 cannot launch Docker."""
+        if getattr(self, "_verification_stopping", False):
+            raise PermissionError("verification_runtime_stopping")
+        import difflib
+        from copy import deepcopy
+        from dataclasses import asdict
+
+        from Sprout.execution.acceptance import render_acceptance_demo, render_acceptance_tests
+        from Sprout.execution.models import TestResult
+        from Sprout.execution.node_result_source import payload_digest
+        from Sprout.execution.verification import build_verification_report
+        from Sprout.execution.verification_manifest import VerificationManifestV1, digest
+        from Sprout.tools.context_keys import _current_project_node, _project_analysis_call
+
+        scope = _current_project_node()
+        if scope is None or scope.node.id != node.id or node.type is not NodeType.EVALUATION:
+            raise PermissionError("verification_evaluation_frame_denied")
+        task, workspace = await self._project_analysis_subject(scope)
+        node = await self._metadata_or_raise().get_execution_node(node.id)
+        host = self._verification_hosts[task.id]
+        if host["oracles"] is None:
+            raise PermissionError("verification_oracle_origin_unavailable")
+        agents = []
+        parent_links = {}
+        for dependency in node.dependencies:
+            parent = await self._metadata_or_raise().get_execution_node(dependency)
+            source = await self._metadata_or_raise().get_node_result_source(dependency)
+            if (parent is None or parent.task_id != task.id
+                    or parent.status is not NodeStatus.COMPLETED
+                    or parent.metadata.get("execution_guard", {}).get("state") != "completed"):
+                raise PermissionError("verification_upstream_origin_denied")
+            if source is None and parent.type is NodeType.AGENT:
+                await self._accept_verification_agent_completion(scope, parent)
+            elif (source is None or source.task_id != task.id or source.node_id != parent.id
+                    or source.node_type != parent.type.value
+                    or source.owner != parent.metadata["execution_guard"].get("owner")
+                    or source.subject_digest != self._node_subject_digest(scope)
+                    or source.output_digest != payload_digest(parent.metadata.get("output"))):
+                raise PermissionError("verification_upstream_origin_denied")
+            if parent.type is NodeType.AGENT:
+                agents.append(parent)
+            parent_links[parent.id] = {
+                "owner": parent.metadata["execution_guard"]["owner"],
+                "output": payload_digest(parent.metadata.get("output"))}
+        if not agents:
+            raise PermissionError("verification_agent_origin_unavailable")
+        paths = host["paths"]
+        # Original and modified byte/identity domains remain distinct.
+        tool = await self._issue_project_analysis_tool(paths=paths)
+        with _project_analysis_call(tool):
+            selection = await self._issue_project_analysis_selection(paths)
+            original = await self._capture_project_selection(selection,
+                content_project=lambda analysis, view: tuple(view.entries))
+        entries, record, root_identity = await self._capture_verification_view(scope, paths)
+        frozen = task.metadata["host_acceptance_v1"]
+        for entry in entries:
+            if entry.relative_path in host["oracles"]:
+                if {"digest": entry.digest, "identity": asdict(entry.identity)} != host["oracles"][
+                        entry.relative_path]:
+                    raise PermissionError("verification_frozen_worktree_changed")
+        for entry in original:
+            if entry.digest != host["source_digests"][entry.relative_path]:
+                raise PermissionError("verification_original_input_changed")
+            if entry.relative_path in frozen["resources"] and {
+                    "digest": entry.digest, "identity": asdict(entry.identity)
+                    } != frozen["resources"][entry.relative_path]:
+                raise PermissionError("verification_frozen_original_changed")
+        from Sprout.strategy.acceptance import AcceptanceSpec
+
+        spec = AcceptanceSpec.from_payload(frozen["spec"])
+        expected_texts = {frozen["test_path"]: render_acceptance_tests(spec),
+                          frozen["demo_path"]: render_acceptance_demo(spec)}
+        for entry in entries:
+            if (entry.relative_path in expected_texts and entry.text().replace("\r\n", "\n")
+                    != expected_texts[entry.relative_path]):
+                raise PermissionError("verification_frozen_spec_changed")
+        before = {entry.relative_path: entry for entry in original}
+        changed = [e.relative_path for e in entries if e.data != before[e.relative_path].data]
+        patch = "".join("".join(difflib.unified_diff(
+            before[e.relative_path].text().splitlines(True), e.text().splitlines(True),
+            fromfile="before/" + e.relative_path, tofile="after/" + e.relative_path))
+            for e in entries)
+        from Sprout.execution.verification_manifest import ordinary_obligations
+
+        obligations = ordinary_obligations(host, node, spec, frozen, changed)
+        requirements = {"paths": paths, "images": host["images"], "tools": host["tools"],
+                        "docker": host.get("docker"),
+                        "discovery": host["discovery"], "frozen": frozen["sha256"],
+                        "source_digests": host["source_digests"],
+                        "declarations": {k: node.metadata.get(k) for k in
+                            ("test_commands", "build_commands", "verification_commands")}}
+        _, exported, _ = await self._capture_verification_view(
+            scope, paths, exporting=True, expected=entries)
+        python_changes = tuple(path for path in changed if path.endswith(".py"))
+        if python_changes:
+            _, disposable, _ = await self._capture_verification_view(
+                scope, paths, exporting=True, expected=entries, export_paths=python_changes)
+            exported["export"]["compileall"] = disposable["export"]
+        manifest = VerificationManifestV1.from_payload({
+            "version": 1, "task": task.id, "workspace": workspace.id, "node": node.id,
+            "owner": scope.guard_owner, "principal": asdict(task.actor), "source": task.source,
+            "scope": json.loads(json.dumps(asdict(task.delegation_scope), default=lambda v:
+                sorted(v) if isinstance(v, (set, frozenset)) else v.isoformat())),
+            "sandbox": {"id": self._frozen_sandboxes[task.id][0].id,
+                        "kind": self._frozen_sandboxes[task.id][0].kind,
+                        "root": str(record["pin"].root),
+                        "worktree_ref": self._frozen_sandboxes[task.id][0].worktree_ref},
+            "worktree_identity": root_identity, "acceptance": frozen,
+            "diff": digest({"patch": patch, "inputs": [e.digest for e in entries]}),
+            "inputs": {e.relative_path: {"digest": e.digest, "identity": asdict(e.identity),
+                "size": len(e.data), "kind": e.kind.value} for e in entries},
+            "obligations": obligations, "budgets": {"max_seconds": 60, "max_output": 65536,
+                "cpus": 1, "memory": "512m", "pids": 64},
+            "approval": {"task": task.id, "requester": task.actor.user_id,
+                         "source": task.source, "session": scope.session_id},
+            "host_requirements": digest(requirements), "export": exported["export"]})
+        # This private, current-frame check cannot be supplied by model JSON.
+        import asyncio
+        import time
+
+        self._verification_preparations[manifest] = {
+            "owner": asyncio.current_task(), "scope": scope, "task": task,
+            "workspace": workspace, "entries": entries, "export": exported["export"],
+            "expires": time.monotonic() + 60,
+            "manifest_sha": manifest.sha256, "plans": {},
+            "node_metadata": deepcopy(node.metadata), "node_budget": node.budget,
+            "parents": parent_links,
+            "host_execution_sha": digest({k: host.get(k) for k in
+                ("docker", "images", "tools", "discovery")}),
+        }
+        try:
+            prepared = await self._process_broker.prepare_verification(
+                manifest, self, scope, exported["export"])
+            executed = {}
+            if host.get("docker") is not None:
+                for item in obligations:
+                    await self._verification_preparation_record(
+                        manifest, self._process_broker, scope,
+                        exported["export"], allow_expired=True)
+                    key = VerificationManifestV1.from_payload(manifest.to_payload())
+                    self._verification_preparations[key] = {
+                        **self._verification_preparations[manifest],
+                        "expires": time.monotonic() + 60,
+                        "plans": deepcopy(self._verification_preparations[manifest]["plans"])}
+                    try:
+                        result = await self._process_broker.execute_verification_obligation(
+                            key, self, scope, exported["export"], item["id"], wait=True)
+                        executed[item["id"]] = result
+                    finally:
+                        self._release_verification_preparation(key)
+                    if executed[item["id"]].get("outcome") == "UNKNOWN":
+                        break  # No further effects while an earlier container is unconfirmed.
+                await self._verification_preparation_record(manifest, self._process_broker, scope,
+                    exported["export"], allow_expired=True)
+        finally:
+            self._release_verification_preparation(manifest)
+        rows = []
+        tests = []
+        for item in obligations:
+            state = prepared[item["id"]]
+            actual = executed.get(item["id"], {})
+            name = item["name"]
+            rows.append({"kind": item["id"], "name": name, "command": item["argv"],
+                "cwd": item["cwd"], "outcome": actual.get("outcome", state["outcome"]),
+                "passed": actual.get("passed", False), "executed": actual.get("executed", False),
+                "allowed": actual.get("executed", False), "exit_code": actual.get("exit_code"),
+                "error": actual.get("reason", "" if actual.get("executed") else state["reason"]),
+                "execution": actual,
+                "preparation": state.get("prepared")})
+            tests.append(TestResult(name, actual.get("passed", False),
+                executed=actual.get("executed", False),
+                output=(actual.get("stdout", "") + actual.get("stderr", "")
+                        if actual.get("executed") else state["reason"])))
+        output = {"status": "unverified", "waiting": True, "waiting_kind": "configuration",
+            "reason": "verification_native_commissioning_required", "verified": False,
+            "manifest": manifest.to_payload(), "manifest_sha256": manifest.sha256,
+            "export": exported["export"], "results": rows,
+            "test_results": [asdict(t) for t in tests], "acceptance_spec": frozen["spec"],
+            "demo_path": frozen["demo_path"], "code_diff": patch}
+        output["original_declarations"] = requirements["declarations"]
+        output["verification_report"] = build_verification_report(tests, output).to_payload()
+        if executed:
+            # Status must be derived from every required row, never preparation.
+            complete = (all(t.executed and t.passed for t in tests)
+                        and all(row["outcome"] == "passed" for row in rows))
+            output["status"] = "passed" if complete else "unverified"
+            output["verification_report"] = build_verification_report(tests, output).to_payload()
+            output["verified"] = output["verification_report"]["verified"]
+            output["waiting"] = not output["verified"]
+            output["waiting_kind"] = "" if output["verified"] else "verification"
+            output["reason"] = "" if output["verified"] else next(
+                (row["error"] for row in rows if row.get("error")),
+                "verification_result_unconfirmed")
+        output["files_changed"] = changed
+        output["original_inputs"] = {e.relative_path: {
+            "digest": e.digest, "identity": asdict(e.identity), "size": len(e.data)}
+            for e in original}
+        output["collection_complete"] = await self._verification_collection_settled(scope, output)
+        if output["collection_complete"]:
+            from Sprout.execution.verification_manifest import scope_digest
+
+            if host.get("git") is not None:
+                from Sprout.tools.result import ToolExecutionUnconfirmed
+
+                try:
+                    git_result = await self._git_broker.review_diff(workspace,
+                        scope=task.delegation_scope)
+                    output["git_diff"] = (json.loads(git_result.output) if git_result.allowed
+                        else {"status": "git_diff_unavailable", "reason": git_result.reason})
+                except ToolExecutionUnconfirmed as error:
+                    output.update(collection_complete=False, waiting=True, waiting_kind="resource",
+                        reason=str(error), git_diff={"status": "UNKNOWN", "retry_allowed": False})
+                    return output
+                if git_result.allowed:
+                    for path, resource in manifest.to_payload()["inputs"].items():
+                        current = output["git_diff"]["current_files"].get(path)
+                        if (current is None or current["sha256"] != resource["digest"]
+                                or current["identity"] != resource["identity"]):
+                            raise PermissionError("git_verification_snapshot_changed")
+                    output["files_changed"] = sorted(set(changed) | set(
+                        output["git_diff"]["changed_paths"]))
+                current_task, current_workspace = await self._project_analysis_subject(scope)
+                if (current_task != task or current_workspace != workspace
+                        or self._verification_hosts.get(task.id) is not host
+                        or not await self._verification_collection_settled(scope, output)):
+                    raise PermissionError("git_evaluation_authority_changed")
+            output.update(waiting=False, waiting_kind="",
+                status="passed" if output["verified"] else "partially_verified",
+                reason="" if output["verified"] else "verification_incomplete_review_only",
+                failed_commands=[r["name"] for r in rows
+                    if r["outcome"] in {"check_failed", "runner_error", "timeout"}],
+                unverified_commands=[r["name"] for r in rows if r["outcome"] not in
+                    {"passed", "check_failed", "runner_error", "timeout"}])
+            host.setdefault("review_results", {})[node.id] = {
+                "runtime": self, "owner": scope.guard_owner,
+                "subject": self._node_subject_digest(scope),
+                "scope": scope_digest(task.delegation_scope),
+                "output": payload_digest(output), "sandbox": self._frozen_sandboxes[task.id],
+                "task": deepcopy(task)}
+        return output
+
+    async def _verification_collection_settled(self, scope, output):
+        """Known results are reviewable; uncertain effects and cleanup are not."""
+        from uuid import NAMESPACE_URL, uuid5
+
+        from Sprout.execution.verification_manifest import digest
+
+        task, _ = await self._project_analysis_subject(scope)
+        if task.delegation_scope.is_expired():
+            raise PermissionError("verification_review_scope_expired")
+        if any(r.get("task", scope.task).id == task.id and self._verification_custody_busy(r)
+               for r in self._verification_preparations.values()):
+            return False
+        manifest = output["manifest"]
+        for row in output["results"]:
+            actual = row.get("execution") or {}
+            identifier = str(uuid5(NAMESPACE_URL,
+                task.id + ":ordinary:" + manifest["node"] + ":" + row["kind"]))
+            saved = await self._metadata_or_raise().get_verification_execution(identifier)
+            if row["outcome"] not in {"passed", "unverified", "check_failed", "policy_denied",
+                                      "not_executed", "runner_error", "timeout"}:
+                return False
+            if row["executed"]:
+                if (not saved or saved.get("state") != "completed"
+                        or saved.get("schema_version") != 3
+                        or saved.get("task_id") != task.id
+                        or saved.get("workspace_id") != manifest["workspace"]
+                        or saved.get("node_id") != manifest["node"]
+                        or saved.get("owner") != manifest["owner"]
+                        or saved.get("manifest") != output["manifest_sha256"]
+                        or saved.get("slot") != row["kind"]
+                        or actual.get("execution_id") != identifier
+                        or digest(saved.get("result")) != digest(actual)):
+                    return False
+            elif saved is not None or row["outcome"] not in {"policy_denied", "not_executed"}:
+                return False
+        return bool(output["results"])
+
+    async def _review_proposal_context(self, scope):
+        """Check this Runtime's receipt against the subsequently completed Guard."""
+        from copy import deepcopy
+
+        from Sprout.execution.node_result_source import payload_digest
+        from Sprout.execution.verification_manifest import scope_digest
+        from Sprout.security.access import AccessDecision, ActionRequest, ActionType
+        from Sprout.workspace.models import ResourceRef
+
+        task, _ = await self._project_analysis_subject(scope)
+        if (getattr(self, "_verification_stopping", False)
+                or scope.node.type is not NodeType.APPROVAL
+                or task.delegation_scope.is_expired()):
+            raise PermissionError("verification_review_subject_denied")
+        host = self._verification_hosts.get(task.id)
+        receipts = host.get("review_results", {}) if host else {}
+        pending, candidates, seen = list(scope.node.dependencies), [], set()
+        while pending:
+            identifier = pending.pop()
+            if identifier in seen:
+                continue
+            seen.add(identifier)
+            node = await self._metadata_or_raise().get_execution_node(identifier)
+            if node is None or node.task_id != task.id:
+                raise PermissionError("verification_review_dependency_denied")
+            if node.status is NodeStatus.SKIPPED:
+                pending.extend(node.dependencies)
+            elif node.type is NodeType.EVALUATION:
+                candidates.append(node)
+            else:
+                raise PermissionError("verification_review_dependency_denied")
+        if len(candidates) != 1:
+            raise PermissionError("verification_review_source_unavailable")
+        node = candidates[0]
+        receipt, output = receipts.get(node.id), node.metadata.get("output")
+        guard = node.metadata.get("execution_guard", {})
+        registered = self._frozen_sandboxes.get(task.id)
+        if (not receipt or receipt["runtime"] is not self
+                or node.status is not NodeStatus.COMPLETED or guard.get("state") != "completed"
+                or guard.get("owner") != receipt["owner"]
+                or receipt["task"] != task
+                or receipt["subject"] != self._node_subject_digest(scope)
+                or receipt["scope"] != scope_digest(task.delegation_scope)
+                or receipt["output"] != payload_digest(output)
+                or registered is None or receipt["sandbox"] is not registered
+                or not output.get("collection_complete")
+                or not await self._verification_collection_settled(scope, output)):
+            raise PermissionError("verification_review_origin_denied")
+        from Sprout.execution.host_acceptance import pin_execution_directory
+
+        sandbox = registered[0]
+        with pin_execution_directory(sandbox.root) as pin:
+            if pin.identity != registered[3]:
+                raise PermissionError("verification_review_worktree_changed")
+            pin.check()
+        bound = task.delegation_scope.bind_paths(str(sandbox.root))
+        for path in output["manifest"]["inputs"]:
+            target = sandbox.root / path
+            request = ActionRequest(task_id=task.id, actor=task.actor,
+                action=ActionType.FILE_READ, scope=bound,
+                resource=ResourceRef(sandbox.id, target.as_posix(),
+                    kind=self._file_broker._classify(target, sandbox)))
+            if (not bound.permits("file.read", target.as_posix())
+                    or self._file_broker._policy.decide(request).decision
+                    is not AccessDecision.ALLOW):
+                raise PermissionError("verification_review_publication_denied")
+        if output.get("git_diff", {}).get("status") == "available":
+            from Sprout.execution.git_s1 import validate_review
+
+            await validate_review(host.get("git"), self, scope, self._git_broker,
+                                  output["git_diff"])
+        return deepcopy(output), sandbox
+
+    @staticmethod
+    def _verification_custody_busy(record):
+        native = record.get("native", {})
+        helper = native.get("cleanup_task")
+        return (native.get("manual_intervention_required", False)
+            or any(not task.done() for task in native.get("pending_operations", ()))
+            or any(p.returncode is None for p in native.get("cli_processes", {}).values())
+            or helper is not None and not helper.done())
+
+    def _release_verification_preparation(self, manifest):
+        record = self._verification_preparations.get(manifest)
+        if record is not None and not self._verification_custody_busy(record):
+            self._verification_preparations.pop(manifest, None)
+
+    async def _verification_preparation_record(self, manifest, broker, scope, exported,
+                                               *, allow_expired=False):
+        import asyncio
+        import time
+
+        record = self._verification_preparations.get(manifest)
+        if (record is None or record["owner"] is not asyncio.current_task()
+                or getattr(self, "_verification_stopping", False)
+                or broker is not self._process_broker or record["scope"] is not scope
+                or record["export"] != exported or record["manifest_sha"] != manifest.sha256
+                or (not allow_expired and time.monotonic() >= record["expires"])):
+            raise PermissionError("verification_preparation_unavailable")
+        task, workspace = await self._project_analysis_subject(scope)
+        if task != record["task"] or workspace != record["workspace"]:
+            raise PermissionError("verification_preparation_authority_changed")
+        from Sprout.execution.verification_manifest import digest
+
+        if digest(record["export"]) != digest(manifest.to_payload()["export"]):
+            raise PermissionError("verification_export_manifest_changed")
+        host_identity = {k: self._verification_hosts[task.id].get(k)
+                         for k in ("docker", "images", "tools", "discovery")}
+        if record["host_execution_sha"] != digest(host_identity):
+            raise PermissionError("verification_host_execution_changed")
+        node = await self._metadata_or_raise().get_execution_node(scope.node.id)
+        if node.metadata != record["node_metadata"] or node.budget != record["node_budget"]:
+            raise PermissionError("verification_node_plan_changed")
+        from Sprout.execution.node_result_source import payload_digest
+
+        for parent_id, expected in record["parents"].items():
+            parent = await self._metadata_or_raise().get_execution_node(parent_id)
+            if (parent is None or parent.task_id != task.id
+                    or parent.status is not NodeStatus.COMPLETED
+                    or parent.metadata.get("execution_guard", {}).get("state") != "completed"
+                    or parent.metadata["execution_guard"].get("owner") != expected["owner"]
+                    or payload_digest(parent.metadata.get("output")) != expected["output"]):
+                raise PermissionError("verification_parent_changed")
+        await self._capture_verification_view(scope, self._verification_hosts[task.id]["paths"],
+                                              expected=record["entries"])
+        from Sprout.execution.verification_export import check_export_receipt
+
+        async def fresh():
+            from Sprout.security.access import AccessDecision, ActionRequest, ActionType
+            from Sprout.workspace.models import ResourceRef
+
+            current_task, current_workspace = await self._project_analysis_subject(scope)
+            if (current_task != record["task"] or current_workspace != record["workspace"]
+                    or current_task.delegation_scope.is_expired()
+                    or (not allow_expired and time.monotonic() >= record["expires"])):
+                raise PermissionError("verification_export_authority_changed")
+            self._verification_export_boundary(self._verification_hosts[task.id], workspace,
+                                               self._frozen_sandboxes[task.id][0])
+            sandbox = self._frozen_sandboxes[task.id][0]
+            bound = current_task.delegation_scope.bind_paths(str(sandbox.root))
+            for entry in record["entries"]:
+                target = sandbox.root / entry.relative_path
+                request = ActionRequest(task_id=task.id, actor=current_task.actor,
+                    action=ActionType.FILE_READ, scope=bound,
+                    resource=ResourceRef(sandbox.id, target.as_posix(),
+                        kind=self._file_broker._classify(target, sandbox)))
+                if (not bound.permits("file.read", target.as_posix())
+                        or self._file_broker._policy.decide(request).decision
+                        is not AccessDecision.ALLOW):
+                    raise PermissionError("verification_export_authorization_denied")
+
+        record["inventories"] = {record["export"]["root"]:
+            await check_export_receipt(record["export"], revalidate=fresh)}
+        if record["export"].get("compileall"):
+            copy = record["export"]["compileall"]
+            record["inventories"][copy["root"]] = await check_export_receipt(
+                copy, revalidate=fresh)
+        from Sprout.execution.verification_run import DockerVerificationRun
+
+        for plan in record["plans"].values():
+            DockerVerificationRun.check_preparation(plan)
+        return record
+
+    async def _accept_verification_agent_completion(self, scope, node):
+        from Sprout.execution.node_result_source import payload_digest
+        from Sprout.execution.verification_manifest import _AgentCompletionCandidate, scope_digest
+
+        host = self._verification_hosts.get(scope.task.id)
+        candidates = host.get("agent_candidates", {}) if host else {}
+        candidate = candidates.get(node.id)
+        try:
+            task, _ = await self._project_analysis_subject(scope)
+            current = await self._metadata_or_raise().get_execution_node(node.id)
+            guard = current.metadata.get("execution_guard", {}) if current else {}
+            if (type(candidate) is not _AgentCompletionCandidate or candidate.issuer is not self
+                    or candidate.scope.runtime is not self or candidate.scope.active
+                    or candidate.scope.task.id != task.id or current is None
+                    or current.task_id != task.id or current.id != candidate.scope.node.id
+                    or current.type is not NodeType.AGENT
+                    or current.status is not NodeStatus.COMPLETED
+                    or task.delegation_scope.is_expired()
+                    or guard.get("state") != "completed" or guard.get("owner") != candidate.owner
+                    or candidate.subject_digest != self._node_subject_digest(scope)
+                    or candidate.scope_digest != scope_digest(task.delegation_scope)
+                    or candidate.output_digest != payload_digest(current.metadata.get("output"))):
+                raise PermissionError("verification_agent_completion_unavailable")
+        except BaseException:
+            candidates.pop(node.id, None)
+            raise
+        # Returning a boolean here confers neither file visibility nor execution.
+        return True
+
+    async def _issue_frozen_execution(self, cwd, spec, path, case_id, executor):
+        import time
+        from copy import deepcopy
+
+        from Sprout.execution.host_acceptance import _FrozenExecutionContract, check_binding
+        from Sprout.execution.node_result_source import payload_digest
+        from Sprout.tools.context_keys import _current_project_node
+
+        scope = _current_project_node()
+        if scope is None or scope.runtime is not self:
+            raise PermissionError("frozen_execution_subject_unavailable")
+        task, workspace = await self._project_analysis_subject(scope)
+        frozen = task.metadata.get("host_acceptance_v1")
+        if task.delegation_scope != scope.task.delegation_scope:
+            raise PermissionError("frozen_execution_scope_changed")
+        expected = check_binding(task, workspace, frozen)
+        registered = self._frozen_sandboxes.get(task.id)
+        if (registered is None or Path(cwd) != registered[0].root
+                or spec.to_payload() != expected.to_payload() or path != frozen["test_path"]
+                or case_id not in {case.id for case in expected.cases}
+                or scope.node.type not in {NodeType.TEST_DESIGN, NodeType.EVALUATION}):
+            raise PermissionError("frozen_execution_target_unavailable")
+        sandbox_node = await self._metadata_or_raise().get_execution_node(registered[1])
+        source = await self._metadata_or_raise().get_node_result_source(registered[1])
+        if (sandbox_node is None or source is None
+                or sandbox_node.status is not NodeStatus.COMPLETED
+                or source.owner != registered[2] or source.task_id != task.id
+                or source.subject_digest != self._node_subject_digest(scope)
+                or source.output_digest != payload_digest(sandbox_node.metadata.get("output"))
+                or sandbox_node.metadata.get("execution_guard", {}).get("owner") != registered[2]
+                or sandbox_node.metadata.get("execution_guard", {}).get("state") != "completed"
+                or sandbox_node.metadata.get("output") != {
+                    "id": registered[0].id, "kind": registered[0].kind,
+                    "root": str(registered[0].root), "worktree_ref": registered[0].worktree_ref}):
+            raise PermissionError("frozen_sandbox_origin_unavailable")
+        permit = _FrozenExecutionContract(self)
+        self._frozen_executions[permit] = {
+            "scope": scope, "owner": asyncio.current_task(), "task": deepcopy(task),
+            "workspace": workspace, "sandbox": registered[0], "root_identity": registered[3],
+            "spec": expected, "path": path, "case_id": case_id, "executor": deepcopy(executor),
+            "expires": time.monotonic() + 60, "used": False, "inputs": None,
+        }
+        return permit
+
+    def _frozen_execution_record(self, permit, broker, *, claim=False):
+        import time
+
+        from Sprout.execution.host_acceptance import _FrozenExecutionContract
+        from Sprout.tools.context_keys import _current_project_node
+
+        record = (self._frozen_executions.get(permit)
+                  if type(permit) is _FrozenExecutionContract else None)
+        if (record is None or permit.issuer is not self or self._process_broker is not broker
+                or record["scope"] is not _current_project_node()
+                or record["owner"] is not asyncio.current_task()
+                or time.monotonic() >= record["expires"] or (claim and record["used"])):
+            raise PermissionError("frozen_execution_contract_unavailable")
+        if claim:
+            record["used"] = True
+        return record
+
+    async def _refresh_frozen_execution(self, permit, broker, pin):
+        from dataclasses import asdict
+        from hashlib import sha256
+
+        from Sprout.execution.acceptance import render_acceptance_demo, render_acceptance_tests
+        from Sprout.execution.host_acceptance import check_binding, check_module_dependencies
+        from Sprout.execution.node_result_source import payload_digest
+        from Sprout.security.access import AccessDecision, ActionRequest, ActionType
+        from Sprout.tools.context_keys import _project_analysis_call
+        from Sprout.workspace.models import ResourceRef
+
+        record = self._frozen_execution_record(permit, broker)
+        task, workspace = await self._project_analysis_subject(record["scope"])
+        if (task != record["task"] or workspace != record["workspace"]
+                or pin.identity != record["root_identity"]
+                or self._frozen_sandboxes.get(task.id, (None,))[0] is not record["sandbox"]):
+            raise PermissionError("frozen_execution_authority_changed")
+        frozen = task.metadata["host_acceptance_v1"]
+        spec = check_binding(task, workspace, frozen)
+        paths = task.metadata.get("required_paths")
+        if (type(paths) not in {list, tuple} or not paths or len(paths) > 64
+                or any(type(path) is not str for path in paths)):
+            raise PermissionError("frozen_execution_inputs_unavailable")
+        effective = task.delegation_scope.bind_paths(str(pin.root))
+        inputs, contents, total = {}, {}, 0
+        for path in paths:
+            target = self._file_broker._safe_target(record["sandbox"], path)
+            if target is None:
+                raise PermissionError("frozen_input_boundary_denied")
+            request = ActionRequest(task_id=task.id, actor=task.actor, action=ActionType.FILE_READ,
+                scope=effective, resource=ResourceRef(workspace.id, target.as_posix(),
+                    kind=self._file_broker._classify(target, record["sandbox"])))
+            decision = self._policy_engine.decide(request)
+            await self._record_project_capture_policy(request, decision)
+            if (decision.decision is not AccessDecision.ALLOW
+                    or not effective.permits("file.read", target.as_posix())):
+                raise PermissionError("frozen_input_authorization_denied")
+            identity = pin.pin_file(path)
+            if identity.size > 100_000:
+                raise PermissionError("frozen_input_budget_exceeded")
+            read = await self._file_broker.read_text(record["sandbox"], path,
+                task_id=task.id, scope=task.delegation_scope, actor=task.actor)
+            if not read.wrote:
+                raise PermissionError("frozen_input_read_denied")
+            contents[path] = read.content
+            total += len(read.content.encode())
+            if total > 1_000_000:
+                raise PermissionError("frozen_input_budget_exceeded")
+            inputs[path] = {"digest": sha256(read.content.encode()).hexdigest(),
+                            "identity": asdict(identity)}
+            pin.check()
+        check_module_dependencies(spec, contents)
+        expected = {frozen["test_path"]: render_acceptance_tests(spec),
+                    frozen["demo_path"]: render_acceptance_demo(spec)}
+        for path, content in expected.items():
+            if path not in inputs or contents[path].replace("\r\n", "\n") != content:
+                raise PermissionError("frozen_execution_content_changed")
+        # Same handle-bound Snapshot identity convention as the original binding,
+        # not Windows pathname stat (whose ctime can mean a different OS field).
+        tool = await self._issue_project_analysis_tool(paths=tuple(expected))
+        with _project_analysis_call(tool):
+            selection = await self._issue_project_analysis_selection(tuple(expected))
+            originals = await self._capture_project_selection(selection, content_project=(
+                lambda analysis, view: {entry.relative_path: {
+                    "digest": entry.digest, "identity": asdict(entry.identity)}
+                    for entry in view.entries}))
+        for path in expected:
+            if originals.get(path) != frozen["resources"][path]:
+                raise PermissionError("frozen_original_source_changed")
+        protected = {path: inputs[path] for path in (frozen["test_path"], frozen["demo_path"])}
+        prior = self._frozen_worktree_inputs.setdefault(task.id, protected)
+        if prior != protected or (record["inputs"] is not None and record["inputs"] != inputs):
+            raise PermissionError("frozen_execution_input_changed")
+        record["inputs"] = inputs
+        current, current_workspace = await self._project_analysis_subject(record["scope"])
+        if current != task or current_workspace != workspace:
+            raise PermissionError("frozen_execution_authority_changed")
+        record["approval_binding"] = payload_digest({
+            "task": task.id, "node": record["scope"].node.id,
+            "owner": record["scope"].guard_owner, "cwd_identity": pin.identity,
+            "binding": frozen["sha256"], "executor": record["executor"], "inputs": inputs})
+        return ActionRequest(task_id=task.id, actor=task.actor, action=ActionType.PROCESS_RUN,
+            resource=ResourceRef(workspace.id, (pin.root / record["path"]).as_posix(),
+                kind=self._file_broker._classify(pin.root / record["path"], record["sandbox"])),
+            scope=effective)
+
+    async def _node_tool_request(self, tool, arguments):
+        from Sprout.execution.sandbox_tool import SandboxReadTool
+        from Sprout.security.access import ActionRequest, ActionType
+        from Sprout.tools.context_keys import _current_project_node
+        from Sprout.workspace.classifier import classify
+        from Sprout.workspace.models import ResourceRef
+
+        scope = _current_project_node()
+        from Sprout.tools.database_tool import DatabaseQueryTool
+
+        if type(tool) is DatabaseQueryTool and self.tools.get("database_query") is tool:
+            _, _, request = await self._database_query_request(
+                tool, arguments.get("database"), arguments.get("sql"),
+                arguments.get("workspace_id"))
+            return request
+        if scope is None or self._node_tool_scopes.get(tool) is not scope:
+            raise PermissionError("node_tool_binding_unavailable")
+        task, workspace = await self._project_analysis_subject(scope)
+        if task.delegation_scope.is_expired():
+            raise PermissionError("node_tool_binding_expired")
+        if task.metadata.get("host_acceptance_v1") != scope.task.metadata.get("host_acceptance_v1"):
+            raise PermissionError("node_tool_acceptance_binding_changed")
+        resource = None
+        paths = task.delegation_scope.bind_paths(str(workspace.root)).narrow(
+            scope.task.delegation_scope.bind_paths(str(workspace.root)))
+        sandbox = getattr(tool, "_sandbox", None)
+        if sandbox is not None:
+            from Sprout.workspace.authorized_content import relative_label
+
+            nodes = await self._metadata_or_raise().list_execution_nodes(task.id)
+            valid = any(n.type is NodeType.SANDBOX and n.status is NodeStatus.COMPLETED
+                        and n.metadata.get("output", {}).get("root") == str(sandbox.root)
+                        and n.metadata.get("output", {}).get("id") == sandbox.id for n in nodes)
+            if (not valid or getattr(tool, "_task_id", None) != task.id
+                    or getattr(tool, "_scope", None) != scope.task.delegation_scope):
+                raise PermissionError("node_tool_sandbox_unavailable")
+            path = relative_label(arguments.get("path", ""))
+            # Relative grants bind to the registered Worktree; absolute grants
+            # are never rebased into a different resource domain.
+            paths = task.delegation_scope.bind_paths(str(sandbox.root)).narrow(
+                scope.task.delegation_scope.bind_paths(str(sandbox.root)))
+            resource = ResourceRef(workspace.id, (sandbox.root / path).as_posix(),
+                                   kind=classify(path))
+            if not isinstance(tool, SandboxReadTool):
+                frozen = task.metadata.get("host_acceptance_v1", {}).get("resources", {})
+                if path in frozen:
+                    raise PermissionError("frozen_acceptance_write_denied")
+        return ActionRequest(task_id=task.id, actor=task.actor, action=ActionType.TOOL_INVOKE,
+                             resource=resource, scope=paths)
+
+    async def _node_file_request(self, request, sandbox):
+        from Sprout.task.paths import scope_path
+        from Sprout.tools.context_keys import _current_node_tool_call
+
+        frame = _current_node_tool_call()
+        if frame is None or getattr(frame[0], "_sandbox", None) != sandbox:
+            raise PermissionError("node_file_binding_unavailable")
+        subject = await self._node_tool_request(frame[0], frame[2])
+        if (request.task_id != subject.task_id or scope_path(request.resource.path) is None
+                or scope_path(request.resource.path) != scope_path(subject.resource.path)):
+            raise PermissionError("node_file_resource_mismatch")
+        return replace(request, actor=subject.actor, scope=subject.scope,
+                       resource=replace(request.resource,
+                                        workspace_id=subject.resource.workspace_id))
+
+    def _same_admitted_read(self, scope, tool, arguments, result):
+        from Sprout.execution.sandbox_tool import SandboxReadTool
+
+        if (type(tool) is not SandboxReadTool or not result.ok
+                or arguments.get("offset") or arguments.get("limit")):
+            return False
+        for record in self._node_products.values():
+            if (len(record) == 7 and record[0] == scope.task and record[5] is self
+                    and record[2].type is NodeType.READ
+                    and record[2].id in scope.parent_receipts):
+                if any(item.get("path") == arguments.get("path")
+                       and item.get("content", "").replace("\r\n", "\n")
+                       == result.content.replace("\r\n", "\n") for item in record[3]):
+                    return True
+        return False
+
+    async def _issue_project_analysis_tool(self, *, paths=None, discover=False):
+        from Sprout.tools.context_keys import _current_project_node
+        from Sprout.tools.project_analyze_tool import ProjectAnalyzeTool
+
+        scope = _current_project_node()
+        if scope is None:
+            raise PermissionError("Project analysis requires a live node execution domain")
+        await self._project_analysis_subject(scope)
+        tool = ProjectAnalyzeTool()
+        self._project_analysis_tools[tool] = scope
+        if discover:
+            # Host choice only, never derived from model arguments or metadata.
+            self._project_tool_paths[tool] = None
+        if paths is not None:
+            self._set_project_tool_paths(tool, paths)
+            admission = self._online_analysis_requests.get(scope.node.id)
+            if (admission is not None and len(paths) > 1
+                    and paths == admission["paths"]):
+                # Private, instance-bound operation: the entry file is NOT an
+                # authorization substitute for the rest of this fixed manifest.
+                self._project_manifest_tools[tool] = (scope, paths)
+                tool.spec = replace(tool.spec, description=tool.spec.description +
+                    " This instance analyzes the entire fixed host-selected manifest; "
+                    "path must identify its entry file and cannot change the manifest.")
+        return tool
+
+    def _set_project_tool_paths(self, tool, paths):
+        from Sprout.workspace.authorized_content import ContentLimits, relative_label
+
+        if (type(paths) is not tuple or not paths or len(paths) > ContentLimits().max_files
+                or len(set(paths)) != len(paths)):
+            raise PermissionError("project_capture_selection_invalid")
+        for path in paths:
+            relative_label(path)
+        self._project_tool_paths[tool] = paths
+
+    async def _database_query_request(self, tool, database, sql, workspace_id):
+        """Use the existing live node authority, never JSON attribution."""
+        from Sprout.security.access import ActionRequest, ActionType
+        from Sprout.task.paths import bound_scope_path, scope_path
+        from Sprout.tools.context_keys import _current_project_node
+        from Sprout.workspace.models import ResourceKind, ResourceRef
+
+        scope = _current_project_node()
+        if (scope is None or scope.runtime is not self
+                or self.tools.get("database_query") is not tool):
+            raise PermissionError("database_task_binding_unavailable")
+        task, workspace = await self._project_analysis_subject(scope)
+        if workspace_id not in {None, "", workspace.id}:
+            raise PermissionError("database_workspace_mismatch")
+        path = bound_scope_path(database, str(workspace.root))
+        target, root = scope_path(path), scope_path(str(workspace.root))
+        effective = task.delegation_scope.bind_paths(str(workspace.root)).narrow(
+            scope.task.delegation_scope.bind_paths(str(workspace.root)))
+        if (target is None or root is None or not root.contains(target)
+                or not effective.permits("db.read", target.text())
+                or not effective.permits("tool.invoke", target.text())):
+            raise PermissionError("database_scope_denied")
+        request = ActionRequest(task_id=task.id, actor=task.actor,
+            action=ActionType.TOOL_INVOKE, scope=effective,
+            resource=ResourceRef(workspace.id, target.text(), ResourceKind.DATA),
+            arguments={"tool": tool.spec.name, "sql": sql})
+        return task, workspace, request
+
+    async def _invoke_database_query(self, tool, database, sql, workspace_id):
+        from Sprout.security.access import AccessDecision
+        from Sprout.tools.context_keys import _current_project_node
+
+        task, workspace, request = await self._database_query_request(
+            tool, database, sql, workspace_id)
+        scope = _current_project_node()
+        decision = self._policy_engine.decide(request)
+        await self._record_project_capture_policy(request, decision)
+        if decision.decision is not AccessDecision.ALLOW:
+            raise PermissionError("database_tool_invocation_denied")
+        scope.untracked_tool_use = True
+        result = await self._database_broker.query(
+            workspace, request.resource.path, sql, task_id=task.id,
+            scope=request.scope, actor=task.actor)
+        current, current_workspace = await self._project_analysis_subject(scope)
+        if current.delegation_scope != task.delegation_scope or current_workspace != workspace:
+            raise PermissionError("database_authority_changed")
+        return result
+
+    async def _issue_project_query_tool(self, *, paths=None, discover=False):
+        from Sprout.tools.context_keys import _current_project_node
+        from Sprout.tools.workspace_query_tool import WorkspaceQueryTool
+
+        scope = _current_project_node()
+        if scope is None:
+            raise PermissionError("project_capture_frame_unavailable")
+        await self._project_analysis_subject(scope)
+        tool = WorkspaceQueryTool()
+        if discover and paths is None:
+            self._project_tool_paths[tool] = None
+        else:
+            self._set_project_tool_paths(tool, paths)
+        self._project_analysis_tools[tool] = scope
+        return tool
+
+    def _project_tool_ready(self, tool, arguments, frame):
+        from Sprout.task.paths import bound_scope_path, scope_path
+        from Sprout.tools.context_keys import _current_project_node
+        from Sprout.tools.workspace_query_tool import WorkspaceQueryTool
+
+        manifest = self._project_manifest_tools.get(tool)
+        if manifest is not None:
+            scope, paths = manifest
+            target = bound_scope_path(arguments.get("path"), str(scope.workspace.root))
+            if (frame is None or frame.node_scope is not scope
+                    or self._project_tool_paths.get(tool) != paths
+                    or scope_path(target) != scope_path(str(scope.workspace.root / paths[0]))):
+                return False
+        return (frame is not None and frame.node_scope is _current_project_node()
+                and frame.node_scope is not None
+                and self._project_analysis_tools.get(tool) is frame.node_scope
+                and (bool(self._project_tool_paths.get(tool))
+                     or (tool in self._project_tool_paths
+                         and self._project_tool_paths[tool] is None))
+                and (not isinstance(tool, WorkspaceQueryTool)
+                     or arguments.get("workspace_id") == frame.node_scope.workspace.id))
+
+    async def _invoke_project_tool(self, tool, arguments):
+        from copy import deepcopy
+
+        from Sprout.security.access import AccessDecision, ActionType
+        from Sprout.task.paths import scope_path
+        from Sprout.tools.context_keys import _current_project_analysis_call
+        from Sprout.tools.project_analyze_tool import ProjectAnalyzeTool
+        from Sprout.tools.result import ToolResult
+        from Sprout.workspace.authorized_content import VISIBLE_KINDS
+        from Sprout.workspace.models import ResourceRef
+
+        arguments = deepcopy(dict(arguments))
+        frame = _current_project_analysis_call()
+        if not self._project_tool_ready(tool, arguments, frame):
+            raise PermissionError("project_analysis_scope_unavailable")
+        subject = await self._project_analysis_request(tool, arguments, frame, "")
+        _, workspace = await self._project_analysis_subject(frame.node_scope)
+        await self._check_project_selection((frame, subject, workspace))
+        paths = self._project_tool_paths[tool]
+        discovered = paths is None
+        identities = None
+        if discovered:
+            sandbox = SandboxRef(frame.node_scope.workspace.id, "restricted_analysis",
+                                 frame.node_scope.workspace.root)
+            directory = Path(subject.resource.path)
+            listing = await self._file_broker.enumerate_readable(
+                sandbox, directory.relative_to(sandbox.root).as_posix(), subject=subject,
+            )
+            if not listing.ok:
+                admission = self._online_analysis_requests.get(frame.node_scope.node.id)
+                if admission is not None:
+                    admission["unavailable_reason"] = "project_auto_discovery_unavailable"
+                raise PermissionError("project_auto_discovery_unavailable")
+            identities = {}
+            for entry in listing.entries:
+                if entry.is_directory:
+                    continue
+                path = sandbox.root / entry.relative_path
+                kind = self._file_broker._classify(path, sandbox)
+                if kind not in VISIBLE_KINDS:
+                    continue
+                current = await self._project_analysis_request(
+                    tool, {"path": str(path)}, frame, frame.node_scope.session_id,
+                )
+                request = replace(current, action=ActionType.FILE_READ,
+                                  resource=ResourceRef(sandbox.id, path.as_posix(), kind))
+                decision = self._policy_engine.decide(request)
+                await self._record_project_capture_policy(request, decision)
+                if decision.decision is AccessDecision.ALLOW:
+                    identities[entry.relative_path] = entry.identity
+            paths = tuple(identities)
+        if isinstance(tool, ProjectAnalyzeTool):
+            manifest = self._project_manifest_tools.get(tool)
+            if manifest is not None:
+                # All members must independently pass the existing ToolInvoke
+                # and FILE_READ contracts before opening ANY manifest member.
+                record = (frame, subject, workspace)
+                sandbox = SandboxRef(workspace.id, "restricted_analysis", workspace.root)
+                for path in paths:
+                    absolute = str(workspace.root / path)
+                    await self._check_project_selection(record, resource_path=absolute)
+                    current = await self._project_analysis_request(
+                        tool, {"path": absolute}, frame, frame.node_scope.session_id,
+                    )
+                    request = replace(current, action=ActionType.FILE_READ, resource=ResourceRef(
+                        workspace.id, current.resource.path,
+                        kind=self._file_broker._classify(workspace.root / path, sandbox),
+                    ))
+                    decision = self._policy_engine.decide(request)
+                    await self._record_project_capture_policy(request, decision)
+                    if (decision.decision is not AccessDecision.ALLOW
+                            or not request.scope.permits(ActionType.FILE_READ.value,
+                                                         request.resource.path)):
+                        raise PermissionError("project_capture_read_denied")
+            else:
+                target = scope_path(subject.resource.path)
+                paths = tuple(path for path in paths if target.contains(
+                    scope_path(str(frame.node_scope.workspace.root / path))))
+        if not paths:
+            raise PermissionError("project_capture_selection_unavailable")
+        selection = await self._issue_project_analysis_selection(paths)
+        if not isinstance(tool, ProjectAnalyzeTool):
+            return await self._query_project_selection(selection, arguments)
+
+        def project(analysis):
+            admission = self._online_analysis_requests.get(frame.node_scope.node.id)
+            if admission is not None:
+                # Provisional data only; the host returns it only after capture's
+                # publication checks and the real Guard settlement succeed.
+                admission["analysis_data"] = analysis
+            payload = {
+                "workspace_id": analysis.workspace.id,
+                "root": analysis.workspace.root.as_posix(),
+                "languages": list(analysis.manifest.detected_languages),
+                "framework_hints": list(analysis.manifest.framework_hints),
+                "entry_points": list(analysis.manifest.entry_points),
+                "test_commands": list(analysis.manifest.test_commands),
+                "build_commands": list(analysis.manifest.build_commands),
+                "read_plan_resources": len(analysis.read_plan.resources),
+                "graph": {"nodes": len(analysis.graph.nodes), "edges": len(analysis.graph.edges),
+                          "node_kinds": sorted({node.kind for node in analysis.graph.nodes}),
+                          "relations": sorted({edge.relation for edge in analysis.graph.edges})},
+                "knowledge": [
+                    {"kind": item.kind, "statement": item.statement,
+                     "confidence": item.confidence, "evidence_ids": list(item.evidence_ids),
+                     "details": dict(item.details)} for item in analysis.knowledge.items
+                ],
+                "coverage": {"mode": "discovery" if discovered else "files",
+                             "file_count": len(paths),
+                             "complete_project": False,
+                             "visibility": "authorized_only"},
+            }
+            return ToolResult.success(analysis.context_summary(), data=payload)
+
+        admission = self._online_analysis_requests.get(frame.node_scope.node.id)
+        projector = admission.get("content_project") if admission is not None else None
+
+        def project_contents(analysis, view):
+            result = project(analysis)
+            if projector is not None:
+                admission["projected_data"] = projector(analysis, view)
+            return result
+
+        result = await self._capture_project_selection(
+            selection, content_project=project_contents, expected_identities=identities,
+        )
+        admission = self._online_analysis_requests.get(frame.node_scope.node.id)
+        if admission is not None and result.ok:
+            admission["analysis_result"] = result
+        return result
+
+    async def _project_analysis_request(self, tool, arguments, frame, session_id):
+        from Sprout.security.access import ActionRequest, ActionType
+        from Sprout.task.paths import bound_scope_path, scope_path
+        from Sprout.tools.context_keys import _current_project_analysis_call, _current_project_node
+        from Sprout.workspace.models import ResourceKind, ResourceRef
+
+        scope = _current_project_node()
+        if (frame is not _current_project_analysis_call() or frame.tool is not tool
+                or scope is None or frame.node_scope is not scope
+                or self._project_analysis_tools.get(tool) is not scope):
+            raise PermissionError("Project analysis instance/call binding unavailable")
+        task, workspace = await self._project_analysis_subject(scope)
+        if session_id not in {"", scope.session_id, f"node-{scope.node.id}"}:
+            raise PermissionError("Project analysis caller session mismatch")
+        root = scope_path(str(workspace.root))
+        from Sprout.tools.workspace_query_tool import WorkspaceQueryTool
+
+        if isinstance(tool, WorkspaceQueryTool):
+            if arguments.get("workspace_id", workspace.id) != workspace.id:
+                raise PermissionError("workspace_query_workspace_mismatch")
+            paths = self._project_tool_paths.get(tool)
+            admission = self._online_analysis_requests.get(scope.node.id)
+            directory = admission["target"] if admission is not None else None
+            raw = (str(workspace.root / paths[0]) if paths else directory) if (
+                "workspace_id" in arguments) else arguments.get("path")
+        else:
+            raw = arguments.get("path")
+        path = bound_scope_path(raw, str(workspace.root)) if isinstance(raw, str) else None
+        target = scope_path(path) if path is not None else None
+        if (root is None or not root.anchor or root.anchor.startswith("//")
+                or target is None or not root.contains(target)):
+            raise PermissionError("Project analysis requested resource unavailable")
+        effective = task.delegation_scope.bind_paths(str(workspace.root)).narrow(
+            scope.task.delegation_scope.bind_paths(str(workspace.root)),
+        )
+        preparation = self._preparation_tasks.get(task.id)
+        # The read service owns a real separate node, but original CODE effects
+        # remain charged to the authoritative parent for task-specific Policy.
+        # Only a live Runtime registration, not child metadata, selects it.
+        resource_task = preparation[1] if preparation and preparation[1] is not None else task
+        return ActionRequest(
+            task_id=resource_task.id, actor=task.actor, action=ActionType.TOOL_INVOKE,
+            resource=ResourceRef(workspace_id=workspace.id, path=target.text(),
+                                 kind=ResourceKind.OTHER),
+            scope=effective,
+        )
+
+    async def _check_project_selection(self, record, *, record_policy=True, resource_path=None):
+        """Recheck B1 authority and existing policies; never ask for approvals."""
+        from Sprout.security.access import AccessDecision, PolicyDecision
+        from Sprout.security.policy import SecurityPolicy
+
+        frame, initial, workspace = record
+        subject = await self._project_analysis_request(
+            frame.tool, {"path": resource_path or initial.resource.path}, frame,
+            frame.node_scope.session_id,
+        )
+        task, current = await self._project_analysis_subject(frame.node_scope)
+        if (subject.actor != initial.actor or subject.task_id != initial.task_id
+                or subject.scope != initial.scope or current.id != workspace.id
+                or current.root != workspace.root or current.revision != workspace.revision):
+            raise PermissionError("project_capture_authority_changed")
+        policy = self.security.tool_policy if self.security is not None else SecurityPolicy()
+        risk = policy.decide_for_spec(frame.tool.spec)
+        request = replace(
+            subject, arguments={"tool_name": frame.tool.spec.name, "path": subject.resource.path},
+        )
+        boundary = self._policy_engine.decide(request)
+        if (subject.scope.is_expired()
+                or not subject.scope.permits(subject.action.value, subject.resource.path)):
+            boundary = PolicyDecision(AccessDecision.DENY, "Project capture Scope denied",
+                                      matched_rules=("scope:expired" if subject.scope.is_expired()
+                                                     else "scope:denied",))
+        decision = replace(
+            boundary, decision=LayeredPolicyEngine._intersect(boundary.decision, risk.decision),
+            matched_rules=(*boundary.matched_rules, *risk.matched_rules),
+            reason="; ".join(filter(None, (boundary.reason, risk.reason))),
+        )
+        if record_policy:
+            await self._record_project_capture_policy(request, decision)
+        if decision.decision is not AccessDecision.ALLOW:
+            raise PermissionError("project_capture_policy_denied")
+        return task, current
+
+    async def _record_project_capture_policy(self, request, decision):
+        from Sprout.execution.policy_emit import emit_policy_decision
+
+        if self.audit is not None:
+            self.audit.record_decision(request, decision)
+        await emit_policy_decision(self.events, request, decision)
+
+    async def _issue_project_analysis_selection(self, paths, *, limits=None):
+        """Trusted host planning only; never called with model tool arguments.
+
+        This fixed selector does NOT grant directory visibility or FILE_READ.
+        Every selected known path still goes through the existing FileBroker.
+        The returned process-local instance is registered to the live B1 frame.
+        """
+        from Sprout.tools.context_keys import _current_project_analysis_call
+        from Sprout.workspace.authorized_content import (
+            ContentLimits,
+            _CaptureSelection,
+            relative_label,
+        )
+
+        frame = _current_project_analysis_call()
+        if frame is None or frame.node_scope is None:
+            raise PermissionError("project_capture_frame_unavailable")
+        limits = ContentLimits() if limits is None else limits
+        if (type(paths) is not tuple or not paths or type(limits) is not ContentLimits
+                or len(paths) > limits.max_files):
+            raise PermissionError("project_capture_selection_invalid")
+        for path in paths:
+            relative_label(path)
+            if len(path.split("/")) > limits.max_depth:
+                raise PermissionError("project_capture_depth_exceeded")
+        if len({path.casefold() for path in paths}) != len(paths):
+            raise PermissionError("project_capture_duplicate_path")
+        root = frame.node_scope.workspace.root
+        initial = await self._project_analysis_request(
+            frame.tool, {"path": str(root / paths[0])}, frame, frame.node_scope.session_id,
+        )
+        _, workspace = await self._project_analysis_subject(frame.node_scope)
+        record = (frame, initial, workspace)
+        await self._check_project_selection(record)
+        selection = _CaptureSelection(paths, limits)
+        self._project_analysis_selections[selection] = record
+        return selection
+
+    async def _analyze_project_selection(self, selection):
+        """Internal restricted pipeline; not a model-visible tool or A bypass."""
+        return await self._capture_project_selection(selection)
+
+    async def _query_project_selection(self, selection, arguments):
+        """Fresh per-call query, no snapshot/cache lookup or portable grant."""
+        from copy import deepcopy
+
+        from Sprout.tools.workspace_query_tool import WorkspaceQueryTool
+        from Sprout.workspace.authorized_content import _CaptureSelection
+
+        arguments = deepcopy(dict(arguments))
+        if type(selection) is not _CaptureSelection:
+            raise PermissionError("project_capture_selection_unregistered")
+        record = self._project_analysis_selections.get(selection)
+        if record is None or arguments.get("workspace_id") != record[2].id:
+            raise PermissionError("workspace_query_workspace_mismatch")
+        return await self._capture_project_selection(
+            selection, project=lambda analysis: WorkspaceQueryTool._project(analysis, arguments),
+            consumer_spec=WorkspaceQueryTool().spec,
+        )
+
+    async def _build_project_context(self, selection, message, session):
+        """Trusted host integration, not a model-visible or JSON-bound entry."""
+        from copy import deepcopy
+
+        from Sprout.tools.context_keys import _current_project_analysis_call
+        from Sprout.workspace.authorized_content import _CaptureSelection
+
+        if type(selection) is not _CaptureSelection:
+            raise PermissionError("project_capture_selection_unregistered")
+        message = replace(message, metadata=deepcopy(dict(message.metadata)))
+        record = self._project_analysis_selections.get(selection)
+        if record is None or record[0] is not _current_project_analysis_call():
+            raise PermissionError("project_capture_selection_unregistered")
+        task, _ = await self._check_project_selection(record)
+        scope = record[0].node_scope
+        if (not scope.session_id or session.id != scope.session_id
+                or session.user_id != task.actor.user_id or message.user_id != task.actor.user_id
+                or message.session_id not in {None, session.id}):
+            raise PermissionError("project_context_subject_mismatch")
+        # The passed Session is not identity authority; use the fresh server row.
+        session = await self._sessions.require_owner(scope.session_id, task.actor)
+        return await self._capture_project_selection(
+            selection, project=lambda analysis: self._contexts._isolated_context(
+                message, session, {}, {}, analysis=analysis),
+        )
+
+    def _project_consumer_request(self, subject, spec):
+        """A data consumer may tighten, never replace, capture authorization."""
+        from Sprout.security.policy import SecurityPolicy
+
+        policy = self.security.tool_policy if self.security is not None else SecurityPolicy()
+        request = replace(subject, arguments={"tool_name": spec.name,
+                                              "path": subject.resource.path})
+        decision = self._policy_engine.decide(request)
+        risk = policy.decide_for_spec(spec)
+        decision = replace(
+            decision, decision=LayeredPolicyEngine._intersect(decision.decision, risk.decision),
+            reason="; ".join(filter(None, (decision.reason, risk.reason))),
+            matched_rules=(*decision.matched_rules, *risk.matched_rules),
+        )
+        return request, decision
+
+    async def _capture_project_selection(
+        self, selection, *, project=None, consumer_spec=None, content_project=None,
+        expected_identities=None,
+    ):
+        """Capture and project before final checks; never cache a projection."""
+        import time
+
+        from Sprout.security.access import AccessDecision, ActionType
+        from Sprout.tools.context_keys import _current_project_analysis_call
+        from Sprout.workspace.authorized_content import (
+            AuthorizedContentView,
+            AuthorizedEntry,
+            _CaptureSelection,
+        )
+        from Sprout.workspace.models import ResourceRef
+
+        if type(selection) is not _CaptureSelection:
+            raise PermissionError("project_capture_selection_unregistered")
+        record = self._project_analysis_selections.get(selection)
+        if record is None or record[0] is not _current_project_analysis_call():
+            raise PermissionError("project_capture_selection_unregistered")
+        del self._project_analysis_selections[selection]  # Single capture, no implicit retry.
+        task, workspace = await self._check_project_selection(record)
+        if consumer_spec is not None:
+            request, decision = self._project_consumer_request(record[1], consumer_spec)
+            await self._record_project_capture_policy(request, decision)
+            if decision.decision is not AccessDecision.ALLOW:
+                raise PermissionError("project_consumer_policy_denied")
+        sandbox = SandboxRef(workspace.id, "restricted_analysis", workspace.root)
+        entries, total, view = [], 0, None
+        deadline = time.monotonic() + selection.limits.max_seconds
+        try:
+            for path in selection.paths:
+                if time.monotonic() > deadline:
+                    raise PermissionError("project_capture_expired")
+                await self._check_project_selection(
+                    record, resource_path=str(workspace.root / path),
+                )
+                subject = await self._project_analysis_request(
+                    record[0].tool, {"path": str(workspace.root / path)}, record[0],
+                    record[0].node_scope.session_id,
+                )
+                if consumer_spec is not None:
+                    request, decision = self._project_consumer_request(subject, consumer_spec)
+                    await self._record_project_capture_policy(request, decision)
+                    if decision.decision is not AccessDecision.ALLOW:
+                        raise PermissionError("project_consumer_policy_denied")
+                remaining = selection.limits.max_total_bytes - total
+                if remaining <= 0:
+                    raise PermissionError("project_capture_total_budget")
+                kind = self._file_broker._classify(workspace.root / path, sandbox)
+                request = replace(subject, action=ActionType.FILE_READ, resource=ResourceRef(
+                    workspace.id, subject.resource.path, kind=kind,
+                ))
+                decision = self._policy_engine.decide(request)
+                await self._record_project_capture_policy(request, decision)
+                if (request.scope.is_expired()
+                        or not request.scope.permits(request.action.value, request.resource.path)
+                        or decision.decision is not AccessDecision.ALLOW):
+                    raise PermissionError("project_capture_read_denied")
+                result = await self._file_broker.read_snapshot(
+                    sandbox, path, subject=subject,
+                    max_bytes=min(selection.limits.max_file_bytes, remaining),
+                    expected_identity=(expected_identities.get(path)
+                                       if expected_identities is not None else None),
+                )
+                if not result.ok:
+                    raise PermissionError("project_capture_read_denied")
+                entries.append(AuthorizedEntry(path, kind, result.data, result.digest,
+                                               result.identity))
+                total += len(result.data)
+            await self._check_project_selection(record)
+            view = AuthorizedContentView(workspace.id, tuple(entries), selection.limits,
+                                         revision=workspace.revision)
+            # Never use a manifest or cache captured under a broader scope.
+            analysis = await self._workspaces.analyze_view(
+                replace(workspace, manifest=None), task, view,
+            )
+            result = (content_project(analysis, view) if content_project is not None
+                      else analysis if project is None else project(analysis))
+            await self._check_project_selection(record)
+            publication_requests = []
+            for entry in entries:
+                await self._check_project_selection(
+                    record, resource_path=str(workspace.root / entry.relative_path),
+                )
+                subject = await self._project_analysis_request(
+                    record[0].tool, {"path": str(workspace.root / entry.relative_path)}, record[0],
+                    record[0].node_scope.session_id,
+                )
+                publication_requests.append(replace(subject, arguments={
+                    "tool_name": record[0].tool.spec.name, "path": subject.resource.path,
+                }))
+                if consumer_spec is not None:
+                    request, decision = self._project_consumer_request(subject, consumer_spec)
+                    publication_requests.append(request)
+                    await self._record_project_capture_policy(request, decision)
+                    if decision.decision is not AccessDecision.ALLOW:
+                        raise PermissionError("project_consumer_policy_denied")
+                request = replace(subject, action=ActionType.FILE_READ, resource=ResourceRef(
+                    workspace.id, subject.resource.path, kind=entry.kind,
+                ))
+                publication_requests.append(request)
+                decision = self._policy_engine.decide(request)
+                await self._record_project_capture_policy(request, decision)
+                if (request.scope.is_expired()
+                        or not request.scope.permits(request.action.value, request.resource.path)
+                        or decision.decision is not AccessDecision.ALLOW):
+                    raise PermissionError("project_capture_publish_denied")
+            # Last authority refresh follows async audit/event callbacks. No
+            # publish callback may invalidate a checked subject unnoticed here.
+            await self._check_project_selection(record, record_policy=False)
+            # Recheck all selected paths after the last asynchronous callback;
+            # an ALLOW on the anchor must not override another path's DENY.
+            for request in publication_requests:
+                if (request.scope.is_expired()
+                        or not request.scope.permits(request.action.value, request.resource.path)
+                        or self._policy_engine.decide(request).decision
+                        is not AccessDecision.ALLOW):
+                    raise PermissionError("project_capture_publish_denied")
+                if consumer_spec is not None:
+                    _, decision = self._project_consumer_request(request, consumer_spec)
+                    if decision.decision is not AccessDecision.ALLOW:
+                        raise PermissionError("project_consumer_policy_denied")
+            if time.monotonic() > deadline:
+                raise PermissionError("project_capture_expired")
+            view.check()
+            captured_receipts = tuple(
+                {"path": entry.relative_path, "kind": entry.kind.value,
+                 "digest": entry.digest,
+                 "identity": {name: getattr(entry.identity, name) for name in
+                              ("device", "inode", "size", "mtime_ns", "ctime_ns")}}
+                for entry in entries
+            )
+            node_scope = record[0].node_scope
+            receipts = {r["path"]: r for r in node_scope.resource_receipts}
+            for receipt in captured_receipts:
+                if (receipt["path"] in receipts
+                        and receipts[receipt["path"]] != receipt):
+                    raise PermissionError("node_resource_content_changed")
+                receipts[receipt["path"]] = receipt
+            node_scope.resource_receipts = tuple(receipts[key] for key in sorted(receipts))
+            node_scope.captured_paths = tuple(sorted(
+                set(node_scope.captured_paths) | set(receipts),
+            ))
+            return result
+        finally:
+            if view is not None:
+                view.invalidate()
+
+    async def _read_node_selection(self, paths):
+        """Known-path READ using the same checked B2 content, never the old reader."""
+        from Sprout.tools.context_keys import _current_project_node, _project_analysis_call
+
+        scope = _current_project_node()
+        tool = await self._issue_project_analysis_tool(paths=paths)
+        with _project_analysis_call(tool):
+            selected = await self._issue_project_analysis_selection(paths)
+            result = await self._capture_project_selection(
+                selected, content_project=lambda analysis, view: [
+                    {"path": entry.relative_path, "decision": "allow",
+                     "content": entry.text(), "error": None} for entry in view.entries],
+            )
+        scope.captured_paths = paths
+        scope.read_captured = True
+        return result
+
+    def _known_read_only_plan(self, workspace, task, *, scheduling=False):
+        """Prepare existing explicit targets without host scanning or cache reuse.
+
+        The empty manifest is only graph preparation for READ_ONLY, never an
+        analysis result or a substitute for CODE verification discovery.
+        """
+        from Sprout.task.paths import bound_scope_path, scope_path
+        from Sprout.workspace.authorized_content import ContentLimits, relative_label
+        from Sprout.workspace.models import ResourceRef
+
+        raw = task.metadata.get("required_paths")
+        if raw is None:
+            # A finite, server-issued scope is also an explicit resource selection.
+            # Directories are not scanned here; the capture broker still decides
+            # whether each selected resource can actually be opened.
+            raw = task.delegation_scope.allowed_paths
+        if not raw and scheduling:
+            # Graph preparation performs no read. The worker independently builds
+            # its authoritative read plan when it executes the persistent node.
+            manifest = WorkspaceManifest(workspace.id, revision=workspace.revision)
+            return replace(workspace, manifest=manifest), ReadPlan(
+                task_id=task.id, purpose=task.instruction,
+            )
+        if (type(raw) not in {tuple, list} or not raw
+                or len(raw) > ContentLimits().max_files):
+            raise PermissionError("project_auto_discovery_unavailable")
+        root = scope_path(str(workspace.root))
+        labels = []
+        for value in raw:
+            target = scope_path(bound_scope_path(value, str(workspace.root)))
+            if target is None or not root.contains(target):
+                raise PermissionError("project_capture_selection_invalid")
+            label = target.text()[len(root.text().rstrip("/")) + 1:]
+            relative_label(label)
+            labels.append(label)
+        manifest = WorkspaceManifest(workspace.id, revision=workspace.revision)
+        return replace(workspace, manifest=manifest), ReadPlan(
+            task_id=task.id, purpose=task.instruction,
+            resources=tuple(ResourceRef(workspace.id, path) for path in labels),
+        )
+
+    async def _ordinary_conversation_context(self, message, session, tools, skills):
+        """Restore newly recorded original input, not unlabelled derived memory.
+
+        Old assistant/facts/recall/knowledge rows cannot be certified from a role,
+        scope string or model metadata. Their admission needs the pending Origin
+        contract, so this deliberately reports partial conversation coverage.
+        """
+        from Sprout.memory.models import ContextMemory
+
+        stored = await self._session_store.get_session(session.id)
+        if stored is None:
+            return None
+        try:
+            principal = self._sessions.frozen_principal(stored)
+        except PermissionError:
+            # Optional history is unavailable, not authority to retrieve old
+            # content. ContextBuilder retains its existing isolated chat path.
+            return None
+        if (principal.authenticated is not True or principal.user_id != message.user_id
+                or message.session_id not in {None, stored.id}):
+            return None
+        stored = await self._sessions.require_owner(stored.id, principal)
+        turns = await self._session_store.recent_turns(
+            stored.id, limit=self._contexts._settings.working_window,
+        )
+        working = tuple(turn for turn in turns if (
+            (turn.role == "user" and self._original_user_turns.get((stored.id, turn.id))
+             == (turn.content, dict(turn.metadata)))
+            or (turn.role == "assistant"
+                and self._ordinary_assistant_turns.get((stored.id, turn.id))
+                == (turn.content, dict(turn.metadata)))))
+        base = self._contexts._isolated_context(message, stored, tools, skills)
+        return replace(base, memory=ContextMemory(session=base.session, working=working))
+
+    def _ordinary_response_has_source(self, context, agent, result):
+        """Only the normal online call may attest a resource-free response.
+
+        No persisted role, model flag or caller-supplied result grants origin.
+        Tool-using/project responses still require the existing project chain.
+        Receipts remain local; this does not upgrade legacy stored memories.
+        """
+        from Sprout.agent.base import ModelAgent
+        from Sprout.agent.loop import AgentLoop
+        from Sprout.memory.models import ContextMemory
+
+        if (context is None or context.workspace is not None or context.files
+                or context.knowledge or type(context.memory) is not ContextMemory
+                or context.memory.summary or context.memory.facts
+                or context.memory.recalled or context.memory.knowledge
+                or context.metadata.get("resume_tool_calls")):
+            return False
+        for turn in context.memory.working:
+            records = (self._original_user_turns if turn.role == "user"
+                       else self._ordinary_assistant_turns if turn.role == "assistant" else {})
+            if records.get((context.session.id, turn.id)) != (turn.content, dict(turn.metadata)):
+                return False
+        return (type(agent) is ModelAgent or (
+            type(agent) is AgentLoop and type(result.metadata.get("tool_calls")) is int
+            and result.metadata["tool_calls"] == 0
+            and not any(result.metadata.get(key) for key in (
+                "approval_required", "workspace_requested", "truncated", "degraded"))))
+
+    def _remember_node_product(self, scope, output):
+        from copy import deepcopy
+
+        from Sprout.tools.context_keys import _current_project_node
+
+        host = getattr(self, "_verification_hosts", {}).get(scope.task.id)
+        if (host is not None and scope.node.type is NodeType.AGENT
+                and _current_project_node() is scope and scope.runtime is self
+                and self._node_publications.get(scope.node.id) is scope and scope.active
+                and isinstance(output, dict) and not output.get("waiting")
+                and not output.get("pending_approvals") and not output.get("pending_tool_calls")):
+            from Sprout.execution.node_result_source import payload_digest
+            from Sprout.execution.verification_manifest import (
+                _AgentCompletionCandidate,
+                scope_digest,
+            )
+
+            host.setdefault("agent_candidates", {})[scope.node.id] = _AgentCompletionCandidate(
+                self, scope, scope.guard_owner, self._node_subject_digest(scope),
+                scope_digest(scope.task.delegation_scope), payload_digest(output))
+        if scope.untracked_tool_use:
+            return  # Tool effects have no transitive resource receipt yet.
+        allowed = scope.node.type in {NodeType.PLAN, NodeType.SUBTASK, NodeType.AGENT}
+        if scope.node.type is NodeType.TEST_DESIGN:
+            binding = scope.task.metadata.get("host_acceptance_v1", {})
+            allowed = (not output.get("waiting") and binding.get("sha256")
+                       and output.get("binding_sha256") == binding["sha256"])
+        if not (scope.read_captured or scope.node.type is NodeType.SANDBOX
+                or (allowed and self._node_publications.get(scope.node.id) is scope)):
+            return
+        payload = deepcopy((
+            scope.task, replace(scope.workspace, manifest=None), scope.node,
+            output, scope.captured_paths,
+        ))
+        self._node_products[(scope.task.id, scope.node.id)] = (*payload, self)
+        from Sprout.execution.node_result_source import NodeResultSourceV1, payload_digest
+
+        parents = []
+        parent_ids = set(scope.node.dependencies) | set(scope.parent_receipts)
+        for dependency in sorted(parent_ids):
+            parent = self._node_products.get((scope.task.id, dependency))
+            if parent is None or len(parent) != 7:
+                return  # Missing transitive inputs cannot acquire a new origin.
+            parents.append({"node_id": dependency,
+                            "output_digest": payload_digest(parent[3])})
+        if scope.captured_paths and not scope.resource_receipts:
+            return
+        source = NodeResultSourceV1(
+            scope.task.id, scope.node.id, scope.node.type.value, scope.guard_owner,
+            self._node_subject_digest(scope), payload_digest(output),
+            json.dumps(scope.resource_receipts, sort_keys=True),
+            json.dumps(parents, sort_keys=True),
+        )
+        self._node_products[(scope.task.id, scope.node.id)] = (*payload, self, source)
+
+    @staticmethod
+    def _node_subject_digest(scope):
+        from dataclasses import asdict
+
+        from Sprout.execution.node_result_source import payload_digest
+
+        return payload_digest({
+            "task": scope.task.id, "instruction": scope.task.instruction,
+            "actor": asdict(scope.task.actor), "source": scope.task.source,
+            "session": scope.session_id, "workspace": scope.workspace.id,
+            "root": str(scope.workspace.root), "revision": scope.workspace.revision,
+            "workspace_kind": scope.workspace.kind.value,
+        })
+
+    async def _persist_node_products(self):
+        """After ordinary settlement only. Missing side record never triggers replay."""
+        metadata = self._metadata_or_raise()
+        save = getattr(metadata, "save_node_result_source", None)
+        if save is None:
+            return
+        for record in tuple(self._node_products.values()):
+            if len(record) == 7 and record[5] is self:
+                await save(record[6])  # Store CAS requires the exact completed owner/output.
+        from Sprout.execution.local_receipt import settle
+
+        await settle(self)
+
+    async def _load_node_product(self, scope, node):
+        from Sprout.execution.node_result_source import payload_digest
+
+        metadata = self._metadata_or_raise()
+        load = getattr(metadata, "get_node_result_source", None)
+        source = await load(node.id) if load else None
+        guard = node.metadata.get("execution_guard", {})
+        if (source is None or source.task_id != scope.task.id
+                or source.node_id != node.id or source.node_type != node.type.value
+                or source.owner != guard.get("owner") or guard.get("state") != "completed"
+                or source.subject_digest != self._node_subject_digest(scope)
+                or source.output_digest != payload_digest(node.metadata.get("output"))):
+            raise PermissionError("node_artifact_provenance_unavailable")
+        resources = json.loads(source.resources_json)
+        parents = json.loads(source.parents_json)
+        if not set(node.dependencies).issubset({p["node_id"] for p in parents}):
+            raise PermissionError("node_artifact_provenance_unavailable")
+        for parent in parents:
+            stored = await metadata.get_execution_node(parent["node_id"])
+            if (stored is None or stored.task_id != scope.task.id
+                    or stored.status is not NodeStatus.COMPLETED
+                    or payload_digest(stored.metadata.get("output")) != parent["output_digest"]):
+                raise PermissionError("node_artifact_provenance_unavailable")
+        # The side record is data. Fresh capture/policy checks below grant visibility.
+        record = (scope.task, replace(scope.workspace, manifest=None), node,
+                  node.metadata.get("output"), tuple(r["path"] for r in resources), self, source)
+        self._node_products[(scope.task.id, node.id)] = record
+        return record
+
+    async def _admit_node_products(self, scope, nodes):
+        """Live receipts or V1 side records, never a bare persisted payload.
+
+        Persisted reuse stays same-Task/Principal/Session/Workspace and performs
+        fresh per-file authorization and content/identity verification. It does
+        not admit cross-Task conversation references or widen a current Scope.
+        """
+        from Sprout.tools.context_keys import _project_analysis_call
+
+        await self._persist_node_products()
+        paths, found, admitted_ids = set(), False, set()
+        for node in nodes:
+            if node.result_ref is not None:
+                raise PermissionError("node_artifact_provenance_unavailable")
+            output = node.metadata.get("output")
+            if output is None:
+                continue
+            record = self._node_products.get((scope.task.id, node.id))
+            if record is None:
+                record = await self._load_node_product(scope, node)
+            if (record is None or record[5] is not self or node.status is not NodeStatus.COMPLETED
+                    or record[0] != scope.task
+                    or record[1] != replace(scope.workspace, manifest=None)
+                    or record[2].type != node.type or record[3] != output
+                    or record[2].metadata.get("execution_guard", {}).get("owner")
+                    != node.metadata.get("execution_guard", {}).get("owner")):
+                raise PermissionError("node_artifact_provenance_unavailable")
+            found = True
+            admitted_ids.add(node.id)
+            paths.update(record[4])
+        if any(dependency not in admitted_ids for dependency in scope.node.dependencies):
+            raise PermissionError("node_artifact_provenance_unavailable")
+        # Re-capture to authorize and verify READ content before every publication.
+        if paths:
+            ordered = tuple(sorted(paths))
+            tool = await self._issue_project_analysis_tool(paths=ordered)
+            with _project_analysis_call(tool):
+                selection = await self._issue_project_analysis_selection(ordered)
+                fresh = await self._capture_project_selection(
+                    selection, content_project=lambda analysis, view: {
+                        entry.relative_path: entry.text() for entry in view.entries},
+                )
+            captured = {r["path"]: r for r in scope.resource_receipts}
+            for node in nodes:
+                record = self._node_products.get((scope.task.id, node.id))
+                if record is not None and len(record) == 7:
+                    if any(captured.get(r["path"]) != r
+                           for r in json.loads(record[6].resources_json)):
+                        raise PermissionError("node_resource_content_changed")
+            for node in nodes:
+                if node.type is NodeType.READ and node.metadata.get("output"):
+                    if any(fresh.get(item["path"]) != item["content"]
+                           for item in node.metadata["output"]):
+                        raise PermissionError("node_resource_content_changed")
+        scope.captured_paths = tuple(sorted(paths))
+        receipts = {}
+        for node in nodes:
+            record = self._node_products.get((scope.task.id, node.id))
+            if record is not None and len(record) == 7:
+                for receipt in json.loads(record[6].resources_json):
+                    prior = receipts.setdefault(receipt["path"], receipt)
+                    if prior != receipt:
+                        raise PermissionError("node_resource_content_changed")
+        scope.resource_receipts = tuple(receipts[key] for key in sorted(receipts))
+        scope.parent_receipts = tuple(sorted(admitted_ids))
+        return found
+
+    def _node_context_resources(self, scope, files, resources):
+        """A live frame is not a licence to inject arbitrary resource dictionaries."""
+        if not resources:
+            return not files
+        known = [item for record in self._node_products.values()
+                 if record[0] == scope.task
+                 and record[1] == replace(scope.workspace, manifest=None)
+                 and record[5] is self
+                 and record[2].type is NodeType.READ for item in record[3]]
+        return (tuple(item.get("path") for item in resources) == tuple(files)
+                and all(item in known for item in resources))
 
     # -- assembly ---------------------------------------------------------
     def register_agent(
@@ -644,6 +2755,8 @@ class Runtime:
 
     # -- lifecycle ---------------------------------------------------------
     async def start(self) -> None:
+        if getattr(self, "_verification_shutdown", {}).get("state") == "UNKNOWN":
+            raise RuntimeError("verification_shutdown_requires_manual_intervention")
         if self._started:
             return
         if self._settings is not None:
@@ -651,6 +2764,7 @@ class Runtime:
 
             await ensure_storage_ready(self._settings)
         self._started = True
+        self._verification_stopping = False
         await self.events.publish(Event(RUNTIME_STARTED, {"version": _package_version()}))
         await self._sandbox_lifecycle.reconcile_orphans()
         await self._sweep_stale_approvals()
@@ -683,6 +2797,74 @@ class Runtime:
             self._record_security("approval.swept_at_startup", {"count": swept})
 
     async def stop(self) -> None:
+        from Sprout.execution.apply_plan import release as release_apply
+        from Sprout.execution.local_receipt import release
+
+        release_apply(self)
+        release(self)
+        # Preserve stop-only custody until native owners finish their bounded
+        # cancellation handlers. New business preparations are already denied.
+        self._verification_stopping = True
+        owners = {p["owner"] for p in getattr(self, "_verification_preparations", {}).values()
+                  if p["owner"] is not asyncio.current_task()}
+        for owner in owners:
+            owner.cancel()
+        git_owners = {s["git_active"]["owner"] for s in self._local_git_reviews.values()
+                      if s.get("git_active")
+                      and s["git_active"]["owner"] is not asyncio.current_task()}
+        for owner in git_owners:
+            owner.cancel()
+        operations = set(owners) | git_owners
+        for state in self._local_git_reviews.values():
+            for custody in state.get("git_active", {}).get("processes", {}).values():
+                operations.update(t for t in (custody.get("spawn"), custody.get("cleanup"))
+                                  if t is not None and not t.done())
+        for preparation in getattr(self, "_verification_preparations", {}).values():
+            native = preparation.get("native", {})
+            operations.update(t for t in native.get("pending_operations", ()) if not t.done())
+            helper = native.get("cleanup_task")
+            if helper is not None and not helper.done():
+                operations.add(helper)
+        pending = set()
+        if operations:
+            _, pending = await asyncio.wait(operations, timeout=30)
+        retained = [p for p in getattr(self, "_verification_preparations", {}).values()
+                    if p["owner"] in pending or self._verification_custody_busy(p)]
+        git_retained = [s for s in self._local_git_reviews.values()
+                        if s.get("git_active", {}).get("processes")
+                        or s.get("git_active", {}).get("owner") in pending]
+        if git_retained:
+            self._verification_shutdown = {"state": "UNKNOWN", "storage_retained": True,
+                "reason": "local_git_cleanup_unresolved", "manual_intervention_required": True}
+            return
+        if retained:
+            # Bounded stop cannot truthfully claim completion while uncancellable
+            # I/O remains. Keep both private custody and storage; never reconstruct
+            # permission from this diagnostic snapshot or silently restart.
+            self._verification_shutdown = {"state": "UNKNOWN",
+                "manual_intervention_required": True, "storage_retained": True,
+                "reason": "verification_cleanup_unresolved", "executions": [
+                    {"execution_id": p.get("native", {}).get("execution_id"),
+                     "container_id": p.get("native", {}).get("container_id"),
+                     "container_name": p.get("native", {}).get("container_name"),
+                     "task_id": getattr(p.get("task"), "id", None),
+                     "node_id": getattr(getattr(p.get("scope"), "node", None), "id", None),
+                     "owner": getattr(p.get("scope"), "guard_owner", None),
+                     "manifest": p.get("manifest_sha"),
+                     "docker": p.get("native", {}).get("host", {}).get("docker"),
+                     "image": p.get("native", {}).get("image"),
+                     "pending_operations": sum(not t.done() for t in
+                         p.get("native", {}).get("pending_operations", ()))} for p in retained]}
+            logger.error("Runtime shutdown incomplete: verification cleanup unresolved; "
+                         "private custody and storage retained, manual intervention required")
+            return
+        self._verification_shutdown = {"state": "completed", "storage_retained": False}
+        self._local_git_reviews.clear()
+        getattr(self, "_verification_hosts", {}).clear()
+        for frame in getattr(self, "_verification_frames", {}):
+            frame.active = False
+        getattr(self, "_verification_frames", {}).clear()
+        getattr(self, "_verification_preparations", {}).clear()
         # Workers can be started independently of start(). Join them even when
         # there is no started Runtime/storage lifecycle to close.
         try:
@@ -729,10 +2911,175 @@ class Runtime:
         await worker.stop()
 
     # -- online path ---------------------------------------------------------
+    async def _dispatch_project_analysis(
+        self, message, session, *, principal, analysis_task, classification,
+        analysis_task_provider=None,
+    ):
+        """Admit an explicit host reference; routing hints confer no authority.
+
+        This local-only lane does not select Tasks by Session, create a Scope,
+        or reinterpret old/running graphs. The existing guard owns execution.
+        """
+        if _project_analyze_tool_call(message, str(classification.get("intent", ""))) is None:
+            return None
+        from Sprout.orchestration.service import SequentialOrchestrator
+        from Sprout.security.access import AccessDecision, ActionRequest, ActionType
+        from Sprout.task.paths import bound_scope_path, scope_path
+        from Sprout.workspace.classifier import classify
+        from Sprout.workspace.models import ResourceRef
+
+        node = None
+        reason = "authorized_analysis_task_required"
+        content = reason
+        try:
+            if analysis_task is None and analysis_task_provider is not None:
+                # Python host capability only. Neither classification nor model
+                # metadata supplies this callable or an authenticated identity.
+                if principal is None or principal.authenticated is not True:
+                    raise PermissionError("analysis_task_subject_unavailable")
+                owned = await self._sessions.require_owner(session.id, principal)
+                frozen = self._sessions.frozen_principal(owned)
+                if (frozen.user_id, frozen.source, frozen.authenticated) != (
+                        principal.user_id, principal.source, principal.authenticated):
+                    raise PermissionError("analysis_task_subject_unavailable")
+                from copy import deepcopy
+
+                analysis_task = await analysis_task_provider(
+                    message=replace(message, metadata={}), session=deepcopy(owned),
+                    principal=principal,
+                )
+                if analysis_task is None:
+                    raise PermissionError("project_analysis_cancelled")
+            if not isinstance(analysis_task, Task) or principal is None:
+                raise PermissionError(reason)
+            store = self.storage.metadata
+            if store is None:
+                raise PermissionError("analysis_metadata_unavailable")
+            task = await store.get_task(analysis_task.id)
+            owned = await self._sessions.require_owner(session.id, principal)
+            frozen = self._sessions.frozen_principal(owned)
+            if (principal.authenticated is not True
+                    or (frozen.user_id, frozen.source, frozen.authenticated)
+                    != (principal.user_id, principal.source, principal.authenticated)
+                    or task is None
+                    or task.actor != principal or task.source != principal.source
+                    or task.metadata.get("session_id") != session.id
+                    or task.execution_mode is not TaskExecutionMode.READ_ONLY
+                    or task.status not in {TaskStatus.CREATED, TaskStatus.READY}
+                    or await store.list_execution_nodes(task.id)):
+                raise PermissionError("analysis_task_subject_unavailable")
+            workspace = await store.get_workspace(task.workspace_id)
+            if workspace is None:
+                raise PermissionError("analysis_workspace_unavailable")
+            root = scope_path(str(workspace.root))
+            scope = task.delegation_scope.bind_paths(str(workspace.root))
+            if (root is None or scope.is_expired() or not scope.allowed_paths
+                    or any(scope_path(p) is None or not root.contains(scope_path(p))
+                           for p in scope.allowed_paths)):
+                raise PermissionError("analysis_task_scope_unavailable")
+            requested_workspace = message.metadata.get("workspace_id")
+            if requested_workspace and requested_workspace != workspace.id:
+                raise PermissionError("analysis_workspace_mismatch")
+            raw_paths = task.metadata.get("required_paths")
+            if raw_paths is not None and type(raw_paths) not in {tuple, list}:
+                raise PermissionError("project_capture_selection_invalid")
+            if raw_paths:
+                _, plan = self._known_read_only_plan(workspace, task)
+                paths = tuple(resource.path for resource in plan.resources)
+                # Negative preflight prevents denied host-selected names entering
+                # model tool-call messages. It grants no access: B1/Broker still
+                # revalidate the live subject and every actual open afterwards.
+                for path in paths:
+                    absolute = (workspace.root / path).as_posix()
+                    request = ActionRequest(
+                        task_id=task.id, actor=task.actor, action=ActionType.FILE_READ,
+                        resource=ResourceRef(workspace.id, absolute, kind=classify(
+                            path, overrides=self._file_broker._classify_overrides)), scope=scope,
+                    )
+                    decision = self._policy_engine.decide(request)
+                    await self._record_project_capture_policy(request, decision)
+                    if (decision.decision is not AccessDecision.ALLOW
+                            or not scope.permits(ActionType.FILE_READ.value, absolute)):
+                        raise PermissionError("analysis_task_resource_unavailable")
+                # A real entry file reaches ToolExecutor. A registered manifest
+                # still requires separate per-file authorization below it.
+                target = str(workspace.root / paths[0])
+            else:
+                plan = ReadPlan(task_id=task.id, purpose=task.instruction)
+                paths = ()
+                target = str(workspace.root)
+                directory = task.metadata.get("analysis_directory")
+                if directory is not None:
+                    from Sprout.workspace.authorized_content import relative_label
+
+                    if directory != ".":
+                        directory = relative_label(directory)
+                        target = str(workspace.root / directory)
+            # Explicit path hints may constrain, never enlarge, the host selection.
+            for key in ("workspace_path", "project_path", "path", "root"):
+                hint = message.metadata.get(key)
+                if hint:
+                    requested = scope_path(bound_scope_path(hint, str(workspace.root)))
+                    if requested is None or not root.contains(requested):
+                        raise PermissionError("analysis_workspace_mismatch")
+                    if paths and any(not requested.contains(scope_path(
+                            str(workspace.root / p))) for p in paths):
+                        raise PermissionError("analysis_workspace_mismatch")
+                    if len(paths) <= 1:
+                        target = requested.text()
+                    break
+            node = ExecutionNode(task_id=task.id, type=NodeType.AGENT)
+            admission = {"task": task, "workspace": workspace, "paths": paths,
+                         "target": target, "message": message, "analysis_result": None}
+            self._online_analysis_requests[node.id] = admission
+            graph = ExecutionGraph(task_id=task.id, nodes=(node,), entry_node_ids=(node.id,))
+            result = await SequentialOrchestrator(store).execute(
+                graph, handler=self._executor(store).handler(task, workspace, plan),
+            )
+            current = await store.get_task(task.id)
+            current_workspace = await store.get_workspace(workspace.id)
+            current_session = await self._sessions.require_owner(session.id, principal)
+            if (result.status is not TaskStatus.COMPLETED or current is None
+                    or current.status is not TaskStatus.COMPLETED
+                    or current.execution_mode is not TaskExecutionMode.READ_ONLY
+                    or current.actor != task.actor or current.source != task.source
+                    or current.workspace_id != task.workspace_id
+                    or current.metadata.get("session_id") != session.id
+                    or current.delegation_scope != task.delegation_scope
+                    or current.delegation_scope.is_expired() or current_workspace != workspace
+                    or self._sessions.frozen_principal(current_session) != frozen):
+                raise PermissionError("analysis_publication_unavailable")
+            saved = await store.get_execution_node(node.id)
+            output = saved.metadata.get("output", {}) if saved else {}
+            if admission["analysis_result"] is None or not output.get("analysis_ok"):
+                raise PermissionError(admission.get(
+                    "unavailable_reason", "project_analysis_unavailable"))
+            await self._persist_node_products()
+            content = output["content"]
+            coverage = admission["analysis_result"].data.get("coverage", {})
+            if coverage.get("mode") == "discovery":
+                content += ("\n\n覆盖范围 / coverage: authorized project files; "
+                            f"{coverage.get('file_count', 0)} files; "
+                            "partial project coverage (policy/scope and supported resource types).")
+            reason = ""
+        except PermissionError as exc:
+            content = reason = str(exc)
+        finally:
+            if node is not None:
+                self._online_analysis_requests.pop(node.id, None)
+        outbound = OutboundMessage(content=content, channel=message.channel,
+                                   session_id=session.id, correlation_id=message.id,
+                                   metadata={"analysis_status": "unavailable" if reason else "ok",
+                                             "reason": reason})
+        await self._persist_turns(session, message, AgentResult(content=content))
+        return outbound
+
     async def handle(
         self, message: Message, *, principal: Principal | None = None,
         foreground: bool = False,
         _resume_calls: list | None = None,
+        analysis_task: Task | None = None,
+        analysis_task_provider: Callable[..., Awaitable[Task | None]] | None = None,
     ) -> OutboundMessage:
         """Run one online turn. Middleware -> session -> router -> context -> agent."""
         if self._router is None:
@@ -764,6 +3111,14 @@ class Runtime:
             tools=self.tools.list(),
             skills=self.skills.list(),
         )
+        if _resume_calls is not None:
+            # Host-only replay, recovered after Session ownership validation.
+            # Never recover this payload from model/message metadata here.
+            from copy import deepcopy
+
+            context = replace(context, metadata={
+                **context.metadata, "resume_tool_calls": deepcopy(_resume_calls),
+            })
         if not classification:
             classification = await self._classify_intent_with_llm(message, context)
         clarification = await route_semantic_clarification(
@@ -774,6 +3129,14 @@ class Runtime:
         message, context = await self._recognize_intent(
             message, context, classification=classification,
         )
+
+        analysis = await self._dispatch_project_analysis(
+            message, session, principal=principal, analysis_task=analysis_task,
+            classification=classification,
+            analysis_task_provider=analysis_task_provider,
+        )
+        if analysis is not None:
+            return await self.middleware.after(message, analysis)
 
         # A recognised task intent is queued for background execution and acked
         # immediately; it never runs inline. A task intent *without* a workspace
@@ -826,7 +3189,8 @@ class Runtime:
             )
             return await self.middleware.after(held, outbound)
 
-        await self._persist_turns(session, message, result)
+        await self._persist_turns(session, message, result,
+                                 ordinary_context=context, ordinary_agent=agent)
         await self.events.publish(Event(AGENT_COMPLETED, {"session_id": session.id}, message.id))
         await self.events.publish(Event(MESSAGE_SENT, {"session_id": session.id}, message.id))
         outbound = OutboundMessage(
@@ -894,7 +3258,7 @@ class Runtime:
         task = await self.create_task(
             workspace_id,
             message.content,
-            actor=Principal(user_id=principal.user_id if principal else "anonymous", source=source),
+            actor=principal or Principal(user_id="anonymous", source=source),
             source=source,
             # Recorded so a later turn can report this task back to the session
             # that asked for it. Without it a parked task belongs to no
@@ -1354,6 +3718,12 @@ class Runtime:
         )
 
     async def _recognize_intent(self, message: Message, context, *, classification=None):
+        from Sprout.intents import capability_question
+
+        if capability_question(message.content or ""):
+            classification = {"intent": "conversation", "confidence": 1.0,
+                              "reason": "resource_free_capability_question"}
+            context = replace(context, tools={})
         if classification is None:
             classification = await self._classify_intent_with_llm(message, context)
         intent = str(classification.get("intent") or "conversation")
@@ -1413,6 +3783,11 @@ class Runtime:
     async def _classify_intent_with_llm(
         self, message: Message, context, *, pending_question: str | None = None,
     ) -> dict[str, Any]:
+        from Sprout.intents import capability_question
+
+        if pending_question is None and capability_question(message.content or ""):
+            return {"intent": "conversation", "confidence": 1.0,
+                    "reason": "resource_free_capability_question"}
         # Cheap task hint before spending an LLM call: an explicit coding task
         # ("修复…", "/task …") is already decidable from the text alone.
         if pending_question is None and detect_task_hint(message.content or ""):
@@ -1577,7 +3952,9 @@ class Runtime:
         )
 
     async def handle_stream(
-        self, message: Message, *, principal: Principal | None = None, foreground: bool = False
+        self, message: Message, *, principal: Principal | None = None, foreground: bool = False,
+        analysis_task: Task | None = None,
+        analysis_task_provider: Callable[..., Awaitable[Task | None]] | None = None,
     ):
         """Run one online turn and stream the agent's text chunks."""
         if self._router is None:
@@ -1622,6 +3999,17 @@ class Runtime:
             message, context, classification=classification,
         )
 
+        analysis = await self._dispatch_project_analysis(
+            message, session, principal=principal, analysis_task=analysis_task,
+            classification=classification,
+            analysis_task_provider=analysis_task_provider,
+        )
+        if analysis is not None:
+            analysis = await self.middleware.after(message, analysis)
+            yield StreamChunk(content=analysis.content)
+            yield StreamChunk(outbound=analysis)
+            return
+
         # Same dispatch as ``handle``. This path had no task branch at all, so
         # the CLI REPL never reached the coding graph even when a workspace was
         # present — the ask-for-workspace fix would have been unreachable from
@@ -1658,7 +4046,12 @@ class Runtime:
                 chunks.append(result.content)
                 result_metadata = dict(result.metadata)
             else:
-                async for chunk in stream(message, context):
+                from Sprout.agent.loop import AgentLoop
+
+                # Opt in only for the known stream contract; legacy text-only
+                # consumers and other agents retain their existing signature.
+                options = {"include_result": True} if type(agent) is AgentLoop else {}
+                async for chunk in stream(message, context, **options):
                     if isinstance(chunk, AgentResult):
                         if chunk.content:
                             chunks.append(chunk.content)
@@ -1713,7 +4106,8 @@ class Runtime:
             metadata=dict(result.metadata),
         )
         yield StreamChunk(outbound=outbound)
-        self._schedule_background_task(self._finish_stream_turn(session, message, result, outbound))
+        self._schedule_background_task(self._finish_stream_turn(
+            session, message, result, outbound, ordinary_context=context, ordinary_agent=agent))
 
     def schedule_background(self, coroutine) -> None:
         """Run a coroutine off the turn path, drained by ``stop()``.
@@ -1735,10 +4129,13 @@ class Runtime:
         message: Message,
         result: AgentResult,
         outbound: OutboundMessage,
+        *, ordinary_context=None, ordinary_agent=None,
     ) -> None:
         """Finish a streamed turn after its response has reached the caller."""
         try:
-            await self._persist_turns(session, message, result)
+            await self._persist_turns(session, message, result,
+                                     ordinary_context=ordinary_context,
+                                     ordinary_agent=ordinary_agent)
             await self.events.publish(
                 Event(AGENT_COMPLETED, {"session_id": session.id}, message.id)
             )
@@ -1828,6 +4225,13 @@ class Runtime:
             tools=self.tools.list(),
             skills=self.skills.list(),
         )
+        # ``pending`` came from the owned Session's authoritative turn above,
+        # not from the middleware or the Message's mutable metadata.
+        from copy import deepcopy
+
+        context = replace(context, metadata={
+            **context.metadata, "resume_tool_calls": deepcopy(pending),
+        })
         agent = self._router.route(message)
         await self.events.publish(Event(AGENT_STARTED, {"session_id": session.id}, message.id))
         try:
@@ -1874,7 +4278,10 @@ class Runtime:
         offloaded = {**envelope, "blob_uri": uri, "content_bytes": size}
         return content[:TURN_PREVIEW_CHARS], offloaded
 
-    async def _persist_turns(self, session: Session, message: Message, result: AgentResult) -> Turn:
+    async def _persist_turns(
+        self, session: Session, message: Message, result: AgentResult, *,
+        ordinary_context=None, ordinary_agent=None,
+    ) -> Turn:
         """Append the user and assistant turns with their full envelopes.
 
         This is the only authority write point of the online path (P1): the
@@ -1892,6 +4299,11 @@ class Runtime:
             session.id, "assistant", assistant_body, metadata=assistant_envelope_dict
         )
         await self._session_store.append_turn(user_turn)
+        from copy import deepcopy
+
+        self._original_user_turns[(session.id, user_turn.id)] = deepcopy((
+            user_turn.content, dict(user_turn.metadata),
+        ))
         if message.metadata.get(WORKSPACE_CONSENT_KEY) is True:
             # Only this freshly persisted server-held turn can be issued. Old
             # history is never scanned to create eligibility. A crash between
@@ -1905,6 +4317,10 @@ class Runtime:
                     raise LookupError("Could not issue durable workspace consent")
         await Runtime._persist_attachments(self, user_turn, message)
         await self._session_store.append_turn(assistant_turn)
+        if self._ordinary_response_has_source(ordinary_context, ordinary_agent, result):
+            self._ordinary_assistant_turns[(session.id, assistant_turn.id)] = deepcopy((
+                assistant_turn.content, dict(assistant_turn.metadata),
+            ))
         stored = list(await self._session_store.recent_turns(session.id, limit=2))
         payload: dict = {"session_id": session.id}
         if len(stored) == 2:
@@ -2075,14 +4491,279 @@ class Runtime:
     async def scan_workspace(self, workspace_id: str) -> WorkspaceManifest:
         return await self._workspaces.scan(workspace_id)
 
-    async def analyze_workspace(self, workspace_id: str) -> WorkspaceAnalysis:
-        return await self._workspaces.analyze(workspace_id)
+    async def analyze_workspace(
+        self, workspace_id: str, *, principal: Principal | None = None,
+        analysis_task: Task | None = None,
+    ) -> WorkspaceAnalysis:
+        return await self._analyze_host_task(
+            workspace_id, principal=principal, analysis_task=analysis_task)
+
+    async def _analyze_host_task(
+        self, workspace_id, *, principal, analysis_task, project=None, refine=None,
+    ):
+        """Fresh host analysis through the existing owned-node/Broker/View lane.
+
+        Task is a reference, never a credential. Neither cached snapshots nor
+        model-supplied paths participate in this host admission.
+        """
+        from Sprout.orchestration.service import SequentialOrchestrator
+        from Sprout.security.policy import SecurityPolicy
+        from Sprout.tools.executor import ToolExecutor
+
+        if (not isinstance(principal, Principal) or principal.authenticated is not True
+                or not isinstance(analysis_task, Task)):
+            raise PermissionError("authorized_workspace_analysis_required")
+        store = self._metadata_or_raise()
+        task = await store.get_task(analysis_task.id)
+        workspace = await store.get_workspace(workspace_id)
+        if (task is None or workspace is None or task.workspace_id != workspace_id
+                or task.actor != principal or task.source != principal.source
+                or task.execution_mode is not TaskExecutionMode.READ_ONLY
+                or task.status not in {TaskStatus.CREATED, TaskStatus.READY}
+                or task.delegation_scope.is_expired()
+                or not task.delegation_scope.allowed_paths
+                or await store.list_execution_nodes(task.id)):
+            raise PermissionError("analysis_task_subject_unavailable")
+        session_id = task.metadata.get("session_id", "")
+        if session_id:
+            owned = await self._sessions.require_owner(session_id, principal)
+            if self._sessions.frozen_principal(owned) != principal:
+                raise PermissionError("analysis_task_subject_unavailable")
+        raw = task.metadata.get("required_paths")
+        if raw:
+            _, plan = self._known_read_only_plan(workspace, task)
+            paths = tuple(resource.path for resource in plan.resources)
+            target = str(workspace.root / paths[0])
+        elif raw is not None:
+            raise PermissionError("project_capture_selection_unavailable")
+        else:
+            # Discovery is an explicit host Task choice. DIRECTORY_LIST policy
+            # and the platform Broker, not root existence, decide visibility.
+            from Sprout.workspace.authorized_content import relative_label
+
+            directory = task.metadata.get("analysis_directory")
+            if not isinstance(directory, str):
+                raise PermissionError("project_capture_selection_unavailable")
+            directory = directory if directory == "." else relative_label(directory)
+            paths = ()
+            target = str(workspace.root / directory)
+        node = ExecutionNode(task_id=task.id, type=NodeType.AGENT)
+        admission = {"paths": paths, "analysis_result": None, "analysis_data": None,
+                     "content_project": project, "projected_data": None}
+        self._online_analysis_requests[node.id] = admission
+
+        async def capture(running):
+            with self._project_analysis_scope(task, workspace, running) as live:
+                tool = await self._issue_project_analysis_tool(
+                    paths=paths or None, discover=not paths)
+                executor = ToolExecutor(
+                    self.tools,
+                    policy=self.security.tool_policy if self.security else SecurityPolicy(),
+                    policy_engine=self._policy_engine,
+                    approvals=self._approvals, audit=self.audit, events=self.events,
+                    scoped={tool.spec.name: tool}, scoped_only=True,
+                )
+                result = await executor.execute(
+                    tool.spec.name, {"path": target, "instruction": task.instruction},
+                    task_id=task.id, session_id=session_id, source=task.source,
+                    requested_by=principal.user_id,
+                )
+                if not result.ok or admission["analysis_data"] is None:
+                    raise PermissionError("project_analysis_unavailable")
+                if refine is not None:
+                    from Sprout.security.access import AccessDecision, ActionType
+                    from Sprout.tools.context_keys import _project_analysis_call
+                    from Sprout.workspace.models import ResourceKind, ResourceRef
+
+                    async def recheck():
+                        await self._project_analysis_subject(live)
+                        with _project_analysis_call(tool) as frame:
+                            for receipt in live.resource_receipts:
+                                request = await self._project_analysis_request(
+                                    tool, {"path": str(workspace.root / receipt["path"])},
+                                    frame, session_id)
+                                await self._check_project_selection((frame, request, workspace))
+                                request = replace(request, action=ActionType.FILE_READ,
+                                    resource=ResourceRef(workspace.id, request.resource.path,
+                                                         kind=ResourceKind(receipt["kind"])))
+                                decision = self._policy_engine.decide(request)
+                                await self._record_project_capture_policy(request, decision)
+                                if (decision.decision is not AccessDecision.ALLOW
+                                        or not request.scope.permits(
+                                            ActionType.FILE_READ.value, request.resource.path)):
+                                    raise PermissionError("preparation_publication_denied")
+
+                    await recheck()
+                    admission["projected_data"] = await refine(admission["projected_data"])
+                    await recheck()
+                return {"analysis_ok": True}
+
+        try:
+            graph = ExecutionGraph(task_id=task.id, nodes=(node,), entry_node_ids=(node.id,))
+            result = await SequentialOrchestrator(store).execute(graph, handler=capture)
+            current = await store.get_task(task.id)
+            if (result.status is not TaskStatus.COMPLETED or current is None
+                    or current.status is not TaskStatus.COMPLETED
+                    or current.execution_mode is not TaskExecutionMode.READ_ONLY
+                    or current.actor != principal or current.source != task.source
+                    or current.workspace_id != workspace_id
+                    or current.metadata.get("session_id", "") != session_id
+                    or current.delegation_scope != task.delegation_scope
+                    or current.delegation_scope.is_expired()
+                    or await store.get_workspace(workspace_id) != workspace
+                    or admission["analysis_data"] is None):
+                raise PermissionError("analysis_publication_unavailable")
+            if session_id:
+                await self._sessions.require_owner(session_id, principal)
+            return admission["analysis_data"] if project is None else admission["projected_data"]
+        finally:
+            self._online_analysis_requests.pop(node.id, None)
+
+    async def _check_preparation_parent(self, expected, workspace, owner_node=None):
+        current = await self._metadata_or_raise().get_task(expected.id)
+        if (current is None or current.actor != expected.actor or current.source != expected.source
+                or current.workspace_id != workspace.id
+                or current.delegation_scope != expected.delegation_scope
+                or current.delegation_scope.is_expired()
+                or current.metadata.get("session_id") != expected.metadata.get("session_id")
+                or current.status in {TaskStatus.CANCELLED, TaskStatus.ROLLED_BACK,
+                                      TaskStatus.COMPLETED, TaskStatus.FAILED}):
+            raise PermissionError("preparation_authority_changed")
+        if owner_node is not None:
+            node = await self._metadata_or_raise().get_execution_node(owner_node.id)
+            guard = node.metadata.get("execution_guard", {}) if node else {}
+            if (node is None or node.task_id != expected.id or node.type != owner_node.type
+                    or node.status is not NodeStatus.RUNNING or guard.get("state") != "active"
+                    or not guard.get("owner")
+                    or guard.get("owner") != owner_node.metadata.get(
+                        "execution_guard", {}).get("owner")):
+                raise PermissionError("preparation_owner_changed")
+        return current
+
+    async def _capture_preparation(
+        self, workspace, *, actor, source, scope, instruction, metadata, parent=None,
+        project=None, refine=None, owner_node=None,
+    ):
+        """A new real read owner, finite authority, and no transferable grant.
+
+        Existing plan_kind is a negative marker only. Missing live registration
+        (including another worker/Runtime) refuses; neither it nor a callback
+        grants access. Scope is revoked on exit; UNKNOWN owners are never reset.
+        """
+        from datetime import UTC, datetime, timedelta
+
+        if (not isinstance(actor, Principal) or actor.authenticated is not True
+                or not actor.user_id or not actor.source or source != actor.source
+                or not isinstance(scope, DelegationScope) or not scope.allowed_paths
+                or scope.is_expired()):
+            raise PermissionError("preparation_subject_unavailable")
+        if parent is not None:
+            await self._check_preparation_parent(parent, workspace, owner_node)
+        deadline = datetime.now(UTC) + timedelta(seconds=self._agent_timeout_seconds())
+        child_scope = replace(scope, expires_at=min(scope.expires_at, deadline)
+                              if scope.expires_at else deadline)
+        child = await self.create_task(
+            workspace.id, instruction, actor=actor, source=source,
+            execution_mode=TaskExecutionMode.READ_ONLY, delegation_scope=child_scope,
+            metadata={**metadata, "plan_kind": "r04_preparation_v1"},
+        )
+        self._preparation_tasks[child.id] = (child, parent, owner_node)
+        try:
+            result = await self._analyze_host_task(
+                workspace.id, principal=actor, analysis_task=child, project=project, refine=refine)
+            if parent is not None:
+                await self._check_preparation_parent(parent, workspace, owner_node)
+            return result
+        finally:
+            try:
+                current = await self._metadata_or_raise().get_task(child.id)
+                if current is not None:
+                    now = datetime.now(UTC)
+                    expiry = current.delegation_scope.expires_at
+                    await self._metadata_or_raise().save_task(replace(
+                        current, delegation_scope=replace(current.delegation_scope,
+                            expires_at=min(expiry, now) if expiry else now)))
+            finally:
+                self._preparation_tasks.pop(child.id, None)
+
+    async def _prepare_code_resources(self, task, workspace, *, owned_node=None):
+        store = self._metadata_or_raise()
+        authoritative = await store.get_task(task.id)
+        if authoritative is not None:
+            if authoritative.actor != task.actor or authoritative.workspace_id != workspace.id:
+                raise PermissionError("preparation_subject_unavailable")
+            task = authoritative
+        elif (task.actor.authenticated is not True or not task.delegation_scope.allowed_paths
+              or task.source != task.actor.source):
+            raise PermissionError("preparation_subject_unavailable")
+        else:
+            await store.save_task(task)  # SDK Tasks may not yet have a durable row.
+        from Sprout.orchestration.service import SequentialOrchestrator
+
+        if any(SequentialOrchestrator._blocks_local_replay(node)
+               for node in await store.list_execution_nodes(task.id)
+               if owned_node is None or node.id != owned_node.id):
+            raise PermissionError("code_preparation_unconfirmed")
+        selection = {key: task.metadata[key] for key in
+                     ("required_paths", "analysis_directory", "session_id") if key in task.metadata}
+        if "required_paths" not in selection and "analysis_directory" not in selection:
+            _, known = self._known_read_only_plan(workspace, task)
+            selection["required_paths"] = [resource.path for resource in known.resources]
+        analysis = await self._capture_preparation(
+            replace(workspace, manifest=None), actor=task.actor, source=task.source,
+            scope=task.delegation_scope, instruction=task.instruction,
+            metadata=selection, parent=task,
+            owner_node=owned_node,
+        )
+        return (replace(workspace, manifest=analysis.manifest),
+                replace(analysis.read_plan, task_id=task.id, purpose=task.instruction))
 
     async def invalidate_workspace(self, workspace_id: str | None = None) -> None:
         await self._workspaces.invalidate_workspace(workspace_id)
 
-    async def plan_task(self, task_id: str) -> ReadPlan:
-        return await self._workspaces.read_plan(task_id)
+    async def plan_task(self, task_id: str, *, principal: Principal | None = None) -> ReadPlan:
+        store = self._metadata_or_raise()
+        if not isinstance(principal, Principal) or principal.authenticated is not True:
+            raise PermissionError("authorized_workspace_analysis_required")
+        task = await store.get_task(task_id)
+        if task is None:
+            raise LookupError(f"Task not found: {task_id}")
+        if (task.actor != principal or task.source != principal.source
+                or task.status not in {TaskStatus.CREATED, TaskStatus.READY, TaskStatus.RUNNING}
+                or task.delegation_scope.is_expired()
+                or not task.delegation_scope.allowed_paths):
+            raise PermissionError("analysis_task_subject_unavailable")
+        reference = task
+        if (task.execution_mode is not TaskExecutionMode.READ_ONLY
+                or task.status is TaskStatus.RUNNING
+                or await store.list_execution_nodes(task.id)):
+            # Planning must not complete/reclaim a CODE or already-owned graph.
+            # Use a separate read-only task with the EXACT existing authority.
+            # No Scope widening, implicit directory discovery or disk scanner.
+            workspace = await store.get_workspace(task.workspace_id)
+            if workspace is None:
+                raise PermissionError("analysis_workspace_unavailable")
+            _, selected = self._known_read_only_plan(workspace, task)
+            reference = await self.create_task(
+                task.workspace_id, task.instruction, actor=principal, source=task.source,
+                execution_mode=TaskExecutionMode.READ_ONLY,
+                delegation_scope=task.delegation_scope,
+                metadata={"required_paths": [r.path for r in selected.resources],
+                          **({"session_id": task.metadata["session_id"]}
+                             if task.metadata.get("session_id") else {})},
+            )
+        plan = (await self.analyze_workspace(
+            task.workspace_id, principal=principal, analysis_task=reference)).read_plan
+        current = await store.get_task(task_id)
+        if (current is None or current.actor != task.actor or current.source != task.source
+                or current.workspace_id != task.workspace_id
+                or current.delegation_scope != task.delegation_scope
+                or current.delegation_scope.is_expired()
+                or current.metadata.get("session_id") != task.metadata.get("session_id")
+                or current.status not in {TaskStatus.CREATED, TaskStatus.READY,
+                                          TaskStatus.RUNNING, TaskStatus.COMPLETED}):
+            raise PermissionError("analysis_publication_unavailable")
+        return replace(plan, task_id=task_id)
 
     async def create_task(
         self,
@@ -2097,6 +4778,8 @@ class Runtime:
         execution_mode: str = TaskExecutionMode.CODE,
     ) -> Task:
         """Create and persist a task without starting orchestration yet."""
+        if metadata and "host_acceptance_v1" in metadata:
+            raise PermissionError("host_acceptance_requires_explicit_host_binding")
         store = self.storage.metadata
         if store is None:
             raise RuntimeError("MetadataStore is not configured")
@@ -2120,6 +4803,56 @@ class Runtime:
         )
         await store.save_task(task)
         return task
+
+    async def bind_task_acceptance(self, task_id, *, principal, spec, test_path, demo_path):
+        """Explicit Python host input, before any graph exists. No Scope expansion."""
+        from dataclasses import asdict
+
+        from Sprout.execution.acceptance import render_acceptance_demo, render_acceptance_tests
+        from Sprout.execution.host_acceptance import binding_subject
+        from Sprout.execution.node_result_source import payload_digest
+        from Sprout.strategy.acceptance import AcceptanceSpec
+        from Sprout.workspace.authorized_content import relative_label
+
+        store = self._metadata_or_raise()
+        task = await store.get_task(task_id)
+        if (task is None or task.actor != principal or principal.authenticated is not True
+                or task.source != principal.source
+                or task.execution_mode is not TaskExecutionMode.CODE
+                or task.status is not TaskStatus.CREATED or task.delegation_scope.is_expired()
+                or task.metadata.get("host_acceptance_v1")
+                or await store.list_execution_nodes(task_id)):
+            raise PermissionError("host_acceptance_subject_unavailable")
+        workspace = await store.get_workspace(task.workspace_id)
+        spec = AcceptanceSpec.from_payload(spec)
+        test_path, demo_path = relative_label(test_path), relative_label(demo_path)
+        if test_path == demo_path:
+            raise ValueError("Acceptance test and Demo must be distinct")
+        expected = {test_path: render_acceptance_tests(spec),
+                    demo_path: render_acceptance_demo(spec)}
+
+        def capture(analysis, view):
+            resources = {}
+            for path, text in expected.items():
+                entry = view.get(path)
+                if entry.identity is None or entry.text().replace("\r\n", "\n") != text:
+                    raise PermissionError("host_acceptance_source_mismatch")
+                resources[path] = {"digest": entry.digest, "identity": asdict(entry.identity)}
+            return resources
+
+        resources = await self._capture_preparation(
+            replace(workspace, manifest=None), actor=principal, source=principal.source,
+            scope=task.delegation_scope, instruction="Capture frozen host acceptance",
+            metadata={"required_paths": [test_path, demo_path]}, project=capture)
+        if task != await store.get_task(task.id) or await store.list_execution_nodes(task.id):
+            raise PermissionError("host_acceptance_subject_changed")
+        binding = {"version": 1, "subject": binding_subject(task, workspace),
+                   "spec": spec.to_payload(), "spec_sha256": payload_digest(spec.to_payload()),
+                   "test_path": test_path, "demo_path": demo_path, "resources": resources}
+        binding["sha256"] = payload_digest(binding)
+        bound = replace(task, metadata={**task.metadata, "host_acceptance_v1": binding})
+        await store.save_task(bound)
+        return bound
 
     async def confirm_task_mode(self, task_id: str, execution_mode: str) -> Task:
         """Confirm an untouched historical task, never reinterpret executed work."""
@@ -2161,8 +4894,10 @@ class Runtime:
         *,
         actor: Principal | None = None,
         source: str = "cli",
+        delegation_scope: DelegationScope | None = None,
         language: str = "",
         use_model_planner: bool = False,
+        preparation_paths: tuple[str, ...] | None = None,
     ) -> Task:
         """Plan a requirement with the strategy layer, then materialize a task.
 
@@ -2180,32 +4915,46 @@ class Runtime:
         from Sprout.strategy.pipeline import StrategyPipeline
 
         pipeline = StrategyPipeline()
-        if use_model_planner:
-            plan = await pipeline.plan_user_request_with_model(
-                workspace.root,
-                requirement,
-                self.models.default(),
-                language=language,
-            )
-        else:
-            plan = pipeline.plan_user_request(
-                workspace.root,
-                requirement,
-                language=language,
-            )
+        if (not isinstance(actor, Principal) or actor.authenticated is not True
+                or not isinstance(delegation_scope, DelegationScope)
+                or not delegation_scope.allowed_paths):
+            raise PermissionError("preparation_subject_unavailable")
+        # A finite host Scope is an existing known-resource selector, not an
+        # implicit permission to list a directory. Actual opens remain Brokered.
+        paths = (delegation_scope.allowed_paths if preparation_paths is None
+                 else preparation_paths)
+        if (type(paths) not in {tuple, list} or not paths
+                or any(type(path) is not str for path in paths)):
+            raise PermissionError("preparation_inputs_unavailable")
+        paths = tuple(paths)
+        selection = {"required_paths": list(paths)}
+
+        def project(analysis, view):
+            return pipeline.plan_view(analysis, view, requirement, language=language)
+
+        async def refine(plan):
+            return await pipeline.model_planner.refine(plan, self.models.default())
+
+        plan = await self._capture_preparation(
+            replace(workspace, manifest=None), actor=actor, source=source,
+            scope=delegation_scope, instruction=requirement, metadata=selection,
+            project=project, refine=refine if use_model_planner else None,
+        )
         spec = ExecutionPlanner().plan_to_task_spec(plan)
         return await self.create_task(
             workspace_id,
             spec.instruction,
             actor=actor,
             source=source,
+            delegation_scope=delegation_scope,
             budget=spec.budget,
             metadata={
-                "required_paths": list(spec.resources),
                 "tool_names": list(spec.tools),
                 "plan_kind": "model" if use_model_planner else "local",
                 **({"response_language": language} if language else {}),
                 **spec.metadata,
+                # Planner output and future write authority cannot add READ inputs.
+                "required_paths": list(paths),
             },
         )
 
@@ -2216,9 +4965,11 @@ class Runtime:
         *,
         actor: Principal | None = None,
         source: str = "cli",
+        delegation_scope: DelegationScope | None = None,
         language: str = "",
         use_model_planner: bool = False,
         execution_mode: str = TaskExecutionMode.CODE,
+        preparation_paths: tuple[str, ...] | None = None,
     ) -> Task:
         """Create a task through strategy planning, falling back if it fails.
 
@@ -2251,6 +5002,18 @@ class Runtime:
         if workspace is None:
             raise LookupError(f"Workspace not found: {workspace_id}")
         execution_metadata({}, execution_mode)
+        if (preparation_paths is not None
+                and (type(preparation_paths) not in {tuple, list} or not preparation_paths
+                     or any(type(path) is not str for path in preparation_paths))):
+            raise PermissionError("preparation_inputs_unavailable")
+        if preparation_paths is not None:
+            preparation_paths = tuple(preparation_paths)
+            # A selector is not authority, including the scheduling-only lane.
+            if (not isinstance(actor, Principal) or actor.authenticated is not True
+                    or not actor.user_id or not actor.source or source != actor.source
+                    or not isinstance(delegation_scope, DelegationScope)
+                    or not delegation_scope.allowed_paths or delegation_scope.is_expired()):
+                raise PermissionError("preparation_subject_unavailable")
         if execution_mode == TaskExecutionMode.READ_ONLY or not (workspace.root / ".git").exists():
             return await self.create_task(
                 workspace_id,
@@ -2258,6 +5021,9 @@ class Runtime:
                 actor=actor,
                 source=source,
                 execution_mode=execution_mode,
+                delegation_scope=delegation_scope,
+                metadata=({"required_paths": list(preparation_paths)}
+                          if preparation_paths is not None else None),
             )
         try:
             return await self.create_task_from_strategy(
@@ -2267,7 +5033,13 @@ class Runtime:
                 source=source,
                 language=language,
                 use_model_planner=use_model_planner,
+                delegation_scope=delegation_scope,
+                preparation_paths=preparation_paths,
             )
+        except PermissionError:
+            # A denied resource preparation is not a planner bug. Never hide
+            # it behind an unscoped plain-task fallback.
+            raise
         except Exception as exc:  # noqa: BLE001 - planning must never block the task
             logger.warning(
                 "strategy planning failed (%s: %s); creating a plain task",
@@ -2279,10 +5051,13 @@ class Runtime:
                 instruction,
                 actor=actor,
                 source=source,
+                delegation_scope=delegation_scope,
                 metadata={
                     "plan_kind": "fallback",
                     "require_acceptance_tests": True,
                     **({"response_language": language} if language else {}),
+                    **({"required_paths": list(preparation_paths)}
+                       if preparation_paths is not None else {}),
                 },
             )
 
@@ -2477,9 +5252,13 @@ class Runtime:
         proposal_id: str,
         *,
         decided_by: str = "cli",
+        principal=None,
     ) -> ChangeProposal:
-        proposal = await self._changes().approve(proposal_id, decided_by=decided_by)
+        proposal = await self._changes().approve(
+            proposal_id, decided_by=decided_by, principal=principal)
         await self._resume_task_after_approval(proposal.task_id)
+        if proposal.id in self._local_apply_plans:
+            return await self._changes().get(proposal.id) or proposal
         return proposal
 
     async def reject_change_proposal(
@@ -2503,6 +5282,7 @@ class Runtime:
             return
         TaskStateMachine.validate(task.status, TaskStatus.CANCELLED)
         await metadata.update_task_status(task_id, TaskStatus.CANCELLED)
+        self._verification_hosts.pop(task_id, None)
 
     async def cancel_task(self, task_id: str, *, reason: str = "") -> Task:
         """Stop a task that is waiting on, or running for, a human.
@@ -2535,6 +5315,7 @@ class Runtime:
         if not TaskStateMachine.can_transition(task.status, TaskStatus.CANCELLED):
             raise ValueError(f"Task {task_id} is {task.status.value}; it cannot be cancelled")
         await metadata.update_task_status(task_id, TaskStatus.CANCELLED)
+        self._verification_hosts.pop(task_id, None)
         self._record_security(
             "task.cancelled",
             {"task_id": task_id, "from": task.status.value, "reason": reason},
@@ -2577,13 +5358,37 @@ class Runtime:
         force: bool = False,
         override_reason: str = "",
         decided_by: str = "cli",
+        principal=None,
     ) -> ApplyResult:
+        proposal = await self._changes().get(proposal_id)
+        if proposal is not None and "apply_plan" in proposal.metadata:
+            from uuid import NAMESPACE_URL, uuid5
+
+            from Sprout.execution.apply_plan import current_plan
+
+            await current_plan(self, proposal_id, principal)
+            if force or allow_failing_tests:
+                return ApplyResult(proposal_id, False, "local_apply_no_override")
+            transaction = str(uuid5(NAMESPACE_URL, "ordinary-apply:" + proposal_id))
+            prior = await self._metadata_or_raise().get_apply_transaction(transaction)
+            if prior is not None:
+                return ApplyResult(proposal_id, False, "local_apply_no_repeat:" + prior["phase"])
+            task = await self._metadata_or_raise().get_task(proposal.task_id)
+            if (proposal.status is ChangeProposalStatus.APPROVED and task is not None
+                    and task.status is TaskStatus.WAITING_APPROVAL):
+                # Resume the existing graph/Guard; never invent an Apply owner.
+                await self._resume_task_after_approval(task.id)
+                row = await self._metadata_or_raise().get_apply_transaction(transaction)
+                return ApplyResult(proposal_id, bool(row and row["phase"] == "COMPLETED"),
+                                   row["phase"] if row else "local_apply_not_started")
+            return ApplyResult(proposal_id, False, "local_apply_approved_guard_required")
         result = await self._changes().apply(
             proposal_id,
             allow_failing_tests=allow_failing_tests,
             force=force,
             override_reason=override_reason,
             decided_by=decided_by,
+            principal=principal,
         )
         if result.applied:
             proposal = await self._changes().get(proposal_id)
@@ -2790,10 +5595,13 @@ class Runtime:
         isolated_wait = await self._isolated_execution_wait(task)
         if isolated_wait is not None:
             return isolated_wait
-        if isinstance(backend or self._orchestrator_backend, TemporalOrchestratorBackend):
-            authoritative = await metadata.get_task(task.id)
-            if authoritative is not None:
-                task = authoritative
+        execution_backend = backend or self._orchestrator_for(metadata)
+        authoritative = await metadata.get_task(task.id)
+        if authoritative is not None:
+            if authoritative.actor != task.actor or authoritative.workspace_id != task.workspace_id:
+                raise PermissionError("preparation_subject_unavailable")
+            task = authoritative
+            if isinstance(execution_backend, TemporalOrchestratorBackend):
                 if task.status in {
                     TaskStatus.COMPLETED,
                     TaskStatus.CANCELLED,
@@ -2806,22 +5614,27 @@ class Runtime:
 
         task = self._task_for_execution(task, workspace)
 
-        manifest = self._scanner.scan(workspace)
-        workspace = Workspace(
-            id=workspace.id,
-            root=workspace.root,
-            kind=workspace.kind,
-            revision=workspace.revision,
-            manifest=manifest,
-        )
-        await metadata.save_workspace(workspace)
-        await metadata.save_task(task)
+        if task.execution_mode is TaskExecutionMode.READ_ONLY:
+            workspace, read_plan = self._known_read_only_plan(
+                workspace, task,
+                scheduling=isinstance(execution_backend, TemporalOrchestratorBackend),
+            )
+            manifest = workspace.manifest
+        else:
+            try:
+                workspace, read_plan = await self._prepare_code_resources(task, workspace)
+            except PermissionError as exc:
+                if str(exc) != "code_preparation_unconfirmed":
+                    raise
+                return TaskResult(task_id=task.id, status=TaskStatus.WAITING_RESOURCE,
+                                  error=str(exc))
+            manifest = workspace.manifest
+        if await metadata.get_task(task.id) is None:
+            await metadata.save_task(task)
 
-        required_paths = tuple(task.metadata.get("required_paths") or ())
         tool_names = tuple(task.metadata.get("tool_names") or ())
         steps = tuple(task.metadata.get("steps") or ())
         verification_commands = tuple(task.metadata.get("verification_commands") or ())
-        read_plan = self._scanner.build_read_plan(workspace, task, required_paths=required_paths)
         graph = self._graph_builder.build(
             task,
             read_plan,
@@ -2841,12 +5654,13 @@ class Runtime:
         previous_skills = self.skills.list()
         pinned_skill = await executor.pin_snapshot(recorder, artifact_snapshot, task.id)
         try:
-            result = await (backend or self._orchestrator_for(metadata)).execute(
+            result = await execution_backend.execute(
                 graph,
                 handler=executor.handler(task, workspace, read_plan),
                 recorder=recorder,
                 budget=task.budget,
             )
+            await self._persist_node_products()
             await self._sandbox_lifecycle.finalize(task, result)
             return result
         finally:
@@ -2886,12 +5700,21 @@ class Runtime:
         if workspace is None:
             raise LookupError(f"Workspace not found: {task.workspace_id}")
         task = self._task_for_execution(task, workspace)
-        manifest = workspace.manifest or self._scanner.scan(workspace)
-        required_paths = tuple(task.metadata.get("required_paths") or ())
+        if task.execution_mode is TaskExecutionMode.READ_ONLY:
+            workspace, read_plan = self._known_read_only_plan(workspace, task)
+            manifest = workspace.manifest
+        else:
+            try:
+                workspace, read_plan = await self._prepare_code_resources(task, workspace)
+            except PermissionError as exc:
+                if str(exc) != "code_preparation_unconfirmed":
+                    raise
+                return TaskResult(task_id=task.id, status=TaskStatus.WAITING_RESOURCE,
+                                  error=str(exc))
+            manifest = workspace.manifest
         tool_names = tuple(task.metadata.get("tool_names") or ())
         steps = tuple(task.metadata.get("steps") or ())
         verification_commands = tuple(task.metadata.get("verification_commands") or ())
-        read_plan = self._scanner.build_read_plan(workspace, task, required_paths=required_paths)
         graph = self._graph_builder.build(
             task,
             read_plan,
@@ -2914,6 +5737,7 @@ class Runtime:
             recorder=recorder,
             budget=task.budget,
         )
+        await self._persist_node_products()
         await self._sandbox_lifecycle.finalize(task, result)
         return result
 
@@ -3039,9 +5863,11 @@ class Runtime:
 
         async def execute_owned(running: ExecutionNode):
             nonlocal recorder
-            manifest = workspace.manifest or self._scanner.scan(workspace)
-            prepared = replace(workspace, manifest=manifest)
-            read_plan = self._scanner.build_read_plan(prepared, task)
+            if task.execution_mode is TaskExecutionMode.READ_ONLY:
+                prepared, read_plan = self._known_read_only_plan(workspace, task)
+            else:
+                prepared, read_plan = await self._prepare_code_resources(
+                    task, workspace, owned_node=running)
             executor = self._executor(metadata)
             if isinstance(executor, NodeExecutor):
                 # External scheduler activities retain their own executor;
@@ -3068,6 +5894,7 @@ class Runtime:
             execute_owned,
             resume_key=await self._execution_resume_key(task.id),
         )
+        await self._persist_node_products()
         if recorder is not None:
             await recorder.record(
                 TrajectoryEvent(

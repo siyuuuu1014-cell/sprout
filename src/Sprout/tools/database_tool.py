@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from pathlib import Path
 from typing import Any
 
 from Sprout.execution.database_broker import DatabaseBroker
 from Sprout.tools.result import ToolResult
 from Sprout.tools.spec import ToolSpec
-from Sprout.workspace.models import Workspace, WorkspaceKind
 
 
 class DatabaseQueryTool:
@@ -42,8 +40,9 @@ class DatabaseQueryTool:
         risk_level="low",
     )
 
-    def __init__(self, broker: DatabaseBroker) -> None:
+    def __init__(self, broker: DatabaseBroker, *, invoke_query=None) -> None:
         self._broker = broker
+        self._invoke_query = invoke_query
 
     async def invoke(self, arguments: Mapping[str, Any]) -> ToolResult:
         database = arguments.get("database")
@@ -53,12 +52,12 @@ class DatabaseQueryTool:
         if not isinstance(sql, str) or not sql.strip():
             return ToolResult.failure("Argument 'sql' must be a non-empty string")
 
-        workspace = Workspace(
-            id=str(arguments.get("workspace_id") or ""),
-            root=Path.cwd(),
-            kind=WorkspaceKind.LOCAL_DIRECTORY,
-        )
-        result = await self._broker.query(workspace, database, sql)
+        if self._invoke_query is None:
+            return ToolResult.denied("database_task_binding_unavailable")
+        try:
+            result = await self._invoke_query(self, database, sql, arguments.get("workspace_id"))
+        except PermissionError as exc:
+            return ToolResult.denied(str(exc))
         if not result.allowed:
             return ToolResult.denied(result.reason or "Database query not allowed")
         rows = [list(row) for row in result.rows]

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -31,6 +32,20 @@ from Sprout.tests.fake_model import FakeModel
 
 REQUIREMENT = "给 user 模块加一个导出 CSV 的函数"
 VALID_EXPORT = "def export_users(users):\n    return 'id\\n1\\n' if users else ''\n"
+
+
+async def _create_host_task(gateway, workspace, instruction):
+    """Explicit first-party fixture resources; never derive grants from model edits."""
+    from Sprout.cli.commands.project import _eval_scope_for_workspace
+    from Sprout.gateway.local_identity import current_cli_principal
+
+    principal = current_cli_principal()
+    scope = _eval_scope_for_workspace(workspace, principal)
+    paths = ("src/user.py", "src/export.py", "obsolete.py", "renamed.py")
+    scope = replace(scope, allowed_paths=scope.allowed_paths + tuple(
+        str(workspace.root / path) for path in paths))
+    return await gateway.create_task(workspace.id, instruction, principal=principal,
+                                     delegation_scope=scope)
 
 
 def _repo(tmp_path: Path, *, gitignore: bool = True) -> Path:
@@ -171,7 +186,7 @@ def test_delete_approval_survives_restart_and_controls_commit(tmp_path, decision
         runtime = _runtime(tmp_path, model)
         workspace = await runtime.open_workspace(repo)
         gateway = ProjectGateway(runtime, transport="cli", default_user="operator")
-        task = await gateway.create_task(workspace.id, REQUIREMENT)
+        task = await _create_host_task(gateway, workspace, REQUIREMENT)
         await runtime.execute(task)
         deletion = None
         for _ in range(8):
@@ -281,7 +296,7 @@ def test_requirement_reaches_the_agent_as_a_planned_task(tmp_path: Path) -> None
         runtime = _runtime(tmp_path, model)
         workspace = await runtime.open_workspace(repo)
         gateway = ProjectGateway(runtime, transport="cli", default_user="t")
-        task = await gateway.create_task(workspace.id, REQUIREMENT)
+        task = await _create_host_task(gateway, workspace, REQUIREMENT)
         await runtime.stop()
         return dict(task.metadata)
 
@@ -310,7 +325,7 @@ def test_requirement_output_controls_whether_the_change_lands(tmp_path: Path, co
         runtime = _runtime(tmp_path, model)
         workspace = await runtime.open_workspace(repo)
         gateway = ProjectGateway(runtime, transport="cli", default_user="t")
-        task = await gateway.create_task(workspace.id, REQUIREMENT)
+        task = await _create_host_task(gateway, workspace, REQUIREMENT)
         final = await _drive(runtime, task)
         if correct and final.status.value != "completed":
             await runtime_failure(runtime, task.id, repo, diagnostic_before,
@@ -357,7 +372,7 @@ def test_a_failing_verification_does_not_land(tmp_path: Path) -> None:
         runtime = _runtime(tmp_path, model)
         workspace = await runtime.open_workspace(repo)
         gateway = ProjectGateway(runtime, transport="cli", default_user="t")
-        task = await gateway.create_task(workspace.id, REQUIREMENT)
+        task = await _create_host_task(gateway, workspace, REQUIREMENT)
         final = await _drive(runtime, task)
         nodes = await runtime.storage.metadata.list_execution_nodes(task.id)
         proposals = await runtime.storage.metadata.list_change_proposals(task.id)
@@ -395,7 +410,7 @@ async def test_a_withheld_command_parks_the_task(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path, model)
     workspace = await runtime.open_workspace(repo)
     gateway = ProjectGateway(runtime, transport="cli", default_user="t")
-    task = await gateway.create_task(workspace.id, REQUIREMENT)
+    task = await _create_host_task(gateway, workspace, REQUIREMENT)
 
     first = await runtime.execute(task)
 
@@ -423,7 +438,7 @@ def test_a_proposal_offers_only_the_agents_edits(tmp_path: Path) -> None:
         runtime = _runtime(tmp_path, model)
         workspace = await runtime.open_workspace(repo)
         gateway = ProjectGateway(runtime, transport="cli", default_user="t")
-        task = await gateway.create_task(workspace.id, REQUIREMENT)
+        task = await _create_host_task(gateway, workspace, REQUIREMENT)
         final = await _drive(runtime, task)
         proposals = await runtime.storage.metadata.list_change_proposals(task.id)
         if final.status.value != "completed":
@@ -489,7 +504,7 @@ def test_approving_a_withheld_command_wakes_the_parked_task(
         live["runtime"] = runtime
         workspace = await runtime.open_workspace(repo)
         gateway = ProjectGateway(runtime, transport="cli", default_user="t")
-        task = await gateway.create_task(workspace.id, REQUIREMENT)
+        task = await _create_host_task(gateway, workspace, REQUIREMENT)
         first = await runtime.execute(task)
         assert first.status.value == "waiting_approval"
         pending = [

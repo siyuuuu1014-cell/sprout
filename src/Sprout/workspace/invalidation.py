@@ -46,6 +46,15 @@ class WorkspaceFingerprint:
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     @classmethod
+    def compute_view(cls, workspace, view):
+        from types import MappingProxyType
+
+        view.check(workspace.id)
+        return cls(workspace.id, revision=view.revision, resource_hashes=MappingProxyType({
+            entry.relative_path: entry.digest for entry in view.entries
+        }))
+
+    @classmethod
     def compute(
         cls,
         workspace: Workspace,

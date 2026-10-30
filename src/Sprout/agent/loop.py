@@ -296,11 +296,15 @@ class AgentLoop:
             },
         )
 
-    async def stream(self, message: Message, context: AgentContext):
+    async def stream(
+        self, message: Message, context: AgentContext, *, include_result: bool = False,
+    ):
         """Run the same tool loop while yielding text chunks.
 
         Providers that expose ``stream_events`` stream both content and tool
         calls. Providers without it fall back to the non-streaming loop.
+        Runtime can opt in to the existing AgentResult terminal; default text
+        consumers keep their original token sequence and approval terminals.
         """
         messages: list[LLMMessage] = []
         response_language = _response_language(message)
@@ -361,6 +365,11 @@ class AgentLoop:
                 if not response.tool_calls:
                     if response.text:
                         yield response.text
+                    if include_result and response.finish_reason in {None, "stop", "end_turn"}:
+                        yield AgentResult(content="", metadata={
+                            "steps": steps, "model_calls": model_calls,
+                            "tool_calls": tool_calls, "plan": self._last_plan,
+                        })
                     return
                 messages.append(LLMMessage.assistant(response.content, response.tool_calls))
                 (
@@ -399,7 +408,10 @@ class AgentLoop:
 
             content_parts: list[str] = []
             final_tool_calls = ()
+            finish_reason = None
             async for event in stream_events(messages, tools=specs):
+                if event.finish_reason is not None:
+                    finish_reason = event.finish_reason
                 if event.content:
                     content_parts.append(event.content)
                     yield event.content
@@ -408,6 +420,11 @@ class AgentLoop:
             steps += 1
             model_calls += 1
             if not final_tool_calls:
+                if include_result and finish_reason in {None, "stop", "end_turn"}:
+                    yield AgentResult(content="", metadata={
+                        "steps": steps, "model_calls": model_calls,
+                        "tool_calls": tool_calls, "plan": self._last_plan,
+                    })
                 return
             messages.append(LLMMessage.assistant("".join(content_parts), final_tool_calls))
             tool_messages, tool_calls, approval_ids, tool_summary = await self._execute_tool_calls(

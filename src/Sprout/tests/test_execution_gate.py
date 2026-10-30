@@ -19,6 +19,7 @@ import sys
 from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -567,12 +568,21 @@ async def test_apply_is_not_blocked_by_passing_verification(tmp_path) -> None:
 # -- R2: the tool path stops being a hole in the process policy ---------------
 
 
+def _environment_recording_cli_tool(tmp_path, variable, default=""):
+    """Observe the actual broker hand-off without starting a host process."""
+    async def run(workspace, command, **kwargs):
+        return ProcessResult(command=tuple(command), exit_code=0,
+                             stdout=kwargs["env"].get(variable, default))
+
+    return CliRunTool(allowed_roots=(tmp_path,), process_broker=SimpleNamespace(run=run))
+
+
 @pytest.mark.asyncio
 async def test_cli_run_tool_does_not_inherit_the_parent_environment(
     tmp_path, monkeypatch
 ) -> None:
     monkeypatch.setenv("SPROUT_TEST_LEAKED_SECRET", "super-secret-value")
-    tool = CliRunTool(allowed_roots=(tmp_path,))
+    tool = _environment_recording_cli_tool(tmp_path, "SPROUT_TEST_LEAKED_SECRET", "<absent>")
 
     result = await tool.invoke(
         {
@@ -593,7 +603,7 @@ async def test_cli_run_tool_does_not_inherit_the_parent_environment(
 
 @pytest.mark.asyncio
 async def test_cli_run_tool_keeps_asking_for_explicit_env(tmp_path) -> None:
-    tool = CliRunTool(allowed_roots=(tmp_path,))
+    tool = _environment_recording_cli_tool(tmp_path, "SPROUT_TEST_EXPLICIT")
 
     result = await tool.invoke(
         {

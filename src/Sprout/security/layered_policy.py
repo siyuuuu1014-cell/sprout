@@ -111,6 +111,12 @@ class PolicyLayer:
 
     def match(self, request: ActionRequest) -> PolicyRule | None:
         for rule in self._rules:
+            # New name visibility must not be silently granted by legacy '*'.
+            # Wildcard restrictions continue to apply, in their original order.
+            if (request.action is ActionType.DIRECTORY_LIST
+                    and rule.decision is AccessDecision.ALLOW
+                    and rule.action != ActionType.DIRECTORY_LIST.value):
+                continue
             if rule.matches(request):
                 return rule
         return None
@@ -282,6 +288,9 @@ class LayeredPolicyEngine:
                 if effective is AccessDecision.REQUIRE_APPROVAL:
                     effective = AccessDecision.ALLOW
                     reason = f"Pre-approved by {rule.id or layer.name}"
+                if (request.action is ActionType.DIRECTORY_LIST
+                        and rule.action == ActionType.DIRECTORY_LIST.value):
+                    matched.append(f"directory:grant:{rule.id or layer.name}")
                 continue
             tightened = self._intersect(effective, rule.decision)
             if tightened is not effective:

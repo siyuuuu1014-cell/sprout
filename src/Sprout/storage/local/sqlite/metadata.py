@@ -50,6 +50,10 @@ from Sprout.workspace.models import (
 )
 
 SCHEMA = MODEL_BUDGET_SCHEMA + """
+CREATE TABLE IF NOT EXISTS node_result_sources_v1 (
+    node_id TEXT PRIMARY KEY,
+    source_json TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS coding_intents (
     id TEXT PRIMARY KEY,
     node_id TEXT NOT NULL,
@@ -201,6 +205,26 @@ class SqliteMetadataStore:
 
     async def finish_git_transaction(self, transaction_id, owner, state, result):
         return await finish_transaction(self._db, transaction_id, owner, state, result)
+
+    async def approve_apply_proposal(self, snapshot):
+        from Sprout.storage.local.sqlite.apply_transaction import approve_proposal
+
+        return await approve_proposal(self._db, snapshot)
+
+    async def claim_apply_transaction(self, record, snapshot):
+        from Sprout.storage.local.sqlite.apply_transaction import claim
+
+        return await claim(self._db, record, snapshot)
+
+    async def get_apply_transaction(self, identifier):
+        from Sprout.storage.local.sqlite.apply_transaction import observe
+
+        return await observe(self._db, identifier)
+
+    async def update_apply_transaction(self, identifier, owner, **change):
+        from Sprout.storage.local.sqlite.apply_transaction import transition
+
+        return await transition(self._db, identifier, owner, **change)
 
     async def begin_git_commit_write(self, transaction_id, owner):
         from Sprout.storage.local.sqlite.git_transaction import begin_commit_write
@@ -378,6 +402,61 @@ class SqliteMetadataStore:
         return changed == 1
 
     async def claim_verification_execution(self, record: dict[str, Any]) -> bool:
+        if record.get("schema_version") == 3:
+            authority = record.get("authority", {})
+            if (type(record.get("schema_version")) is not int
+                    or any(not isinstance(record.get(key), str) or not record[key]
+                           for key in ("id", "task_id", "node_id", "owner", "workspace_id"))
+                    or not isinstance(authority, dict)
+                    or set(authority) != {"actor", "scope", "task_metadata", "node_metadata",
+                                          "workspace_root", "workspace_revision", "instruction"}):
+                return False
+            if (any(type(authority[k]) is not dict for k in
+                    ("actor", "scope", "task_metadata", "node_metadata"))
+                    or type(authority["workspace_root"]) is not str
+                    or type(authority["instruction"]) is not str
+                    or authority["workspace_revision"] is not None
+                    and type(authority["workspace_revision"]) is not str):
+                return False
+            # One writer statement checks the actual Task and persisted Guard
+            # and inserts once. No pre-query grants, state transition or schema migration.
+            changed = await self._db.execute(
+                "INSERT OR IGNORE INTO verification_executions "
+                "(id, task_id, owner, state, record_json) "
+                "SELECT ?, ?, ?, 'active', ? FROM tasks t JOIN execution_nodes n "
+                "ON n.task_id=t.id JOIN workspaces w ON w.id=t.workspace_id "
+                "WHERE t.id=? AND t.workspace_id=? AND t.status='running' "
+                "AND w.root=? AND w.revision IS ? AND t.instruction=? "
+                "AND json_extract(t.metadata_json,'$.execution_mode')='code' "
+                "AND json_extract(t.actor_json,'$.authenticated')=1 "
+                "AND json_type(t.actor_json,'$.authenticated')='true' "
+                "AND t.source=json_extract(t.actor_json,'$.source') "
+                "AND json_extract(t.actor_json,'$.user_id')!='' "
+                "AND t.source!='' AND json(t.actor_json)=json(?) "
+                "AND json(t.delegation_scope_json)=json(?) "
+                "AND json(t.metadata_json)=json(?) "
+                "AND (json_extract(t.delegation_scope_json,'$.expires_at') IS NULL "
+                "OR ((json_extract(t.delegation_scope_json,'$.expires_at') LIKE '%Z' "
+                "OR json_extract(t.delegation_scope_json,'$.expires_at') GLOB '*[+-]??:??') "
+                "AND julianday(json_extract(t.delegation_scope_json,'$.expires_at')) "
+                "> julianday('now'))) "
+                "AND n.id=? AND n.type='evaluation' AND n.status='running' "
+                "AND json(n.metadata_json)=json(?) "
+                "AND json_extract(n.metadata_json,'$.execution_guard.state')='active' "
+                "AND json_extract(n.metadata_json,'$.execution_guard.owner')=? "
+                "AND (julianday('now')-julianday(json_extract(n.metadata_json, "
+                "'$.execution_guard.started_at')))*86400 "
+                "< json_extract(n.budget_json,'$.timeout_seconds')",
+                (record["id"], record["task_id"], record["owner"], _json_dumps(record),
+                 record["task_id"], record["workspace_id"], authority["workspace_root"],
+                 authority["workspace_revision"], authority["instruction"],
+                 _json_dumps(authority["actor"]),
+                 _json_dumps(authority["scope"]), _json_dumps(authority["task_metadata"]),
+                 record["node_id"], _json_dumps(authority["node_metadata"]), record["owner"]),
+            )
+            return changed == 1
+        if record.get("schema_version", 2) != 2:
+            return False
         changed = await self._db.execute(
             "INSERT OR IGNORE INTO verification_executions "
             "(id, task_id, owner, state, record_json) SELECT ?, ?, ?, 'active', ? "
@@ -639,6 +718,50 @@ class SqliteMetadataStore:
         )
 
     # -- execution nodes ----------------------------------------------------
+    async def save_node_result_source(self, source) -> bool:
+        from Sprout.execution.node_result_source import NodeResultSourceV1, payload_digest
+
+        if type(source) is not NodeResultSourceV1:
+            return False
+        try:
+            source = NodeResultSourceV1.from_json(source.to_json())
+        except (ValueError, TypeError):
+            return False
+        row = await self._db.fetchone("SELECT * FROM execution_nodes WHERE id = ?",
+                                      (source.node_id,))
+        if row is None:
+            return False
+        node = self._row_to_execution_node(row)
+        guard = node.metadata.get("execution_guard", {})
+        if (node.task_id != source.task_id or node.type.value != source.node_type
+                or node.status is not NodeStatus.COMPLETED
+                or guard.get("state") != "completed" or guard.get("owner") != source.owner
+                or node.result_ref is not None
+                or payload_digest(node.metadata.get("output")) != source.output_digest):
+            return False
+        # CAS against the exact settled row. Never overwrite an existing origin.
+        changed = await self._db.execute(
+            "INSERT INTO node_result_sources_v1 (node_id, source_json) "
+            "SELECT id, ? FROM execution_nodes WHERE id = ? AND status = 'completed' "
+            "AND metadata_json = ? AND result_ref_json IS NULL "
+            "ON CONFLICT(node_id) DO NOTHING",
+            (source.to_json(), node.id, row["metadata_json"]),
+        )
+        return changed == 1 or await self.get_node_result_source(node.id) == source
+
+    async def get_node_result_source(self, node_id: str):
+        from Sprout.execution.node_result_source import NodeResultSourceV1
+
+        row = await self._db.fetchone(
+            "SELECT source_json FROM node_result_sources_v1 WHERE node_id = ?", (node_id,),
+        )
+        if row is None:
+            return None
+        try:
+            return NodeResultSourceV1.from_json(row["source_json"])
+        except (TypeError, ValueError):
+            return None
+
     async def claim_execution_node(self, node: ExecutionNode, owner: str, resume_key: str) -> bool:
         """Atomically occupy a node; ownership never expires or gets stolen."""
         guard = {

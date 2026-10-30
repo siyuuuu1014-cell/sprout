@@ -49,7 +49,9 @@ class TaskAdapter:
             workspace_id=request.workspace_id,
             instruction=request.instruction,
             actor=request.caller,
-            source=request.transport,
+            # Transport labels identify a channel, not the authenticated host.
+            # Preserve the complete supplied Principal; never promote its trust.
+            source=request.caller.source,
             delegation_scope=request.delegation_scope,
             budget=request.budget,
             metadata=execution_metadata(request.metadata, request.execution_mode),

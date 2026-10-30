@@ -9,7 +9,7 @@ from Sprout.strategy.intake import RequirementIntake
 from Sprout.strategy.model_planner import ModelStrategyPlanner
 from Sprout.strategy.models import Requirement, StrategyPlan
 from Sprout.strategy.planner import RequirementPlanner
-from Sprout.strategy.project_profile import ProjectProfile, inspect_project
+from Sprout.strategy.project_profile import ProjectProfile, inspect_project, inspect_view
 from Sprout.strategy.verification import VerificationPlanner
 
 
@@ -39,6 +39,15 @@ class StrategyPipeline:
     def plan(self, root: str | Path, requirement: Requirement) -> StrategyPlan:
         report = self.impact.analyze(root, requirement)
         return self._build(root, requirement, report)
+
+    def plan_view(self, analysis, view, text, *, language="") -> StrategyPlan:
+        """Pure strategy input; Runtime owns capture and publication authority."""
+        view.check(analysis.workspace.id)
+        requirement = self.intake.from_user(text, language=language)
+        report = self.impact.analyze_paths(
+            (entry.relative_path for entry in view.entries), requirement)
+        profile = inspect_view(analysis, report, view)
+        return self._build(analysis.workspace.root, requirement, report, profile=profile)
 
     def _build(self, root, requirement, report, *, profile=None):
         profile = profile or inspect_project(root, report)
