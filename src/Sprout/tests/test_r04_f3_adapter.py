@@ -35,12 +35,16 @@ def test_compile_copy_is_exact_and_does_not_write_host_inputs(tmp_path):
         materialize_inputs({"app.py": hashlib.sha256(content).hexdigest()}, source, destination)
 
 
-@pytest.mark.parametrize("name,content,digest", [
-    ("../escape.py", b"x", "0" * 64),
-    (".env", b"x", "0" * 64),
-    ("app.py", b"x", "0" * 64),
-    ("app.py", b"x" * 100001, "0" * 64),
-], ids=["escape", "private", "digest", "budget"])
+@pytest.mark.parametrize(
+    "name,content,digest",
+    [
+        ("../escape.py", b"x", "0" * 64),
+        (".env", b"x", "0" * 64),
+        ("app.py", b"x", "0" * 64),
+        ("app.py", b"x" * 100001, "0" * 64),
+    ],
+    ids=["escape", "private", "digest", "budget"],
+)
 def test_compile_copy_rejects_escape_digest_and_budget(tmp_path, name, content, digest):
     from Sprout.execution.verification_observer import materialize_inputs
 
@@ -137,7 +141,8 @@ def inspection(value, *, status="exited", code=0):
     if value.get("protocol") == "observed-command-v1":
         command = value["command"]
         result["HostConfig"]["Tmpfs"] = dict(
-            x.split("=", 1)[1].split(":", 1) for x in command if x.startswith("--tmpfs="))
+            x.split("=", 1)[1].split(":", 1) for x in command if x.startswith("--tmpfs=")
+        )
         result["Config"].update(
             Entrypoint=[next(x.split("=", 1)[1] for x in command if x.startswith("--entrypoint="))],
             WorkingDir="/workspace",
@@ -320,7 +325,11 @@ async def test_owned_lifecycle_uses_daemon_stop_evidence(mode):
 async def test_real_runtime_guard_broker_claim_and_report_with_substituted_docker(
     f3, monkeypatch, mode
 ):
-    """Real Runtime/SQLite/Approval, substituted processes and files, not native proof."""
+    await exercise_owned_verification(f3, monkeypatch, mode)
+
+
+async def exercise_owned_verification(f3, monkeypatch, mode, graph=None):
+    """Real Runtime/SQLite/Approval; optional real review graph, substituted Docker."""
     import base64
     import hashlib
 
@@ -467,7 +476,11 @@ async def test_real_runtime_guard_broker_claim_and_report_with_substituted_docke
                     "exit_code": 0,
                     "collected": ["tests/frozen.py::test_normal"],
                     "collection_errors": [],
-                    "configuration": {"plugins": [], "relative_config": None, "config_hash": None},
+                    "configuration": {
+                        "plugins": ["unexpected"] if graph else [],
+                        "relative_config": None,
+                        "config_hash": None,
+                    },
                     "runner": {"probe_hash": request["pytest_observer_sha"]},
                     "reports": [
                         {
@@ -482,8 +495,11 @@ async def test_real_runtime_guard_broker_claim_and_report_with_substituted_docke
                 )
             if request["argv"][1:3] == ["-m", "compileall"]:
                 assert request["materialize"] == prepared["input_manifest"]
-                assert all(a.endswith(",readonly") for a in prepared["command"]
-                           if a.startswith("type=bind"))
+                assert all(
+                    a.endswith(",readonly")
+                    for a in prepared["command"]
+                    if a.startswith("type=bind")
+                )
                 assert any(a.startswith("--tmpfs=/workspace:") for a in prepared["command"])
             output = "SPROUT_COMMAND_REPORT " + prepared["nonce"] + " " + json.dumps(result)
         elif action == "inspect":
@@ -526,18 +542,27 @@ async def test_real_runtime_guard_broker_claim_and_report_with_substituted_docke
         )
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", docker)
-    with runtime._project_analysis_scope(e.rig.task, e.rig.workspace, e.rig.node):
-        if mode == "cancel-coroutine":
-            with pytest.raises(asyncio.CancelledError):
-                await runtime._evaluate_host_verification(e.rig.node)
-            assert len(starts) == 1 and all(state == "exited" for _, state in containers.values())
-            return
-        if mode in {"cancel-task", "scope-expired"}:
-            with pytest.raises(PermissionError):
-                await runtime._evaluate_host_verification(e.rig.node)
-            assert len(starts) == 1 and all(state == "exited" for _, state in containers.values())
-            return
-        result = await runtime._evaluate_host_verification(e.rig.node)
+    if graph is not None:
+        await graph.runner.execute(graph.flow, handler=graph.handler)
+        settled = await graph.store.get_execution_node(graph.evaluation.id)
+        result = settled.metadata["output"]
+    else:
+        with runtime._project_analysis_scope(e.rig.task, e.rig.workspace, e.rig.node):
+            if mode == "cancel-coroutine":
+                with pytest.raises(asyncio.CancelledError):
+                    await runtime._evaluate_host_verification(e.rig.node)
+                assert len(starts) == 1 and all(
+                    state == "exited" for _, state in containers.values()
+                )
+                return
+            if mode in {"cancel-task", "scope-expired"}:
+                with pytest.raises(PermissionError):
+                    await runtime._evaluate_host_verification(e.rig.node)
+                assert len(starts) == 1 and all(
+                    state == "exited" for _, state in containers.values()
+                )
+                return
+            result = await runtime._evaluate_host_verification(e.rig.node)
     if mode != "success":
         assert not result["verified"]
         if mode in {"pending", "daemon-before"}:
@@ -568,20 +593,34 @@ async def test_real_runtime_guard_broker_claim_and_report_with_substituted_docke
     assert all(state == "exited" for _, state in containers.values())
     for row in result["results"]:
         pytest_result = row["kind"] in {"project-pytest", "strategy-pytest"} or row[
-            "kind"].startswith("acceptance:")
+            "kind"
+        ].startswith("acceptance:")
         assert row["outcome"] == ("unverified" if pytest_result else "passed")
         assert row["passed"] is (not pytest_result)
         saved = await runtime.storage.metadata.get_verification_execution(
-            row["execution"]["execution_id"])
+            row["execution"]["execution_id"]
+        )
         assert saved["state"] == "completed" and saved["schema_version"] == 3
         assert saved["task_id"] == e.rig.task.id
         assert saved["node_id"] == result["manifest"]["node"]
         assert saved["owner"] == result["manifest"]["owner"]
+    if graph is not None:
+        proposals = await graph.store.list_change_proposals(e.rig.task.id)
+        assert len(proposals) == 1
+        proposal = proposals[0]
+        assert proposal.metadata["verification"]["collection_complete"]
+        assert not proposal.metadata["verification"]["verification_report"]["verified"]
+        assert any(
+            row["error"] == "verification_pytest_configuration_unproved"
+            for row in result["results"]
+        )
+        assert not runtime._verification_preparations
     from Sprout.security.approval import ApprovalStatus
 
     for approval_id in approvals:
         assert (await e.broker._approvals.store.get_approval(approval_id)).status is (
-            ApprovalStatus.CONSUMED)
+            ApprovalStatus.CONSUMED
+        )
 
     from Sprout.execution.models import ChangeProposal, ChangeProposalStatus
     from Sprout.execution.models import TestResult as Check
@@ -589,16 +628,23 @@ async def test_real_runtime_guard_broker_claim_and_report_with_substituted_docke
     from Sprout.runtime.changes import ChangeProposalService
     from Sprout.storage.local.memory import MemoryOperationalStore
 
-    proposal = ChangeProposal(task_id=e.rig.task.id, status=ChangeProposalStatus.APPROVED,
+    proposal = ChangeProposal(
+        task_id=e.rig.task.id,
+        status=ChangeProposalStatus.APPROVED,
         test_results=tuple(Check(**item) for item in result["test_results"]),
-        metadata={"verification": result})
+        metadata={"verification": result},
+    )
     report = proposal_verification_report(proposal)
     assert not report.verified and "unverified" in report.failure_codes
-    metadata = SimpleNamespace(get_change_proposal=AsyncMock(return_value=proposal),
-        get_task=AsyncMock(return_value=e.rig.task), get_workspace=AsyncMock())
+    metadata = SimpleNamespace(
+        get_change_proposal=AsyncMock(return_value=proposal),
+        get_task=AsyncMock(return_value=e.rig.task),
+        get_workspace=AsyncMock(),
+    )
     apply_broker = SimpleNamespace(apply=AsyncMock())
     denied = await ChangeProposalService(metadata, MemoryOperationalStore(), apply_broker).apply(
-        proposal.id)
+        proposal.id
+    )
     assert not denied.applied
     apply_broker.apply.assert_not_called()
     metadata.get_workspace.assert_not_called()

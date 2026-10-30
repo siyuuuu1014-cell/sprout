@@ -33,6 +33,78 @@ app = typer.Typer(
     rich_markup_mode="rich",
 )
 
+
+def permission_inventory(runtime) -> dict:
+    """Describe this live registry; conditional gates are never execution grants."""
+    from Sprout.tools.system_tools import (
+        CliDownloadTool,
+        GitWriteTool,
+        GrepCheckTool,
+        SkillScriptTool,
+    )
+
+    layer = runtime.security
+    rows = []
+    disabled = (CliDownloadTool, GitWriteTool, GrepCheckTool, SkillScriptTool)
+    for name, tool in sorted(runtime.tools.list().items()):
+        decision = layer.tool_policy.decide_for_spec(tool.spec) if layer else None
+        rows.append({"tool": name, "risk": tool.spec.risk_level,
+                     "tool_gate": ("deny" if isinstance(tool, disabled) else
+                                   decision.decision.value if decision else "unavailable"),
+                     "resource_gate": "Current Task/Scope/Policy and concrete arguments required"})
+    commands = layer.commands if layer else runtime._process_broker.commands
+    return {"tools": rows, "command_allowlist": sorted(commands.allowlist),
+            "command_auto_run": sorted(commands.auto_run),
+            "command_denylist": sorted(commands.denylist),
+            "policy_layers": [p.name for p in getattr(runtime._policy_engine, "_layers", ())],
+            "session_reuse": ("Same principal/source/session and exact operation/resources; "
+                              "not Task authority"),
+            "note": "Tool gate is intersected with resource policy, never a blanket ALLOW"}
+
+
+async def session_permission_inventory(runtime, *, session_id, principal) -> dict:
+    """Read existing approval records, never consume or widen a grant."""
+    from datetime import UTC, datetime
+
+    from Sprout.security.approval import ApprovalStatus
+
+    result = permission_inventory(runtime)
+    result["dynamic_authorization"] = {
+        "status": "not_evaluated",
+        "reason": "No concrete current Task/action/resource selected; checked again at execution",
+    }
+    result["approved_records"] = []
+    result["pending_requests"] = []
+    if not session_id:
+        result["approval_scope"] = "No current session; no session grants selected"
+        return result
+    if principal is None or not principal.authenticated:
+        raise PermissionError("Authenticated session owner required")
+    await runtime._sessions.require_owner(session_id, principal)
+    now = datetime.now(UTC)
+    for record in await runtime.approvals.store.list_approvals():
+        if (record.session_id != session_id or record.requested_by != principal.user_id
+                or record.source != principal.source
+                or record.expires_at is not None and record.expires_at <= now):
+            continue
+        if record.status not in {ApprovalStatus.APPROVED, ApprovalStatus.PENDING}:
+            continue
+        row = {"id": record.id, "tool": record.tool, "origin_task_id": record.task_id,
+               "resource_scope": record.resource_scope,
+               "arguments_fingerprint": record.arguments_fingerprint,
+               "expires_at": record.expires_at.isoformat() if record.expires_at else None,
+               "session_exact_reuse": (record.status is ApprovalStatus.APPROVED
+                   and not record.single_use
+                   and record.approval_class.startswith("session-exact-v1:")),
+               "status": record.status.value}
+        result["approved_records" if record.status is ApprovalStatus.APPROVED
+               else "pending_requests"].append(row)
+    result["approval_scope"] = (
+        "Unexpired records for this session/principal/source, not execution permission. "
+        "Pending requests are not grants; origin Task and current resource policy still apply."
+    )
+    return result
+
 _WRAP_WIDTH = 88
 
 

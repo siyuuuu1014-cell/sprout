@@ -18,8 +18,6 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-import httpx
-
 from Sprout.security.net_guard import NetworkGuard
 from Sprout.security.secret_broker import SecretBroker
 from Sprout.tools.context_keys import CONTEXT_KEY as _CONTEXT_KEY
@@ -300,63 +298,10 @@ class CliDownloadTool:
         self._network_broker = network_broker
 
     async def invoke(self, arguments: Mapping[str, Any]) -> ToolResult:
-        url = arguments.get("url")
-        if not isinstance(url, str) or not url.startswith(("http://", "https://")):
-            return ToolResult.failure("Argument 'url' must be an http:// or https:// URL")
+        # URL permission is not permission to create a destination or its parents.
+        # No bounded binary FileBroker contract is currently available here.
+        return ToolResult.denied("download_file_write_contract_unavailable")
 
-        verdict = await self._guard.acheck(url)
-        if not verdict.allowed:
-            return ToolResult.denied(f"Download blocked: {verdict.reason or url}")
-
-        destination = arguments.get("destination")
-        cwd = Path.cwd().resolve()
-        if destination:
-            target = (cwd / str(destination)).resolve()
-            try:
-                target.relative_to(cwd)
-            except ValueError:
-                return ToolResult.failure("'destination' must stay inside the workspace")
-        else:
-            filename = Path(url.split("?", 1)[0]).name or "downloaded-cli"
-            target = cwd / "data" / "cli_tools" / filename
-        if target.exists() and not arguments.get("overwrite", False):
-            return ToolResult.failure(f"Destination already exists: {target}")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if self._network_broker is not None:
-            result = await self._network_broker.download(
-                _workspace_for(cwd),
-                url,
-                target,
-            )
-            if not result.allowed:
-                return ToolResult.denied(result.reason or "Download blocked")
-            return ToolResult.success(
-                f"Downloaded {url} to {target}.",
-                data={"path": str(target), "bytes": target.stat().st_size},
-            )
-        try:
-            # ``follow_redirects`` stays off: following a redirect would leave
-            # the guarded URL behind and reach a host the guard never saw.
-            async with httpx.AsyncClient(follow_redirects=False, timeout=60.0) as client:
-                async with client.stream("GET", url) as response:
-                    if response.is_redirect:
-                        location = response.headers.get("location", "")
-                        return ToolResult.denied(
-                            f"Download blocked: {url} redirects to {location}"
-                        )
-                    response.raise_for_status()
-                    with target.open("wb") as handle:
-                        async for chunk in response.aiter_bytes():
-                            handle.write(chunk)
-        except Exception as exc:  # noqa: BLE001 - network/download errors are tool results
-            return ToolResult.failure(f"Download failed: {type(exc).__name__}: {exc}")
-        # Deliberately no ``chmod +x``: the old unconditional bit turned
-        # "download" into "download and make runnable", which is exactly the
-        # combination the command allowlist refuses to carry.
-        return ToolResult.success(
-            f"Downloaded {url} to {target}.",
-            data={"path": str(target), "bytes": target.stat().st_size},
-        )
 
 
 class CliRunTool:

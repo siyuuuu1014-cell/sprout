@@ -144,13 +144,13 @@ def test_only_cli_tool_run_is_classed() -> None:
 # -- matching ------------------------------------------------------------------
 
 
-def test_a_class_grant_covers_a_different_subcommand() -> None:
-    """The bug: answering "this class" re-asked for the next subcommand."""
+def test_legacy_class_grant_never_covers_a_different_subcommand() -> None:
+    """A legacy name-wide grant cannot weaken the exact-operation contract."""
     manager = _manager()
     _grant(manager, "sprout", "--help", widen=True)
 
-    assert _approved(manager, "sprout", "info"), "a different subcommand re-asked"
-    assert _approved(manager, "sprout", "storage", "status")
+    assert not _approved(manager, "sprout", "info")
+    assert not _approved(manager, "sprout", "storage", "status")
     assert _approved(manager, "sprout", "--help")
 
 

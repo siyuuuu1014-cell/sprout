@@ -260,7 +260,6 @@ class DockerVerificationRun:
             contract = request.get("pytest_contract")
             configuration = probe.get("configuration", {})
             if (not isinstance(contract, dict) or type(contract.get("plugins")) is not list
-                    or configuration.get("plugins") != contract["plugins"]
                     or {name.split("::", 1)[0] for name in probe.get("collected", ())}
                     != set(contract["files"])):
                 raise ValueError("verification_pytest_configuration_unproved")
@@ -283,6 +282,20 @@ class DockerVerificationRun:
                 != {p["nodeid"] for p in probe.get("reports", ()) if p.get("phase") == "call"}
             ):
                 raise ValueError("verification_pytest_observation_incomplete")
+            if (isinstance(contract, dict) and type(contract.get("plugins")) is list
+                    and isinstance(configuration, dict)
+                    and type(configuration.get("plugins")) is list
+                    and configuration["plugins"] != contract["plugins"]):
+                # Configuration evidence is not a test verdict. Only the owned
+                # lifecycle caller may settle this after start/stop verification;
+                # the pure parser still raises, and never publishes PASS.
+                raise _UnverifiedPytest({
+                    "outcome": "unverified", "executed": True, "passed": False,
+                    "exit_code": exit_code, "stdout": value["stdout"],
+                    "stderr": value["stderr"], "duration_ms": value["duration_ms"],
+                    "container_id": observed["container_id"],
+                    "reason": "verification_pytest_configuration_unproved",
+                })
         result = {
             "outcome": outcome,
             "executed": True,

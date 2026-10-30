@@ -212,13 +212,14 @@ class ProjectGateway:
             raise LookupError(f"Proposal not found: {prefix}")
         return proposal
 
-    async def approve_proposal(self, proposal_id: str):
+    async def approve_proposal(self, proposal_id: str, *, principal=None):
         proposal = await self._runtime.find_change_proposal(proposal_id)
         if proposal is None:
             raise LookupError(f"Proposal not found: {proposal_id}")
         return await self._runtime.approve_change_proposal(
             proposal.id,
             decided_by=self._transport,
+            principal=principal,
         )
 
     async def reject_proposal(self, proposal_id: str, *, reason: str = ""):
@@ -234,6 +235,7 @@ class ProjectGateway:
         allow_failing_tests: bool = False,
         force: bool = False,
         override_reason: str = "",
+        principal=None,
     ) -> ApplyResult:
         proposal = await self._runtime.find_change_proposal(proposal_id)
         if proposal is None:
@@ -244,6 +246,7 @@ class ProjectGateway:
             force=force,
             override_reason=override_reason,
             decided_by=self._default_user,
+            principal=principal,
         )
 
     async def rollback_proposal(self, proposal_id: str) -> ApplyResult:

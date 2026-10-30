@@ -43,6 +43,7 @@ TOOL_DENIED = "tool.denied"
 APPROVAL_REQUESTED = "approval.requested"
 APPROVAL_DECIDED = "approval.decided"
 APPROVAL_EXPIRED = "approval.expired"
+APPROVAL_REUSED = "approval.reused"
 VERIFICATION_OVERRIDDEN = "verification.overridden"
 TASK_MODE_CONFIRMED = "task.mode_confirmed"
 
@@ -102,6 +103,7 @@ EVENT_DEFINITIONS: tuple[EventDefinition, ...] = (
     EventDefinition(APPROVAL_REQUESTED, "approvals", "audit"),
     EventDefinition(APPROVAL_DECIDED, "approvals", "audit"),
     EventDefinition(APPROVAL_EXPIRED, "approvals", "audit"),
+    EventDefinition(APPROVAL_REUSED, "approvals", "audit"),
     EventDefinition(VERIFICATION_OVERRIDDEN, "approvals", "audit"),
     EventDefinition(TASK_MODE_CONFIRMED, "tasks", "audit"),
     EventDefinition(AUTH_ROLES_DISCARDED, "authorization", "audit"),

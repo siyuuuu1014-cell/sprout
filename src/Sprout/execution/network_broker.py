@@ -109,45 +109,9 @@ class NetworkBroker:
         *,
         task_id: str = "",
     ) -> NetworkResult:
-        """Stream a guarded GET response to a file without following redirects."""
-        blocked = await self._guard_url(url)
-        if blocked is not None:
-            return blocked
-        decision = await self._decide(workspace, url, ActionType.NETWORK_GET, {}, task_id)
-        if decision is not AccessDecision.ALLOW:
-            return NetworkResult(url=url, allowed=False, reason="Network GET not allowed")
-        target = Path(destination)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            async with httpx.AsyncClient(
-                timeout=self._timeout_seconds,
-                transport=self._transport,
-                follow_redirects=False,
-            ) as client:
-                async with client.stream("GET", url) as response:
-                    if response.is_redirect:
-                        return NetworkResult(
-                            url=url,
-                            allowed=False,
-                            reason=f"Download blocked: redirects to "
-                            f"{response.headers.get('location', '')}",
-                        )
-                    response.raise_for_status()
-                    with target.open("wb") as handle:
-                        async for chunk in response.aiter_bytes():
-                            handle.write(chunk)
-            return NetworkResult(
-                url=url,
-                status_code=response.status_code,
-                allowed=True,
-                body=str(target),
-            )
-        except Exception as exc:  # noqa: BLE001 - network/download errors are results
-            return NetworkResult(
-                url=url,
-                allowed=False,
-                reason=f"Download failed: {type(exc).__name__}: {exc}",
-            )
+        """Refuse until network and bounded binary file grants can be combined."""
+        return NetworkResult(url=url, allowed=False,
+                             reason="download_file_write_contract_unavailable")
 
     async def _guard_url(self, url: str) -> NetworkResult | None:
         """Return a refusal when the URL targets a non-routable address."""

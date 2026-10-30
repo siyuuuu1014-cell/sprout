@@ -167,7 +167,7 @@ def test_the_summary_is_recorded_for_the_audit_trail() -> None:
 
 
 def test_reusable_approval_is_bound_to_session_user_source_and_class() -> None:
-    """The "similar" option should skip repeats without becoming global."""
+    """The session option repeats an exact operation, never a different command."""
     import asyncio
 
     async def _run() -> tuple[bool, bool, bool, str, str]:
@@ -190,9 +190,13 @@ def test_reusable_approval_is_bound_to_session_user_source_and_class() -> None:
         await manager.store.save_approval(record)
         await manager.decide(record.id, True, decided_by="cli-user", channel="cli")
 
+        assert not await manager.is_approved(
+            "cli_tool_run", {"command": "sprout", "args": ["info"]},
+            requested_by="cli-user", source="interactive", session_id="session-1",
+        )
         same_session_same_class = await manager.is_approved(
             "cli_tool_run",
-            {"command": "sprout", "args": ["info"]},
+            first_args,
             requested_by="cli-user",
             source="interactive",
             session_id="session-1",
@@ -227,7 +231,7 @@ def test_reusable_approval_is_bound_to_session_user_source_and_class() -> None:
     assert other_session is False
     assert other_user is False
     assert session_id == "session-1"
-    assert approval_class == "sprout"
+    assert approval_class.startswith("session-exact-v1:")
 
 
 def test_the_fingerprint_is_unchanged_by_the_new_field() -> None:
@@ -323,6 +327,11 @@ def test_cli_approval_resumes_a_session_exactly_once(monkeypatch) -> None:
     from types import SimpleNamespace
 
     from Sprout.cli.commands import chat
+    from Sprout.gateway.identity import Principal
+
+    # UI/resume unit fixture, not a native Windows authentication test.
+    principal = Principal(user_id="cli-user", source="cli", authenticated=True)
+    monkeypatch.setattr(chat, "current_cli_principal", lambda: principal)
 
     manager = ApprovalManager(MemoryOperationalStore(), policy=ApprovalPolicy())
     calls = {"resume": 0}
@@ -342,6 +351,7 @@ def test_cli_approval_resumes_a_session_exactly_once(monkeypatch) -> None:
             await manager.decide(approval_id, approved, decided_by="cli-user")
 
         async def resume_pending_task(self, *_args, **_kwargs):
+            assert _kwargs["principal"] == principal
             calls["resume"] += 1
             return SimpleNamespace(content="continued", metadata={})
 
@@ -377,6 +387,11 @@ def test_chained_approvals_print_one_session_separator(monkeypatch) -> None:
     from types import SimpleNamespace
 
     from Sprout.cli.commands import chat
+    from Sprout.gateway.identity import Principal
+
+    # UI/resume unit fixture, not a native Windows authentication test.
+    principal = Principal(user_id="cli-user", source="cli", authenticated=True)
+    monkeypatch.setattr(chat, "current_cli_principal", lambda: principal)
 
     manager = ApprovalManager(MemoryOperationalStore(), policy=ApprovalPolicy())
     separators = []
@@ -396,6 +411,7 @@ def test_chained_approvals_print_one_session_separator(monkeypatch) -> None:
             await manager.decide(approval_id, approved, decided_by="cli-user")
 
         async def resume_pending_task(self, *_args, **_kwargs):
+            assert _kwargs["principal"] == principal
             self.resumes += 1
             metadata = (
                 {"approval_required": True, "approval_ids": [approvals[1].id]}

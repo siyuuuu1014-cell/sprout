@@ -21,6 +21,10 @@ class FileBoundaryError(OSError):
     """A secure resource identity could not be established; never retry loosely."""
 
 
+class ConditionalWriteRefused(FileBoundaryError):
+    """The pinned conditional primitive proved refusal before any write."""
+
+
 async def directory_entries(root: Path, target: Path, limit: int, authorize_entry):
     """Private handle-bound listing. No ordinary pathname traversal fallback.
 
@@ -79,6 +83,8 @@ def file_operation(
     root: Path, target: Path, operation: str, authorize: Callable[[], None],
     *, content: str = "", newline: str | None = None,
 ):
+    if operation == "conditional_write" and os.name != "nt":
+        raise FileBoundaryError("conditional_write_platform_unavailable")
     if os.name == "nt":
         return _windows(root, target, operation, authorize, content, newline)
     if (os.name == "posix"
@@ -95,6 +101,8 @@ def _missing(operation, authorize):
 
 
 def _stream(fd: int, operation: str, content: str, newline: str | None):
+    if operation == "conditional_write":
+        return _conditional_write_fd(fd, content)
     if operation == "snapshot":
         from Sprout.execution.file_snapshot import read_fd
 
@@ -108,6 +116,56 @@ def _stream(fd: int, operation: str, content: str, newline: str | None):
             return stream.read()
         stream.write(content)
     return True
+
+
+def _conditional_write_fd(fd, options):
+    """Private R03 primitive, not authority; caller must persist write-start first.
+
+    Windows secure-open holds no SHARE_WRITE/DELETE throughout this operation.
+    Any exception after write-start is an uncertain effect to the caller.
+    """
+    import hashlib
+
+    from Sprout.execution.file_snapshot import ResourceIdentity
+
+    if not isinstance(options, tuple) or len(options) != 4:
+        raise ConditionalWriteRefused("conditional_write_options_invalid")
+    expected, old_digest, data, check = options
+    if (type(expected) is not ResourceIdentity or type(data) is not bytes
+            or len(data) > 16 * 1024 * 1024 or not callable(check)
+            or type(old_digest) is not str or len(old_digest) != 64):
+        raise ConditionalWriteRefused("conditional_write_options_invalid")
+    before = ResourceIdentity.from_stat(os.fstat(fd))
+    if before != expected or before.size > 16 * 1024 * 1024:
+        raise ConditionalWriteRefused("conditional_write_identity_changed")
+    os.lseek(fd, 0, os.SEEK_SET)
+    old = bytearray()
+    while chunk := os.read(fd, 65536):
+        old.extend(chunk)
+        if len(old) > before.size:
+            raise ConditionalWriteRefused("conditional_write_identity_changed")
+    if (ResourceIdentity.from_stat(os.fstat(fd)) != before
+            or hashlib.sha256(old).hexdigest() != old_digest):
+        raise ConditionalWriteRefused("conditional_write_version_changed")
+    check()  # Final authority check on the same exclusive, verified handle.
+    os.lseek(fd, 0, os.SEEK_SET)
+    view = memoryview(data)
+    while view:
+        count = os.write(fd, view)
+        if count <= 0:
+            raise FileBoundaryError("conditional_write_unconfirmed")
+        view = view[count:]
+    os.ftruncate(fd, len(data))
+    os.fsync(fd)
+    os.lseek(fd, 0, os.SEEK_SET)
+    actual = bytearray()
+    while chunk := os.read(fd, 65536):
+        actual.extend(chunk)
+        if len(actual) > len(data):
+            raise FileBoundaryError("conditional_write_unconfirmed")
+    if actual != data:
+        raise FileBoundaryError("conditional_write_unconfirmed")
+    return {"sha256": hashlib.sha256(actual).hexdigest(), "size": len(actual)}
 
 
 def _posix(root, target, operation, authorize, content, newline):
@@ -408,7 +466,8 @@ def _windows(root, target, operation, authorize, content, newline):
                     raise FileBoundaryError("secure_directory_creation_refused") from None
                 _win_directory(parent, stack)
         authorize()  # Recheck before OPEN_ALWAYS may create a leaf.
-        access = {"write": 0x40000000, "read": 0x80000000, "snapshot": 0x80000000,
+        access = {"conditional_write": 0xC0000000, "write": 0x40000000,
+                  "read": 0x80000000, "snapshot": 0x80000000,
                   "delete": 0x10080, "probe": 0x80, "exists": 0x80}[operation]
         try:
             handle = _win_open(parent / relative[-1], access,
@@ -433,6 +492,7 @@ def _windows(root, target, operation, authorize, content, newline):
                     raise FileBoundaryError("handle_delete_refused")
                 return True
             fd = msvcrt.open_osfhandle(handle, os.O_BINARY | (
+                os.O_RDWR if operation == "conditional_write" else
                 os.O_WRONLY if operation == "write" else os.O_RDONLY
             ))
             handle = None  # Ownership transferred to the CRT fd.

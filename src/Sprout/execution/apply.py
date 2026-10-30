@@ -32,7 +32,9 @@ class ApplyBroker:
         *,
         approvals: ApprovalManager | None = None,
         events: EventBus | None = None,
+        runtime=None,
     ) -> None:
+        self._runtime = runtime
         self._policy = policy
         self._approvals = approvals
         self._events = events
@@ -79,8 +81,13 @@ class ApplyBroker:
         workspace: Workspace,
         *,
         scope: DelegationScope | None = None,
+        principal=None,
     ) -> ApplyResult:
-        """Execution disabled until installation, view and durable effects are trusted."""
+        """Only a live Runtime exact plan can reach conditional Workspace writes."""
+        if self._runtime is not None and proposal.id in self._runtime._local_apply_plans:
+            from Sprout.execution.apply_plan import execute
+
+            return await execute(self._runtime, proposal, workspace, principal)
         return ApplyResult(
             proposal_id=proposal.id, applied=False,
             reason="internal_apply_execution_unavailable",
