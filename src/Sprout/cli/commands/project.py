@@ -554,6 +554,8 @@ def task_create(
         "--write-path", help="Workspace-relative write target; policy still applies.")] = None,
     allow_pytest: Annotated[bool, typer.Option(
         "--allow-pytest", help="Request process.run; no approval bypass.")] = False,
+    allow_apply: Annotated[bool, typer.Option(
+        "--allow-apply", help="Request exact-plan Apply; receipt and approval required.")] = False,
     acceptance_spec: Annotated[str | None, typer.Option("--acceptance-spec")] = None,
     acceptance_test: Annotated[str | None, typer.Option("--acceptance-test")] = None,
     acceptance_demo: Annotated[str | None, typer.Option("--acceptance-demo")] = None,
@@ -583,12 +585,16 @@ def task_create(
         frozen = {"spec": AcceptanceSpec.from_payload(json.loads(
             Path(acceptance_spec).read_text(encoding="utf-8"))).to_payload(),
             "test_path": test, "demo_path": demo}
+    if allow_apply and (not writes or frozen is None):
+        raise typer.BadParameter("--allow-apply requires --write-path and frozen acceptance inputs")
     principal = current_cli_principal()
     actions = {"tool.invoke", "file.read"}
     if writes:
         actions.add("file.write")
     if allow_pytest:
         actions.add("process.run")
+    if allow_apply:
+        actions.update({"file.apply", "git.diff"})
     scope = (DelegationScope(allowed_paths=tuple(dict.fromkeys((*inputs, *writes))),
         allowed_actions=frozenset(actions), issued_by=principal.source+":"+principal.user_id)
         if inputs else None)
@@ -626,13 +632,69 @@ def task_confirm_mode(
 def task_run(
     task_id: Annotated[str, typer.Argument(help="Task id.")],
     config: Annotated[str | None, typer.Option("--config", help="Path to sprout.toml.")] = None,
+    review_apply: Annotated[bool, typer.Option(
+        "--review-apply", help="Review one live Local Apply Plan before exiting.")] = False,
+    git_executable: Annotated[str | None, typer.Option("--git-executable")] = None,
+    git_sha256: Annotated[str | None, typer.Option("--git-sha256")] = None,
 ) -> None:
-    """Run a project task through the execution graph."""
+    """Run the graph; optionally review one exact plan before this Runtime exits."""
+    if review_apply and (not git_executable or not git_sha256):
+        raise typer.BadParameter(
+            "--review-apply requires Host-pinned --git-executable/--git-sha256")
     gateway = _gateway(config)
 
     async def run() -> None:
-        result = await gateway.run_task(task_id)
-        typer.echo(f"{result.task_id}  {result.status}")
+        if not review_apply:
+            result = await gateway.run_task(task_id)
+            typer.echo(f"{result.task_id}  {result.status}")
+            return
+        from Sprout.gateway.task_queries import TaskQueries
+
+        principal = current_cli_principal()
+        runtime = gateway._runtime
+        try:
+            await TaskQueries(runtime)._owned_task(task_id, principal)
+            import tempfile
+
+            parent = tempfile.mkdtemp(prefix="sprout-g1-")
+            typer.echo(f"Git review evidence: {parent}")
+            await runtime.configure_local_git_review(task_id, principal,
+                executable=git_executable, executable_sha256=git_sha256, export_parent=parent)
+            result = await gateway.run_task(task_id)
+            typer.echo(f"{result.task_id}  {result.status}")
+            proposals = await gateway.list_changes(task_id)
+            eligible = [p for p in proposals if p.id in runtime._local_apply_plans]
+            if len(eligible) != 1:
+                typer.echo("No live complete Local Apply Plan; no write performed.")
+                report = await runtime.get_task_execution_report(task_id)
+                for node in report["nodes"]:
+                    if node.get("reason") or node.get("error"):
+                        typer.echo(str(node.get("reason") or node["error"]))
+                return
+            proposal = eligible[0]
+            body = proposal.metadata["apply_plan"]
+            typer.echo(f"Proposal: {proposal.id}")
+            typer.echo(f"Workspace: {body['workspace_id']}  {body['target']}")
+            typer.echo(f"Plan SHA256: {proposal.metadata['apply_plan_sha256']}")
+            for item in body["files"]:
+                typer.echo(f"{item['path']}: {item['before']} -> {item['after']}")
+            for diff in proposal.diffs:
+                render_diff(diff.path, diff.diff_text)
+            content = proposal.metadata.get("content_diff")
+            if content:
+                typer.echo("Exact Workspace replacement (content snapshots; not Git output):")
+                render_diff("workspace_replacement", content["text"])
+            if not typer.confirm("Approve this entire exact Apply Plan?", default=False):
+                typer.echo("Not approved; no Apply write performed.")
+                return
+            updated = await gateway.approve_proposal(proposal.id, principal=principal)
+            typer.echo(f"proposal_status={updated.status.value}")
+            report = await runtime.get_task_execution_report(task_id)
+            for node in report["nodes"]:
+                if node.get("type") == "apply":
+                    typer.echo(json.dumps(node, ensure_ascii=False, default=str))
+        finally:
+            await runtime.stop()
 
     _run(run())
 
@@ -781,6 +843,7 @@ def apply(
         proposal = await _resolve_proposal(gateway, proposal_id)
         result = await gateway.apply_proposal(
             proposal.id,
+            principal=current_cli_principal(),
             allow_failing_tests=allow_failing_tests,
             force=force,
             override_reason=override_reason,
@@ -822,7 +885,7 @@ def approve(
 
     async def run() -> None:
         proposal = await _resolve_proposal(gateway, proposal_id)
-        updated = await gateway.approve_proposal(proposal.id)
+        updated = await gateway.approve_proposal(proposal.id, principal=current_cli_principal())
         typer.echo(f"approved={updated.status.value}")
 
     _run(run())

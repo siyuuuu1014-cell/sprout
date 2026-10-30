@@ -68,6 +68,7 @@ async def test_diagnostic_survives_failure_and_cancel(tmp_path, monkeypatch, can
     issuer._metadata_or_raise = lambda: SimpleNamespace(
         get_execution_node=AsyncMock(return_value=node)
     )
+    issuer._git_review_state = lambda task_id: issuer._verification_hosts.get(task_id)
     frame.runtime = issuer
     binding = SimpleNamespace(parent=tmp_path, parent_identity="unit")
 
@@ -126,6 +127,7 @@ async def test_spawn_cancel_without_handle_stays_unconfirmed(tmp_path, monkeypat
         _verification_hosts={"task": {"git_active": active}}, _git_review_record=AsyncMock()
     )
     command_records(issuer, frame, active)
+    issuer._git_review_state = lambda task_id: issuer._verification_hosts.get(task_id)
     frame.runtime = issuer
     broker = SimpleNamespace(_authorize_review=AsyncMock(), _check_review_policy=lambda *a: None)
 
@@ -177,6 +179,7 @@ async def test_command_capture_timeout_and_reap_failure_remain_unknown(tmp_path,
         _verification_hosts={"task": {"git_active": active}}, _git_review_record=AsyncMock()
     )
     command_records(issuer, frame, active)
+    issuer._git_review_state = lambda task_id: issuer._verification_hosts.get(task_id)
     frame.runtime = issuer
     broker = SimpleNamespace(_authorize_review=AsyncMock(), _check_review_policy=lambda *a: None)
 
@@ -262,6 +265,7 @@ async def test_owned_handle_survives_cancellation(tmp_path, monkeypatch, mode):
         _verification_hosts={"task": {"git_active": active}}, _git_review_record=AsyncMock()
     )
     command_records(issuer, frame, active)
+    issuer._git_review_state = lambda task_id: issuer._verification_hosts.get(task_id)
     frame.runtime = issuer
     broker = SimpleNamespace(_authorize_review=AsyncMock(), _check_review_policy=lambda *a: None)
     spawn_entered, release_spawn, wait_entered, release_wait = [asyncio.Event() for _ in range(4)]
@@ -381,6 +385,7 @@ async def test_revocation_before_native_spawn_has_zero_effect(tmp_path, monkeypa
         return node
 
     store.get_execution_node = revoke
+    issuer._git_review_state = lambda task_id: issuer._verification_hosts.get(task_id)
     frame.runtime = issuer
     broker = SimpleNamespace(_authorize_review=AsyncMock(), _check_review_policy=lambda *a: None)
 

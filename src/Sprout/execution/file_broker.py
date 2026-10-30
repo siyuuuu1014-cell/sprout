@@ -44,6 +44,7 @@ class FileBroker:
         self._classify_overrides = dict(classify_overrides or {})
         self._events = events
         self._approvals = approvals
+        self._apply_resolver = None  # Installed only by the trusted Apply coordinator.
 
     def _classify(self, target: Path, sandbox: SandboxRef) -> ResourceKind:
         return classify(
@@ -422,6 +423,160 @@ class FileBroker:
                                        content=content, newline=newline)
         return FileResult(path=str(relative_path), wrote=ok, resource_kind=kind.value,
                           reason="" if ok else value)
+
+    async def _local_receipt_snapshot(self, scope, sandbox, path, *, pin_stack=None):
+        """Only the live Local EVALUATION owner can capture a registered input."""
+        import os
+        from dataclasses import asdict
+        from threading import Event
+
+        from Sprout.execution.file_snapshot import _ReadOptions, checked_snapshot
+        from Sprout.tools.context_keys import _current_project_node
+
+        if os.name != "nt" or scope is not _current_project_node():
+            raise PermissionError("local_receipt_frame_unavailable")
+        task, workspace = await scope.runtime._project_analysis_subject(scope)
+        registered = scope.runtime._frozen_sandboxes.get(task.id)
+        if (scope.node.type.value != "evaluation" or not registered
+                or registered[0] is not sandbox or scope.runtime._file_broker is not self
+                or path not in task.metadata.get("required_paths", ())):
+            raise PermissionError("local_receipt_source_unavailable")
+        target = self._safe_target(sandbox, path)
+        if target is None:
+            raise PermissionError("local_receipt_path_denied")
+        request = ActionRequest(task_id=task.id, actor=task.actor, action=ActionType.FILE_READ,
+            scope=task.delegation_scope.bind_paths(str(sandbox.root)),
+            resource=ResourceRef(workspace.id, target.as_posix(),
+                                 kind=self._classify(target, sandbox)))
+
+        def authorize():
+            if (request.scope.is_expired()
+                    or not request.scope.permits("file.read", target.as_posix())
+                    or self._policy.decide(request).decision is not AccessDecision.ALLOW):
+                raise PermissionError("local_receipt_read_denied")
+
+        decision = self._policy.decide(request)
+        await emit_policy_decision(self._events, request, decision)
+        authorize()
+        if pin_stack is not None:
+            from Sprout.execution import file_access
+
+            # Attributes-only handles do not exclude Windows data writers.
+            # Hold actual READ custody after Policy/Scope, through settlement.
+            handle = file_access._win_open(target, 0x80000000)
+            pin_stack.callback(file_access._kernel().CloseHandle, handle)
+            file_access._win_name(handle, target)
+            info = file_access._win_info(handle)
+            if info.attributes & 0x10 or info.links != 1:
+                raise PermissionError("local_receipt_input_not_regular")
+            authorize()
+        result = file_operation(sandbox.root, target, "snapshot", authorize,
+                                content=_ReadOptions(100_000, None, Event(), authorize))
+        result = checked_snapshot(result, 100_000, None)
+        if not result.ok:
+            raise PermissionError("local_receipt_snapshot_unproved")
+        await scope.runtime._project_analysis_subject(scope)
+        return {"path": path, "identity": asdict(result.identity), "sha256": result.digest}
+
+    async def _apply_snapshot(self, permit):
+        """Coordinator-only exact source/target capture, never a public read grant."""
+        from threading import Event
+
+        from Sprout.execution.file_snapshot import _ReadOptions, checked_snapshot
+
+        if self._apply_resolver is None:
+            raise PermissionError("apply_coordinator_unavailable")
+        request, root, path, _, _, _ = await self._apply_resolver(permit)
+        target = root.root / path
+        if (request.action is not ActionType.FILE_READ or not request.actor.authenticated
+                or request.resource.path != target.as_posix()
+                or request.resource.kind != classify(target, workspace_root=root.root,
+                                                     overrides=self._classify_overrides)):
+            raise PermissionError("apply_snapshot_binding_invalid")
+
+        def authorize():
+            if (request.scope.is_expired()
+                    or not request.scope.permits("file.read", target.as_posix())
+                    or self._policy.decide(request).decision is not AccessDecision.ALLOW):
+                raise PermissionError("apply_snapshot_denied")
+
+        await emit_policy_decision(self._events, request, self._policy.decide(request))
+        authorize()
+        result = file_operation(root.root, target, "snapshot", authorize,
+                                content=_ReadOptions(100_000, None, Event(), authorize))
+        result = checked_snapshot(result, 100_000, None)
+        if not result.ok:
+            raise PermissionError("apply_snapshot_unconfirmed")
+        await self._apply_resolver(permit)
+        return result
+
+    async def _conditional_apply_write(self, permit):
+        """Host-only adapter; resolver must be the registered Apply coordinator.
+
+        Not registered as a tool. The coordinator supplies the opaque permit,
+        authoritative subject and a durable write-start, never model arguments.
+        Until that coordinator exists no public Apply entry calls this method.
+        """
+        import hashlib
+        import os
+
+        from Sprout.execution.file_snapshot import ResourceIdentity
+        from Sprout.workspace.authorized_content import relative_label
+
+        if os.name != "nt":
+            raise PermissionError("conditional_apply_platform_unavailable")
+        resolve = self._apply_resolver
+        if resolve is None:
+            raise PermissionError("conditional_apply_coordinator_unavailable")
+        record = await resolve(permit)
+        request, workspace, path, identity, old_sha, data = record
+        path = relative_label(path)
+        target = workspace.root / path
+        if (type(request) is not ActionRequest or not request.actor.authenticated
+                or not request.actor.source or not request.task_id
+                or request.action not in {ActionType.FILE_WRITE, ActionType.FILE_APPLY}
+                or request.resource is None or request.resource.workspace_id != workspace.id
+                or request.resource.path != target.as_posix()
+                or request.resource.kind != classify(
+                    target, workspace_root=workspace.root, overrides=self._classify_overrides)
+                or type(identity) is not ResourceIdentity or type(data) is not bytes):
+            raise PermissionError("conditional_apply_subject_invalid")
+        expected = (request, workspace, path, identity, old_sha, data)
+        # Policy remains authoritative. SANDBOX_ONLY is not host-write authority.
+        decision = self._policy.decide(request)
+        await emit_policy_decision(self._events, request, decision)
+        acceptable = ({AccessDecision.ALLOW, AccessDecision.REQUIRE_APPROVAL}
+                      if request.action is ActionType.FILE_APPLY else {AccessDecision.ALLOW})
+        if (decision.decision not in acceptable
+                or not request.scope.permits(request.action.value, target.as_posix())
+                or request.scope.is_expired()):
+            raise PermissionError("conditional_apply_policy_denied")
+        if await resolve(permit) != expected:
+            raise PermissionError("conditional_apply_binding_changed")
+
+        def authorize():
+            from dataclasses import replace
+
+            denied_write = (request.action is ActionType.FILE_APPLY and (
+                not request.scope.permits("file.write", target.as_posix())
+                or self._policy.decide(replace(request, action=ActionType.FILE_WRITE)).decision
+                is AccessDecision.DENY))
+            if (denied_write or request.scope.is_expired()
+                    or not request.scope.permits(request.action.value, target.as_posix())
+                    or self._policy.decide(request).decision not in acceptable):
+                from Sprout.execution.file_access import ConditionalWriteRefused
+
+                raise ConditionalWriteRefused("conditional_apply_authorization_changed")
+
+        # Synchronous bounded native call: no worker may outlive cancellation.
+        # Coordinator must record write-start BEFORE this call and settle any
+        # exception as UNKNOWN unless independent no-write proof exists.
+        result = file_operation(workspace.root, target, "conditional_write", authorize,
+                                content=(identity, old_sha, data, authorize))
+        if (result != {"sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}
+                or await resolve(permit) != expected):
+            raise PermissionError("conditional_apply_result_unconfirmed")
+        return result
 
     async def read_text(
         self,

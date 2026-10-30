@@ -94,6 +94,12 @@ class PolicyEngine:
             )
         if request.action is ActionType.FILE_READ:
             return self._read_decision(kind)
+        if request.action is ActionType.FILE_APPLY:
+            if kind in _WRITE_DENIED_KINDS:
+                return _decision(AccessDecision.DENY, "Apply classification denied",
+                                 "matrix:file.apply:classification")
+            return _decision(AccessDecision.REQUIRE_APPROVAL,
+                             "Exact Apply Plan approval required", "matrix:file.apply")
         if request.action is ActionType.FILE_WRITE:
             return self._write_decision(kind)
         if request.action is ActionType.FILE_DELETE:

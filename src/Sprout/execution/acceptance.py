@@ -287,7 +287,8 @@ def _local_acceptance_main():
                                   ".".join(pieces[:i]) for i in range(1, len(pieces))))):
                         evidence["category"] = "target_module_not_implemented"
 
-        exit_code = int(pytest.main(["-q", nodeid], plugins=[Observer()]))
+        exit_code = int(pytest.main(["-q", "--rootdir=" + str(root),
+                                   "--confcutdir=" + str(root), nodeid], plugins=[Observer()]))
         if not unchanged():
             evidence["category"] = "unknown"
         if exit_code not in (0, 1):

@@ -35,6 +35,19 @@ class Intent(StrEnum):
 
 DEFAULT_INTENT = Intent.CONVERSATION
 
+
+def capability_question(text: str) -> bool:
+    """Narrow resource-free product questions, never a project inspection request."""
+    value = text.strip().casefold().rstrip("?？。!！")
+    if any(term in value for term in ("/", "\\", "`", "\n", "项目", "仓库", "文件",
+                                      "project", "repo", "file", "扫描", "统计")):
+        return False
+    return bool(re.fullmatch(
+        r"(?:你|sprout)(?:能做什么|会做什么|有哪些功能|支持什么|可以做什么|有什么能力)"
+        r"|(?:你|sprout)(?:能|会|可以|支持)(?:编程|写代码|生成代码|运行测试)吗?"
+        r"|(?:what can (?:you|sprout) do|what (?:are your|is sprout's) capabilities)"
+        r"|can (?:you|sprout) (?:code|write code|run tests)", value))
+
 #: intent -> the ``intent.*.requested`` event it triggers.
 INTENT_EVENTS: dict[Intent, str] = {
     Intent.CONVERSATION: INTENT_CONVERSATION_REQUESTED,

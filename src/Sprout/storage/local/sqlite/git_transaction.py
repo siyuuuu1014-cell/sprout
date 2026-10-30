@@ -138,6 +138,9 @@ async def begin_commit_write(db, transaction_id, owner):
 
 
 async def finish_transaction(db, transaction_id, owner, state, result):
+    current_record = await get_transaction(db, transaction_id)
+    if current_record is not None and current_record.get("operation") == "apply_v1":
+        return False  # Ordinary Apply can only settle through its versioned CAS.
     if state not in {"completed", "uncertain"}:
         raise ValueError("Git settlement must be completed or uncertain; no reset or release")
     if state == "completed":

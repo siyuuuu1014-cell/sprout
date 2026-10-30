@@ -525,6 +525,18 @@ async def _repl(
         if _handle_natural_language_request(content):
             continue
         if content.startswith("/"):
+            if content == "/permissions":
+                from Sprout.cli.commands.security import session_permission_inventory
+
+                try:
+                    permissions = await session_permission_inventory(
+                        runtime, session_id=session,
+                        principal=current_cli_principal() if session else None)
+                except PermissionError as error:
+                    typer.echo(ui.warning(str(error)))
+                    continue
+                typer.echo(json.dumps(permissions, ensure_ascii=False, indent=2))
+                continue
             if content in {"/", "/help"}:
                 if content == "/help":
                     _show_slash_directory()
@@ -1335,7 +1347,8 @@ def _approval_action_lines(record: Any, pending: object) -> list[str]:
 def _print_approval_record(record: Any, pending: object = ()) -> None:
     typer.echo("")
     typer.echo(ui.text(_approval_text("title"), bold=True))
-    scope = "similar_scope" if getattr(record, "approval_class", "") else "exact_scope"
+    scope = ("similar_scope" if getattr(record, "approval_class", "")
+             and getattr(record, "session_id", "") else "exact_scope")
     rows = _approval_detail_rows(record)
     rows.extend(
         (_approval_text("action"), line)
@@ -1345,7 +1358,17 @@ def _print_approval_record(record: Any, pending: object = ()) -> None:
         _approval_text("scope"),
         _approval_text(scope, command=_approval_command(record)),
     ))
-    rendered = [f"{label}  {value or '-'}" for label, value in rows]
+    from rich.ansi import AnsiDecoder
+
+    available = max(20, shutil.get_terminal_size(fallback=(80, 24)).columns - 4)
+    console = Console(width=available, color_system=None)
+    rendered = []
+    for label, value in rows:
+        if not value or value == "-":
+            continue
+        # Literal text, never Rich markup. Strip control sequences before measuring.
+        clean = " ".join(part.plain for part in AnsiDecoder().decode(f"{label}  {value}"))
+        rendered.extend(part.plain for part in Text(clean).wrap(console, available))
     width = max((cell_len(line) for line in rendered), default=0)
     typer.echo("+" + "-" * (width + 2) + "+")
     for line in rendered:
@@ -1376,7 +1399,7 @@ def _approval_detail_rows(record: Any) -> list[tuple[str, str]]:
 
 async def _prompt_approval_decision(record: Any) -> str:
     choices = [questionary.Choice(_approval_text("yes_once"), "approve_once")]
-    if getattr(record, "approval_class", ""):
+    if getattr(record, "approval_class", "") and getattr(record, "session_id", ""):
         choices.append(
             questionary.Choice(_approval_text("yes_similar"), "approve_similar")
         )
@@ -1428,9 +1451,9 @@ _APPROVAL_TEXT: dict[str, dict[str, str]] = {
         "pt": "Permitir esta operação: {tool}?",
     },
     "yes_once": {
-        "zh": "Yes，只为本轮对话",
+        "zh": "仅本次操作",
         "zh-Hant": "Yes，僅限本輪對話",
-        "en": "Yes, this turn only",
+        "en": "This operation only",
         "ja": "Yes、このターンのみ",
         "ko": "Yes, 이번 대화만",
         "ru": "Yes, только для этого хода",
@@ -1438,9 +1461,9 @@ _APPROVAL_TEXT: dict[str, dict[str, str]] = {
         "pt": "Yes, somente esta rodada",
     },
     "yes_similar": {
-        "zh": "Yes，整个此类都同意",
-        "zh-Hant": "Yes，同類全部同意",
-        "en": "Yes, allow this similar class",
+        "zh": "当前Session，相同命令与资源",
+        "zh-Hant": "目前Session，相同命令與資源",
+        "en": "This session, same operation and resources",
         "ja": "Yes、この同種の操作を許可",
         "ko": "Yes, 같은 유형 허용",
         "ru": "Yes, разрешить этот похожий класс",
@@ -1458,10 +1481,11 @@ _APPROVAL_TEXT: dict[str, dict[str, str]] = {
         "pt": "No, negar",
     },
     "similar_scope": {
-        "zh": "说明：{command} 同类授权仅适用于当前任务和会话，不是全局授权。",
+        "zh": ("说明：{command} 仅复用当前Session、相同主体的相同命令、参数与资源授权。"
+               "Task权限仍逐次核验。"),
         "zh-Hant": "說明：{command} 同類授權僅適用於目前任務和對話，不是全域授權。",
         "en": (
-            "Note: {command} class approval covers this task and session; "
+            "Note: {command}, same session, principal, exact arguments and resources; "
             "it is not a global grant."
         ),
         "ja": (
@@ -2125,6 +2149,7 @@ _SLASH_ROWS = [
     ("/remote", "远程操作", "Remote operations"),
     ("/evolution", "成长平面", "Evolution"),
     ("/approvals", "审批操作", "Approvals"),
+    ("/permissions", "当前工具权限与审批范围", "Effective tool gates and approval scope"),
     ("/audit", "审计验证", "Audit verification"),
     ("/serve", "启动 Web 控制台", "Start web console"),
     ("/web", "打开 Web 控制台", "Open web console"),

@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 from uuid import uuid4
 
 from Sprout.events import APPROVAL_DECIDED, APPROVAL_EXPIRED, APPROVAL_REQUESTED, Event, EventBus
+from Sprout.events.catalog import APPROVAL_REUSED
 from Sprout.task.models import UNATTENDED_SOURCES, TaskSource, coerce_source
 
 if TYPE_CHECKING:
@@ -268,6 +269,18 @@ class ApprovalManager:
         )
         return str(self._commands.class_key(argv))
 
+    def session_key_for(self, tool: str, arguments: Mapping[str, Any]) -> str:
+        """Exact operation identity, excluding only the envelope event identifier.
+
+        Only CLI handoffs currently provide a server-pinned command/cwd/env.
+        Frozen verification, MCP and Proposal grants keep their existing contracts.
+        """
+        if tool != "cli_tool_run":
+            return ""
+        return "session-exact-v1:" + self.fingerprint({
+            "tool": tool, "arguments": {k: v for k, v in arguments.items() if k != "event_id"},
+        })
+
     def mode_for(self, source: str | TaskSource | None) -> ApprovalMode:
         return self._policy.mode_for(source)
 
@@ -304,7 +317,8 @@ class ApprovalManager:
             action_summary=self.describe(arguments),
             source=coerce_source(source).value,
             session_id=session_id,
-            approval_class=self.class_key_for(tool, arguments),
+            approval_class=(self.session_key_for(tool, arguments) if session_id
+                            else self.class_key_for(tool, arguments)),
         )
         await self._store.save_approval(record)
         if request_approval:
@@ -361,7 +375,7 @@ class ApprovalManager:
         candidate = await self._store.find_approval(
             tool, self.fingerprint(arguments), ApprovalStatus.APPROVED, task_id
         )
-        class_key = self.class_key_for(tool, arguments)
+        class_key = self.session_key_for(tool, arguments) if session_id else ""
         if candidate is None and class_key and (session_id or task_id):
             candidate = await self._store.find_reusable_approval(
                 tool,
@@ -394,6 +408,13 @@ class ApprovalManager:
                     record, ApprovalStatus.APPROVED
                 ):
                     return False
+            else:
+                await self._emit(APPROVAL_REUSED, {
+                    "approval_id": record.id, "task_id": task_id,
+                    "session_id": session_id, "requested_by": requested_by,
+                    "source": source, "resource_scope": resource_scope,
+                    "arguments_fingerprint": self.fingerprint(arguments),
+                })
             return True
 
     def _consume_lock(self, approval_id: str) -> asyncio.Lock:
@@ -423,7 +444,7 @@ class ApprovalManager:
         record = await self._store.find_approval(
             tool, self.fingerprint(arguments), ApprovalStatus.APPROVED, task_id
         )
-        class_key = self.class_key_for(tool, arguments)
+        class_key = self.session_key_for(tool, arguments) if session_id else ""
         if record is None and class_key and (session_id or task_id):
             record = await self._store.find_reusable_approval(
                 tool,
@@ -438,15 +459,18 @@ class ApprovalManager:
         if record is None:
             return None
         if record.task_id and record.task_id != task_id:
-            return None
+            if (record.single_use or not session_id
+                    or not class_key.startswith("session-exact-v1:")
+                    or record.approval_class != class_key):
+                return None
         scoped_to_session = bool(record.session_id)
         if scoped_to_session and record.session_id != session_id:
             return None
-        if scoped_to_session and record.requested_by and record.requested_by != requested_by:
+        if scoped_to_session and record.requested_by != requested_by:
             return None
-        if scoped_to_session and record.source and record.source != coerce_source(source).value:
+        if scoped_to_session and record.source != coerce_source(source).value:
             return None
-        if scoped_to_session and record.resource_scope and record.resource_scope != resource_scope:
+        if scoped_to_session and record.resource_scope != resource_scope:
             return None
         if record.expires_at is not None and record.expires_at <= datetime.now(UTC):
             record.status = ApprovalStatus.EXPIRED

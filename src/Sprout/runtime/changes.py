@@ -55,7 +55,9 @@ class ChangeProposalService:
         events: EventBus | None = None,
         approvals: ApprovalManager | None = None,
         local_acceptance: bool = True,
+        runtime=None,
     ) -> None:
+        self._runtime = runtime
         self._metadata = metadata
         self._events = events
         self._apply_broker = apply_broker
@@ -92,9 +94,15 @@ class ChangeProposalService:
         return await self._save(replace(proposal, status=ChangeProposalStatus.PENDING))
 
     async def approve(
-        self, proposal_id: str, *, decided_by: str = "cli"
+        self, proposal_id: str, *, decided_by: str = "cli", principal=None
     ) -> ChangeProposal:
         proposal = await self._require(proposal_id)
+        if "apply_plan" in proposal.metadata:
+            if self._runtime is None:
+                raise PermissionError("local_apply_runtime_required")
+            from Sprout.execution.apply_plan import approve
+
+            return await approve(self._runtime, proposal_id, principal)
         if proposal.status is not ChangeProposalStatus.PENDING:
             raise ValueError(
                 f"Proposal {proposal.id} cannot be approved from {proposal.status.value}"
@@ -135,9 +143,25 @@ class ChangeProposalService:
 
     async def apply(
         self, proposal_id: str, *, allow_failing_tests: bool = False,
-        force: bool = False, override_reason: str = "", decided_by: str = "cli",
+        force: bool = False, override_reason: str = "", decided_by: str = "cli", principal=None,
     ) -> ApplyResult:
         proposal = await self._require(proposal_id)
+        if "apply_plan" in proposal.metadata:
+            if self._runtime is None or force or allow_failing_tests:
+                return ApplyResult(proposal.id, False, "local_apply_no_override_or_fallback")
+            from Sprout.execution.apply_plan import current_plan
+
+            await current_plan(self._runtime, proposal_id, principal)
+            blocker = proposal_verification_blocker(proposal)
+            if (blocker or proposal.metadata.get("review_only") is not False
+                    or proposal.metadata.get("change_coverage", {}).get("status")
+                    != "complete_for_apply_plan"):
+                return ApplyResult(proposal.id, False, blocker or "local_apply_incomplete_plan")
+            workspace = await self._task_workspace(proposal.task_id)
+            result = await self._apply_broker.apply(proposal, workspace, principal=principal)
+            if result.applied:
+                await self._save(replace(proposal, status=ChangeProposalStatus.APPLIED))
+            return result
         task = await self._metadata.get_task(proposal.task_id)
         if task is None:
             raise LookupError("Proposal task not found")

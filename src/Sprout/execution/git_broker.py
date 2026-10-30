@@ -105,7 +105,7 @@ class GitBroker:
             return GitResult(action="diff", allowed=False, reason="git_subject_unavailable")
         try:
             task, registered = await frame.runtime._project_analysis_subject(frame)
-            binding = frame.runtime._verification_hosts.get(task.id, {}).get("git")
+            binding = (frame.runtime._git_review_state(task.id) or {}).get("git")
             if workspace != registered or scope != task.delegation_scope:
                 raise PermissionError("git_subject_or_selection_changed")
             selected = tuple(relative_label(p) for p in (

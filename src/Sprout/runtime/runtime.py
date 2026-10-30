@@ -338,6 +338,12 @@ class Runtime:
         self._project_manifest_tools = WeakKeyDictionary()
         # Live issuance receipts; side records require completed-owner checks
         # and fresh resource capture before they may enter this local registry.
+        self._local_receipt_candidates = {}
+        self._local_receipt_plans = {}
+        self._local_acceptance_receipts = {}
+        self._local_apply_plans = {}
+        self._local_apply_permits = {}
+        self._local_git_reviews = {}
         self._node_products = {}
         self._node_publications = {}
         self._node_tool_scopes = WeakKeyDictionary()
@@ -408,8 +414,10 @@ class Runtime:
             approvals=self._approvals,
             classify_overrides=security.classify_overrides if security is not None else {},
         )
+        self._file_broker._apply_resolver = self._resolve_local_apply_resource
         self._apply_broker = ApplyBroker(
             self._policy_engine,
+            runtime=self,
             approvals=self._approvals,
         )
         self._network_broker = NetworkBroker(
@@ -589,6 +597,23 @@ class Runtime:
             raise RuntimeError("MetadataStore is not configured")
         return metadata
 
+    async def _resolve_local_apply_resource(self, permit):
+        from Sprout.execution.apply_plan import resolve_resource
+
+        return await resolve_resource(self, permit)
+
+    async def _prepare_local_apply_proposal(self, scope):
+        from Sprout.execution.apply_plan import publish
+
+        output = await publish(self, scope)
+        state = self._local_git_reviews.get(scope.task.id)
+        if state is not None:
+            from Sprout.execution.node_result_source import payload_digest
+
+            state["publication_candidate"] = (
+                scope.node.id, scope.guard_owner, payload_digest(output))
+        return output
+
     def _changes(self, *, local_acceptance: bool | None = None) -> ChangeProposalService:
         """The change proposal state machine; built per call, it holds no state."""
         return ChangeProposalService(
@@ -597,6 +622,7 @@ class Runtime:
             self._apply_broker,
             events=self.events,
             approvals=self._approvals,
+            runtime=self,
             local_acceptance=(not isinstance(
                 self._orchestrator_backend, TemporalOrchestratorBackend)
                 and not getattr(self, "_isolated_coding_required", False)
@@ -738,6 +764,10 @@ class Runtime:
                 sandbox, scope.node.id, scope.guard_owner, pin.identity)
         if task.id in self._verification_hosts:
             await self._freeze_verification_oracles(scope)
+        elif task.id in self._local_git_reviews:
+            from Sprout.execution.local_git_review import capture_source
+
+            await capture_source(self, scope, sandbox)
 
     async def bind_task_verification(self, task_id, principal, *, paths, export_parent,
                                      images, source_digests, discovery=None, tools=None,
@@ -756,6 +786,7 @@ class Runtime:
                 or principal.authenticated is not True or task.source != principal.source
                 or not principal.user_id or not principal.source
                 or task.execution_mode != "code" or task.id in self._verification_hosts
+                or task.id in self._local_git_reviews
                 or await self._metadata_or_raise().list_execution_nodes(task.id)):
             raise PermissionError("verification_host_binding_denied")
         workspace = await self._metadata_or_raise().get_workspace(task.workspace_id)
@@ -800,9 +831,30 @@ class Runtime:
             "docker": deepcopy(docker),
         }
 
+    def _git_review_state(self, task_id):
+        # Data/custody lookup only. _git_review_record grants fresh authority.
+        state = self._verification_hosts.get(task_id)
+        if state is None:
+            state = self._local_git_reviews.get(task_id)
+        return state
+
+    async def configure_local_git_review(self, task_id, principal, *, executable,
+                                         executable_sha256, export_parent, chain=()):
+        from Sprout.execution.local_git_review import configure
+
+        return await configure(self, task_id, principal, executable=executable,
+            executable_sha256=executable_sha256, export_parent=export_parent, chain=chain)
+
     async def bind_task_git_view(self, task_id, principal, *, executable, executable_sha256,
-                                 baseline, metadata_root, paths, common_root=None, chain=()):
+                                 baseline, metadata_root, paths, common_root=None, chain=(),
+                                 local_receipt=None):
         """Python Host only; never exposed through message metadata or a model tool."""
+        if local_receipt is not None:
+            from Sprout.execution.local_git_review import bind
+
+            return await bind(self, task_id, principal, receipt=local_receipt,
+                executable=executable, executable_sha256=executable_sha256, baseline=baseline,
+                metadata_root=metadata_root, common_root=common_root, paths=paths, chain=chain)
         import re
         from pathlib import Path
 
@@ -872,10 +924,12 @@ class Runtime:
         if type(binding) is not _ReviewView:
             raise PermissionError("git_view_binding_required")
         task, workspace = await self._project_analysis_subject(frame)
-        host = self._verification_hosts.get(task.id)
+        host = self._git_review_state(task.id)
+        local = task.id in self._local_git_reviews
         registered = self._frozen_sandboxes.get(task.id)
         if (getattr(self, "_verification_stopping", False) or frame is not _current_project_node()
-                or frame.node.type not in {NodeType.EVALUATION, NodeType.APPROVAL}
+                or frame.node.type not in ({NodeType.APPROVAL, NodeType.APPLY} if local
+                    else {NodeType.EVALUATION, NodeType.APPROVAL})
                 or broker is not self._git_broker or host is None or host.get("git") is not binding
                 or registered is None or registered[0] is not binding.sandbox
                 or registered[3] != binding.root_identity or task.delegation_scope.is_expired()
@@ -883,6 +937,10 @@ class Runtime:
                     "scope": scope_digest(task.delegation_scope),
                     "session": task.metadata.get("session_id")})):
             raise PermissionError("git_current_binding_denied")
+        if local:
+            from Sprout.execution.local_git_review import authorize
+
+            await authorize(self, host, frame, task, workspace)
         from Sprout.execution.node_result_source import payload_digest
 
         producer = await self._metadata_or_raise().get_execution_node(registered[1])
@@ -2566,6 +2624,9 @@ class Runtime:
         for record in tuple(self._node_products.values()):
             if len(record) == 7 and record[5] is self:
                 await save(record[6])  # Store CAS requires the exact completed owner/output.
+        from Sprout.execution.local_receipt import settle
+
+        await settle(self)
 
     async def _load_node_product(self, scope, node):
         from Sprout.execution.node_result_source import payload_digest
@@ -2736,6 +2797,11 @@ class Runtime:
             self._record_security("approval.swept_at_startup", {"count": swept})
 
     async def stop(self) -> None:
+        from Sprout.execution.apply_plan import release as release_apply
+        from Sprout.execution.local_receipt import release
+
+        release_apply(self)
+        release(self)
         # Preserve stop-only custody until native owners finish their bounded
         # cancellation handlers. New business preparations are already denied.
         self._verification_stopping = True
@@ -2743,7 +2809,16 @@ class Runtime:
                   if p["owner"] is not asyncio.current_task()}
         for owner in owners:
             owner.cancel()
-        operations = set(owners)
+        git_owners = {s["git_active"]["owner"] for s in self._local_git_reviews.values()
+                      if s.get("git_active")
+                      and s["git_active"]["owner"] is not asyncio.current_task()}
+        for owner in git_owners:
+            owner.cancel()
+        operations = set(owners) | git_owners
+        for state in self._local_git_reviews.values():
+            for custody in state.get("git_active", {}).get("processes", {}).values():
+                operations.update(t for t in (custody.get("spawn"), custody.get("cleanup"))
+                                  if t is not None and not t.done())
         for preparation in getattr(self, "_verification_preparations", {}).values():
             native = preparation.get("native", {})
             operations.update(t for t in native.get("pending_operations", ()) if not t.done())
@@ -2755,6 +2830,13 @@ class Runtime:
             _, pending = await asyncio.wait(operations, timeout=30)
         retained = [p for p in getattr(self, "_verification_preparations", {}).values()
                     if p["owner"] in pending or self._verification_custody_busy(p)]
+        git_retained = [s for s in self._local_git_reviews.values()
+                        if s.get("git_active", {}).get("processes")
+                        or s.get("git_active", {}).get("owner") in pending]
+        if git_retained:
+            self._verification_shutdown = {"state": "UNKNOWN", "storage_retained": True,
+                "reason": "local_git_cleanup_unresolved", "manual_intervention_required": True}
+            return
         if retained:
             # Bounded stop cannot truthfully claim completion while uncancellable
             # I/O remains. Keep both private custody and storage; never reconstruct
@@ -2777,6 +2859,7 @@ class Runtime:
                          "private custody and storage retained, manual intervention required")
             return
         self._verification_shutdown = {"state": "completed", "storage_retained": False}
+        self._local_git_reviews.clear()
         getattr(self, "_verification_hosts", {}).clear()
         for frame in getattr(self, "_verification_frames", {}):
             frame.active = False
@@ -3635,6 +3718,12 @@ class Runtime:
         )
 
     async def _recognize_intent(self, message: Message, context, *, classification=None):
+        from Sprout.intents import capability_question
+
+        if capability_question(message.content or ""):
+            classification = {"intent": "conversation", "confidence": 1.0,
+                              "reason": "resource_free_capability_question"}
+            context = replace(context, tools={})
         if classification is None:
             classification = await self._classify_intent_with_llm(message, context)
         intent = str(classification.get("intent") or "conversation")
@@ -3694,6 +3783,11 @@ class Runtime:
     async def _classify_intent_with_llm(
         self, message: Message, context, *, pending_question: str | None = None,
     ) -> dict[str, Any]:
+        from Sprout.intents import capability_question
+
+        if pending_question is None and capability_question(message.content or ""):
+            return {"intent": "conversation", "confidence": 1.0,
+                    "reason": "resource_free_capability_question"}
         # Cheap task hint before spending an LLM call: an explicit coding task
         # ("修复…", "/task …") is already decidable from the text alone.
         if pending_question is None and detect_task_hint(message.content or ""):
@@ -5158,9 +5252,13 @@ class Runtime:
         proposal_id: str,
         *,
         decided_by: str = "cli",
+        principal=None,
     ) -> ChangeProposal:
-        proposal = await self._changes().approve(proposal_id, decided_by=decided_by)
+        proposal = await self._changes().approve(
+            proposal_id, decided_by=decided_by, principal=principal)
         await self._resume_task_after_approval(proposal.task_id)
+        if proposal.id in self._local_apply_plans:
+            return await self._changes().get(proposal.id) or proposal
         return proposal
 
     async def reject_change_proposal(
@@ -5260,13 +5358,37 @@ class Runtime:
         force: bool = False,
         override_reason: str = "",
         decided_by: str = "cli",
+        principal=None,
     ) -> ApplyResult:
+        proposal = await self._changes().get(proposal_id)
+        if proposal is not None and "apply_plan" in proposal.metadata:
+            from uuid import NAMESPACE_URL, uuid5
+
+            from Sprout.execution.apply_plan import current_plan
+
+            await current_plan(self, proposal_id, principal)
+            if force or allow_failing_tests:
+                return ApplyResult(proposal_id, False, "local_apply_no_override")
+            transaction = str(uuid5(NAMESPACE_URL, "ordinary-apply:" + proposal_id))
+            prior = await self._metadata_or_raise().get_apply_transaction(transaction)
+            if prior is not None:
+                return ApplyResult(proposal_id, False, "local_apply_no_repeat:" + prior["phase"])
+            task = await self._metadata_or_raise().get_task(proposal.task_id)
+            if (proposal.status is ChangeProposalStatus.APPROVED and task is not None
+                    and task.status is TaskStatus.WAITING_APPROVAL):
+                # Resume the existing graph/Guard; never invent an Apply owner.
+                await self._resume_task_after_approval(task.id)
+                row = await self._metadata_or_raise().get_apply_transaction(transaction)
+                return ApplyResult(proposal_id, bool(row and row["phase"] == "COMPLETED"),
+                                   row["phase"] if row else "local_apply_not_started")
+            return ApplyResult(proposal_id, False, "local_apply_approved_guard_required")
         result = await self._changes().apply(
             proposal_id,
             allow_failing_tests=allow_failing_tests,
             force=force,
             override_reason=override_reason,
             decided_by=decided_by,
+            principal=principal,
         )
         if result.applied:
             proposal = await self._changes().get(proposal_id)

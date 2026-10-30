@@ -274,6 +274,13 @@ class NodeExecutor:
         if node.type is NodeType.SANDBOX:
             return await self._sandbox(workspace)
         if node.type is NodeType.EVALUATION:
+            from Sprout.execution.local_receipt import evaluate
+            from Sprout.tools.context_keys import _current_project_node
+
+            scope = _current_project_node()
+            if scope is not None:
+                return await evaluate(scope.runtime, scope,
+                                      lambda: self._evaluation(node, workspace, task))
             return await self._evaluation(node, workspace, task)
         if node.type is NodeType.APPROVAL:
             return await self._approval(workspace, task)
@@ -939,6 +946,11 @@ class NodeExecutor:
                 tuple(item for item in resources if guard.allows(item["path"])))
 
     async def _sandbox(self, workspace: Workspace) -> dict:
+        from Sprout.tools.context_keys import _current_project_node
+
+        scope = _current_project_node()
+        if scope is not None:
+            _, workspace = await scope.runtime._project_analysis_subject(scope)
         if workspace.kind is not WorkspaceKind.GIT_REPOSITORY:
             return {
                 "status": "not_applicable",
@@ -1080,6 +1092,13 @@ class NodeExecutor:
             raise RuntimeError("Requirement acceptance tests are missing")
         if not planned:
             planned = self._fallback_verification(workspace)
+        from Sprout.tools.context_keys import _current_project_node
+
+        local_scope = _current_project_node()
+        if local_scope is not None:
+            from copy import deepcopy
+
+            local_scope.runtime._local_receipt_plans[(task.id, node.id)] = deepcopy(planned)
         attempts = max(1, int(node.metadata.get("verification_attempts", 1)))
 
         records: list[dict] = []
@@ -1128,6 +1147,7 @@ class NodeExecutor:
                     "command": list(outcome.command if kind in local_cases else parts),
                     "exit_code": outcome.exit_code,
                     "allowed": outcome.allowed,
+                    "started": outcome.started,
                     "allowlisted": outcome.allowlisted,
                     "passed": passed,
                     "attempts": attempts,
@@ -1210,6 +1230,7 @@ class NodeExecutor:
                 parts,
                 cwd=cwd,
                 task_id=task.id,
+                actor=task.actor,
                 scope=task.delegation_scope,
                 command_origin="manifest",
                 # Carried so a withheld command can be attributed to the task
@@ -1233,7 +1254,13 @@ class NodeExecutor:
         """Build changed-file scoped lint/typecheck commands when tools exist."""
         if sandbox_ref is None or workspace.kind is not WorkspaceKind.GIT_REPOSITORY:
             return []
-        changed = await GitWorktreeSandbox(workspace).changed_files(sandbox_ref)
+        from Sprout.tools.context_keys import _current_project_node
+
+        scope = _current_project_node()
+        management_workspace = workspace
+        if scope is not None:
+            _, management_workspace = await scope.runtime._project_analysis_subject(scope)
+        changed = await GitWorktreeSandbox(management_workspace).changed_files(sandbox_ref)
         manifest = workspace.manifest
         languages = set(manifest.detected_languages) if manifest is not None else set()
         commands: list[tuple[str, tuple[str, ...]]] = []
@@ -1267,7 +1294,12 @@ class NodeExecutor:
     async def _approval(self, workspace: Workspace, task: Task) -> dict:
         from Sprout.tools.context_keys import _current_project_node
 
-        runtime = getattr(self._project_analysis_scope, "__self__", None)
+        runtime = getattr(getattr(self, "_project_analysis_scope", None), "__self__", None)
+        if (runtime is not None and task.id not in runtime._verification_hosts
+                and "file.apply" in task.delegation_scope.allowed_actions):
+            await runtime._persist_node_products()
+            if any(r.task_id == task.id for r in runtime._local_acceptance_receipts):
+                return await runtime._prepare_local_apply_proposal(_current_project_node())
         nodes = await self._metadata.list_execution_nodes(task.id)
         recorded = self._output_for(nodes, NodeType.EVALUATION)
         review = None
@@ -1322,13 +1354,11 @@ class NodeExecutor:
                 diffs.append(DiffResult(path="authorized_git_view", diff_text=text))
         files_changed: tuple[str, ...] = tuple(evaluation["files_changed"]) if review else ()
         if sandbox_ref is not None and review is None:
-            provider = (IsolatedGitWorktreeSandbox if self._isolated_coding_required
-                        else GitWorktreeSandbox)
-            sandbox = provider(workspace)
-            diff = await sandbox.diff(sandbox_ref)
-            if diff.diff_text:
-                diffs.append(diff)
-            files_changed = await sandbox.changed_files(sandbox_ref)
+            # Only the live Host-bound review above can supply authenticated
+            # Git evidence. A serialized Evaluation output is not a Git View.
+            # Refuse before building/saving a proposal; never use retired
+            # sandbox.diff or infer a clean tree from unavailable evidence.
+            raise PermissionError("git_diff_unavailable: Task-owned GitBroker review required")
 
         if not files_changed and not diffs and review is None:
             # A turn that produced no file changes has nothing to apply, so it
@@ -1438,6 +1468,17 @@ class NodeExecutor:
                 raise RuntimeError("Coding task produced no verified change proposal")
             return {"status": "no_change_proposal"}
         proposal = proposals[0]
+        runtime = getattr(getattr(self, "_project_analysis_scope", None), "__self__", None)
+        if "apply_plan" in proposal.metadata:
+            if runtime is None or self._changes is None:
+                raise PermissionError("local_apply_runtime_required")
+            result = await self._changes.apply(proposal.id, principal=task.actor)
+            if not result.applied:
+                uncertain = result.reason.startswith(("UNKNOWN:", "PARTIAL:"))
+                return {"proposal_id": proposal.id, "applied": False, "waiting": True,
+                        "waiting_kind": "resource" if uncertain else "configuration",
+                        "reason": result.reason}
+            return {"proposal_id": proposal.id, "applied": True, "reason": result.reason}
         verification = proposal.metadata.get("verification")
         applicability = verification_evidence_applicability(
             verification, local_execution_available=self._local_acceptance)

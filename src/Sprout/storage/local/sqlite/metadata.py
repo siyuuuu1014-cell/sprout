@@ -206,6 +206,26 @@ class SqliteMetadataStore:
     async def finish_git_transaction(self, transaction_id, owner, state, result):
         return await finish_transaction(self._db, transaction_id, owner, state, result)
 
+    async def approve_apply_proposal(self, snapshot):
+        from Sprout.storage.local.sqlite.apply_transaction import approve_proposal
+
+        return await approve_proposal(self._db, snapshot)
+
+    async def claim_apply_transaction(self, record, snapshot):
+        from Sprout.storage.local.sqlite.apply_transaction import claim
+
+        return await claim(self._db, record, snapshot)
+
+    async def get_apply_transaction(self, identifier):
+        from Sprout.storage.local.sqlite.apply_transaction import observe
+
+        return await observe(self._db, identifier)
+
+    async def update_apply_transaction(self, identifier, owner, **change):
+        from Sprout.storage.local.sqlite.apply_transaction import transition
+
+        return await transition(self._db, identifier, owner, **change)
+
     async def begin_git_commit_write(self, transaction_id, owner):
         from Sprout.storage.local.sqlite.git_transaction import begin_commit_write
 

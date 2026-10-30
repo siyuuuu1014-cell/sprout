@@ -233,7 +233,7 @@ class ToolExecutor:
                 reason="mcp_task_binding_denied" if is_mcp else "node_tool_binding_denied",
                 matched_rules=(*decision.matched_rules, "binding:task:denied"))
 
-        from Sprout.tools.system_tools import GitWriteTool, SkillScriptTool
+        from Sprout.tools.system_tools import CliDownloadTool, GitWriteTool, SkillScriptTool
 
         retired = type(tool) is GitWriteTool and decision.decision in {
             AccessDecision.ALLOW, AccessDecision.REQUIRE_APPROVAL,
@@ -265,6 +265,9 @@ class ToolExecutor:
             AccessDecision.ALLOW, AccessDecision.REQUIRE_APPROVAL,
             }
         ) else ""
+        if isinstance(tool, CliDownloadTool) and decision.decision in {
+                AccessDecision.ALLOW, AccessDecision.REQUIRE_APPROVAL}:
+            unavailable = "download_file_write_contract_unavailable"
         if unavailable:
             decision = replace(
                 decision, decision=AccessDecision.DENY, reason=unavailable,

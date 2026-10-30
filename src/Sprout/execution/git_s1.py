@@ -337,7 +337,7 @@ class _LooseObjects:
 def _review_trace(frame, phase, state, **values):
     """Host diagnostics only; never an execution credential or verdict."""
     import time
-    active = frame.runtime._verification_hosts[frame.task.id].get("git_active")
+    active = frame.runtime._git_review_state(frame.task.id).get("git_active")
     if active is not None and len(active["trace"]) < 256:
         active["trace"].append({"phase": phase, "state": state,
                                 "elapsed": time.monotonic() - active["started"], **values})
@@ -369,7 +369,7 @@ async def _review_command(binding, view, arguments, refresh, *, issuer, frame, b
     from Sprout.execution.host_acceptance import pin_execution_directory
 
     await issuer._git_review_record(binding, broker, frame)
-    active = issuer._verification_hosts[frame.task.id].get("git_active")
+    active = issuer._git_review_state(frame.task.id).get("git_active")
     if (active is None or active["binding"] is not binding or active["frame"] is not frame
             or active["owner"] is not asyncio.current_task() or active.get("view") != view):
         raise PermissionError("git_review_execution_frame_denied")
@@ -436,7 +436,7 @@ async def _review_command(binding, view, arguments, refresh, *, issuer, frame, b
                 workspace = await store.get_workspace(admitted_workspace.id)
                 node = await store.get_execution_node(frame.node.id)
                 guard = node.metadata.get("execution_guard", {}) if node is not None else {}
-                host = issuer._verification_hosts.get(frame.task.id)
+                host = issuer._git_review_state(frame.task.id)
                 if (host is None or host.get("git_active") is not active
                         or host.get("git") is not binding
                         or active["binding"] is not binding or active["frame"] is not frame
@@ -657,7 +657,7 @@ async def _run_review(binding, issuer, frame, broker):
         await broker._authorize_review(frame, binding.paths, binding.sandbox.root)
         _review_trace(frame, "authority", "end")
     def check_selected(paths):
-        active = issuer._verification_hosts[frame.task.id].get("git_active")
+        active = issuer._git_review_state(frame.task.id).get("git_active")
         if (active is None or active["binding"] is not binding or active["frame"] is not frame
                 or active["owner"] is not asyncio.current_task()
                 or frame.task.delegation_scope.is_expired()
@@ -675,7 +675,7 @@ async def _run_review(binding, issuer, frame, broker):
         if root == binding.sandbox.root and relative in binding.paths:
             selected = relative
         else:
-            active = issuer._verification_hosts[frame.task.id].get("git_active")
+            active = issuer._git_review_state(frame.task.id).get("git_active")
             parts = Path(relative).parts
             if (active is not None and root == active.get("view") and len(parts) > 1
                     and parts[0] in {"base", "index", "current", "new"}):
@@ -718,7 +718,7 @@ async def _run_review(binding, issuer, frame, broker):
         parent.check()
         view = binding.parent / ("git-review-" + uuid4().hex)
         view.mkdir()  # Exclusive, under the pinned Host output parent.
-        issuer._verification_hosts[frame.task.id]["git_active"]["view"] = view
+        issuer._git_review_state(frame.task.id)["git_active"]["view"] = view
         directories = ("base", "index", "current", "new", "empty", "control",
                        "control/hooks", "control/git", "control/git/objects", "control/git/refs")
         for path in directories:
@@ -811,7 +811,7 @@ async def _run_review(binding, issuer, frame, broker):
                              "launch_chain": dict(binding.chain)},
             "budgets": {"seconds": REVIEW_TOTAL_SECONDS, "command_seconds": TIMEOUT_SECONDS,
                         "elapsed_seconds": __import__("time").monotonic()
-                            - issuer._verification_hosts[frame.task.id]["git_active"]["started"],
+                            - issuer._git_review_state(frame.task.id)["git_active"]["started"],
                         "cleanup_seconds": CLEANUP_SECONDS,
                         "output_bytes": MAX_OUTPUT_BYTES, "selected_paths": 64},
             "view": str(view)}
@@ -875,7 +875,7 @@ async def run_review(binding, issuer, frame, broker):
         datetime.now(UTC) - datetime.fromisoformat(guard["started_at"])).total_seconds()
     if remaining < REVIEW_TOTAL_SECONDS + CLEANUP_SECONDS:
         raise PermissionError("git_review_node_budget_insufficient:" + str(remaining))
-    host = issuer._verification_hosts[frame.task.id]
+    host = issuer._git_review_state(frame.task.id)
     if host.get("git_active") is not None:
         raise PermissionError("git_review_already_active")
     import time
