@@ -322,10 +322,18 @@ async def test_explicit_internal_analysis_compatibility(internal_runtime, entry)
     runtime, root = internal_runtime
     workspace = await runtime.open_workspace(str(root))
     if entry == "runtime":
-        analysis = await runtime.analyze_workspace(workspace.id)
+        from Sprout.tests.readonly_host_fixtures import native_analysis_subject
+
+        subject = await native_analysis_subject(runtime, workspace, ("main.py", "package.json"))
+        analysis = await runtime.analyze_workspace(workspace.id, **subject)
         assert any(n.qualified_name == "internal_symbol" for n in analysis.graph.nodes)
     elif entry == "service":
-        analysis = await runtime._workspaces.analyze(workspace.id)
+        from Sprout.tests.readonly_host_fixtures import native_analysis_subject
+
+        with pytest.raises(PermissionError, match="authorized_workspace_analysis_required"):
+            await runtime._workspaces.analyze(workspace.id)
+        subject = await native_analysis_subject(runtime, workspace, ("main.py", "package.json"))
+        analysis = await runtime.analyze_workspace(workspace.id, **subject)
         assert any(n.qualified_name == "internal_symbol" for n in analysis.graph.nodes)
     elif entry == "context":
         context = await runtime._contexts.build(

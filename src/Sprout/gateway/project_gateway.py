@@ -142,7 +142,20 @@ class ProjectGateway:
             delegation_scope=delegation_scope,
             **({"preparation_paths": preparation_paths} if preparation_paths is not None else {}),
         )
+        if principal is not None and principal.authenticated is True:
+            from dataclasses import replace
+
+            from Sprout.message.models import Message
+
+            if task.actor != principal:
+                raise PermissionError("Authenticated project session required")
+            session = await self._runtime._sessions.resolve(
+                Message(content=instruction, channel=principal.source), principal=principal)
+            task = replace(task, metadata={**task.metadata, "session_id": session.id})
+            await self._runtime._metadata_or_raise().save_task(task)
         if host_acceptance is not None:
+            if principal is None or principal.authenticated is not True or task.actor != principal:
+                raise PermissionError("Authenticated Local Acceptance session required")
             task = await self._runtime.bind_task_acceptance(
                 task.id, principal=principal, **host_acceptance)
         return task

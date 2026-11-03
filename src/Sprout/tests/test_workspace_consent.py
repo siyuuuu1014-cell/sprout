@@ -25,6 +25,7 @@ import json
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -86,6 +87,10 @@ def _runtime(tmp_path: Path):
     settings.storage.blobs_dir = str(tmp_path / "blobs")
     settings.security.audit.path = str(tmp_path / "audit.jsonl")
     runtime = create_runtime(settings)
+    # These tests verify consent/submission, not project execution. The fixture
+    # repository below deliberately contains only a .git marker. Keep the real
+    # queue, but observe scheduling instead of racing a worker into that marker.
+    runtime.start_worker = Mock(name="submission_only_worker")
     # This fixture acts as the trusted embedding adapter. Labels in Message
     # are not credentials; all original task/history assertions remain intact.
     principal = Principal("u-1", source="cli")
@@ -284,6 +289,8 @@ async def test_consent_is_single_use(tmp_path) -> None:
         await runtime.grant_workspace_consent(session_id, root=repo, user_id="u-1")
 
     assert len(await runtime.list_tasks()) == 1
+    assert runtime._task_queue.qsize() == 1
+    runtime.start_worker.assert_called_once_with()
     await runtime.stop()
 
 

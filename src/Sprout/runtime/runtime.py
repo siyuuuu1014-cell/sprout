@@ -356,6 +356,7 @@ class Runtime:
         self._original_user_turns = {}
         self._ordinary_assistant_turns = {}
         self._settings = settings
+        self._agent_step_store = None
         self.models = models
         self.tools = tools
         self.skills = skills
@@ -1602,7 +1603,8 @@ class Runtime:
         # Returning a boolean here confers neither file visibility nor execution.
         return True
 
-    async def _issue_frozen_execution(self, cwd, spec, path, case_id, executor):
+    async def _issue_frozen_execution(self, cwd, spec, path, case_id, executor,
+                                      *, verification_command=None):
         import time
         from copy import deepcopy
 
@@ -1618,6 +1620,12 @@ class Runtime:
         if task.delegation_scope != scope.task.delegation_scope:
             raise PermissionError("frozen_execution_scope_changed")
         expected = check_binding(task, workspace, frozen)
+        if verification_command is not None:
+            planned = self._local_receipt_plans.get((task.id, scope.node.id), ())
+            if (scope.node.type is not NodeType.EVALUATION
+                    or type(verification_command) is not tuple
+                    or not any(parts == verification_command for _, parts in planned)):
+                raise PermissionError("evaluation_command_not_planned")
         registered = self._frozen_sandboxes.get(task.id)
         if (registered is None or Path(cwd) != registered[0].root
                 or spec.to_payload() != expected.to_payload() or path != frozen["test_path"]
@@ -1643,6 +1651,7 @@ class Runtime:
             "workspace": workspace, "sandbox": registered[0], "root_identity": registered[3],
             "spec": expected, "path": path, "case_id": case_id, "executor": deepcopy(executor),
             "expires": time.monotonic() + 60, "used": False, "inputs": None,
+            "verification_command": verification_command,
         }
         return permit
 
@@ -1680,6 +1689,12 @@ class Runtime:
                 or pin.identity != record["root_identity"]
                 or self._frozen_sandboxes.get(task.id, (None,))[0] is not record["sandbox"]):
             raise PermissionError("frozen_execution_authority_changed")
+        command = record.get("verification_command")
+        if command is not None and (
+                record["scope"].node.type is not NodeType.EVALUATION
+                or not any(parts == command for _, parts in self._local_receipt_plans.get(
+                    (task.id, record["scope"].node.id), ()))):
+            raise PermissionError("evaluation_command_plan_changed")
         frozen = task.metadata["host_acceptance_v1"]
         spec = check_binding(task, workspace, frozen)
         paths = task.metadata.get("required_paths")
@@ -1743,7 +1758,9 @@ class Runtime:
         record["approval_binding"] = payload_digest({
             "task": task.id, "node": record["scope"].node.id,
             "owner": record["scope"].guard_owner, "cwd_identity": pin.identity,
-            "binding": frozen["sha256"], "executor": record["executor"], "inputs": inputs})
+            "binding": frozen["sha256"], "executor": record["executor"], "inputs": inputs,
+            **({"verification_command": command,
+                "native_command": record["native_command"]} if command is not None else {})})
         return ActionRequest(task_id=task.id, actor=task.actor, action=ActionType.PROCESS_RUN,
             resource=ResourceRef(workspace.id, (pin.root / record["path"]).as_posix(),
                 kind=self._file_broker._classify(pin.root / record["path"], record["sandbox"])),
@@ -1813,6 +1830,54 @@ class Runtime:
         return replace(request, actor=subject.actor, scope=subject.scope,
                        resource=replace(request.resource,
                                         workspace_id=subject.resource.workspace_id))
+
+    async def _track_sandbox_result(self, scope, tool, arguments, result):
+        """Attest Local node data through a fresh Broker read, never grant file rights."""
+        from hashlib import sha256
+
+        from Sprout.execution.sandbox_tool import SandboxEditTool, SandboxReadTool, SandboxWriteTool
+        from Sprout.tools.context_keys import _current_node_tool_call, _current_project_node
+
+        if (type(tool) not in {SandboxReadTool, SandboxWriteTool, SandboxEditTool}
+                or not result.ok or scope is not _current_project_node()
+                or self._node_tool_scopes.get(tool) is not scope
+                or scope.node.type is not NodeType.AGENT
+                or scope.task.id in self._verification_hosts
+                or arguments.get("offset") or arguments.get("limit")):
+            return False
+        call = _current_node_tool_call()
+        if call is None or call[0] is not tool or call[2] != arguments:
+            return False
+        task, workspace = await self._project_analysis_subject(scope)
+        registered = self._frozen_sandboxes.get(task.id)
+        sandbox, path = tool._sandbox, arguments.get("path")
+        if (registered is None or sandbox != registered[0]
+                or tool._broker is not self._file_broker
+                or path not in task.metadata.get("required_paths", ())
+                or "host_acceptance_v1" not in task.metadata):
+            return False
+        await self._node_tool_request(tool, arguments)
+        captured = await self._file_broker.read_text(
+            sandbox, path, task_id=task.id, scope=task.delegation_scope, actor=task.actor)
+        if not captured.wrote:
+            return False
+        def normalize(text):
+            return text.replace("\r\n", "\n")
+        if (type(tool) is SandboxReadTool
+                and normalize(captured.content) != normalize(result.content)):
+            return False
+        if (type(tool) is SandboxWriteTool
+                and normalize(captured.content) != normalize(arguments["content"])):
+            return False
+        current, current_workspace = await self._project_analysis_subject(scope)
+        if current != task or current_workspace != workspace:
+            raise PermissionError("sandbox_tool_source_subject_changed")
+        scope.sandbox_tool_results += ({
+            "tool": tool.spec.name, "path": path, "sandbox_id": sandbox.id,
+            "task_id": task.id, "node_id": scope.node.id, "owner": scope.guard_owner,
+            "content_sha256": sha256(captured.content.encode()).hexdigest(),
+        },)
+        return True
 
     def _same_admitted_read(self, scope, tool, arguments, result):
         from Sprout.execution.sandbox_tool import SandboxReadTool
@@ -2569,6 +2634,8 @@ class Runtime:
         if scope.untracked_tool_use:
             return  # Tool effects have no transitive resource receipt yet.
         allowed = scope.node.type in {NodeType.PLAN, NodeType.SUBTASK, NodeType.AGENT}
+        if scope.node.type is NodeType.EVALUATION:
+            allowed = scope.local_evaluation_result is output
         if scope.node.type is NodeType.TEST_DESIGN:
             binding = scope.task.metadata.get("host_acceptance_v1", {})
             allowed = (not output.get("waiting") and binding.get("sha256")
@@ -2737,6 +2804,40 @@ class Runtime:
                 and all(item in known for item in resources))
 
     # -- assembly ---------------------------------------------------------
+    def _agent_step_recording(self):
+        from Sprout.agent.step_store import AgentStepStore, bind_agent_step_store
+        from Sprout.storage.local.sqlite.driver import SqliteDatabase
+
+        if self._agent_step_store is None:
+            database = getattr(self.storage.metadata, "_db", None)
+            if isinstance(database, SqliteDatabase):
+                self._agent_step_store = AgentStepStore(database=database)
+            else:
+                # A non-SQLite Runtime must not leak to the default
+                # file. Keep its derived step telemetry ephemeral instead.
+                self._agent_step_store = AgentStepStore(":memory:")
+        return bind_agent_step_store(self._agent_step_store)
+
+    async def _run_recorded_agent(self, agent, message, context):
+        with self._agent_step_recording():
+            return await agent.run(message, context)
+
+    async def _stream_recorded_agent(self, stream, message, context, **options):
+        iterator = stream(message, context, **options).__aiter__()
+        try:
+            while True:
+                with self._agent_step_recording():
+                    try:
+                        chunk = await anext(iterator)
+                    except StopAsyncIteration:
+                        return
+                yield chunk  # Do not leak a binding into the stream consumer.
+        finally:
+            close = getattr(iterator, "aclose", None)
+            if close is not None:
+                with self._agent_step_recording():
+                    await close()
+
     def register_agent(
         self, name: str, agent: Agent, *, default: bool = False, replace: bool = True
     ) -> None:
@@ -2859,6 +2960,8 @@ class Runtime:
                          "private custody and storage retained, manual intervention required")
             return
         self._verification_shutdown = {"state": "completed", "storage_retained": False}
+        if self._agent_step_store is not None:
+            self._agent_step_store.close()
         self._local_git_reviews.clear()
         getattr(self, "_verification_hosts", {}).clear()
         for frame in getattr(self, "_verification_frames", {}):
@@ -3164,7 +3267,7 @@ class Runtime:
         agent = self._router.route(message)
         await self.events.publish(Event(AGENT_STARTED, {"session_id": session.id}, message.id))
         try:
-            result = await agent.run(message, context)
+            result = await self._run_recorded_agent(agent, message, context)
         except Exception as exc:
             await self.events.publish(
                 Event(
@@ -4042,7 +4145,7 @@ class Runtime:
         result_metadata: dict[str, Any] = {}
         try:
             if stream is None:
-                result = await agent.run(message, context)
+                result = await self._run_recorded_agent(agent, message, context)
                 chunks.append(result.content)
                 result_metadata = dict(result.metadata)
             else:
@@ -4051,7 +4154,7 @@ class Runtime:
                 # Opt in only for the known stream contract; legacy text-only
                 # consumers and other agents retain their existing signature.
                 options = {"include_result": True} if type(agent) is AgentLoop else {}
-                async for chunk in stream(message, context, **options):
+                async for chunk in self._stream_recorded_agent(stream, message, context, **options):
                     if isinstance(chunk, AgentResult):
                         if chunk.content:
                             chunks.append(chunk.content)
@@ -4235,7 +4338,7 @@ class Runtime:
         agent = self._router.route(message)
         await self.events.publish(Event(AGENT_STARTED, {"session_id": session.id}, message.id))
         try:
-            result = await agent.run(message, context)
+            result = await self._run_recorded_agent(agent, message, context)
         except Exception as exc:
             await self.events.publish(
                 Event(

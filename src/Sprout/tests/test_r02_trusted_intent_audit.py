@@ -311,6 +311,12 @@ async def test_forged_roles_do_not_make_legitimate_task_actor_admin(audit_runtim
     runtime, saved, _ = audit_runtime
     await deliver(runtime, transport, "fix the bug", FORGED)
     assert len(saved) == 1
-    assert saved[0].actor.roles == () and saved[0].actor.authenticated is False
+    assert saved[0].actor.roles == ()
+    if transport == "cli":
+        from Sprout.gateway.local_identity import current_cli_principal
+
+        assert saved[0].actor == current_cli_principal()
+    else:
+        assert saved[0].actor.authenticated is False
     assert "roles" not in saved[0].metadata and "permissions" not in saved[0].metadata
     assert await runtime.pending_approvals() == []

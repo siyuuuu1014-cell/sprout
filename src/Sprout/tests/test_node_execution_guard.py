@@ -76,7 +76,7 @@ async def test_concurrent_retry_never_invokes_a_second_executor(tmp_path):
         assert calls == [node.id]
         release.set()
         result = await first
-        assert result["status"] == "completed"
+        assert result["status"] == "completed", result
         repeated = await NodeExecutionGuard(store).execute(node, execute)
         assert repeated["output"] == {"value": "confirmed"}
         assert len(calls) == 1
@@ -273,16 +273,21 @@ asyncio.run(run())
 async def _runtime_fixture(store, tmp_path, executor):
     from types import SimpleNamespace
 
-    from Sprout.runtime.runtime import Runtime
+    from Sprout.storage.bundle import StorageBundle
+    from Sprout.tests.conftest import ScriptedModel, build_runtime
     from Sprout.workspace.models import Workspace
 
-    class Operational:
-        async def list_approvals(self, status=None):
-            return []
-
     await store.save_workspace(Workspace(id="fixture", root=tmp_path))
-    runtime = Runtime.__new__(Runtime)
-    runtime.storage = SimpleNamespace(metadata=store, operational=Operational())
+    storage = StorageBundle.in_memory()
+    storage.metadata = store
+    runtime, _ = build_runtime(storage=storage, model=ScriptedModel([]))
+    from Sprout.task.models import DelegationScope
+
+    target = tmp_path / "guard_input.py"
+    target.write_text("# Explicit read-only fixture input\n", encoding="utf-8")
+    for task in await store.list_tasks():
+        await store.save_task(replace(task, delegation_scope=DelegationScope(
+            allowed_paths=(str(target),), allowed_actions=frozenset({"file.read"}))))
     runtime._scanner = SimpleNamespace(
         scan=lambda workspace: None,
         build_read_plan=lambda workspace, task: None,

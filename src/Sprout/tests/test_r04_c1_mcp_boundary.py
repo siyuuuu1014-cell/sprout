@@ -1,8 +1,4 @@
-"""C1 target RED and legacy controls; all remote/process I/O is mocked.
-
-No current API issues a verified per-server/per-operation risk classification.
-The HIGH approval control is legacy behavior, not evidence of trusted issuance.
-"""
+"""C1 refusal and authorized error boundaries; only transport is controlled."""
 
 import asyncio
 import subprocess
@@ -16,6 +12,13 @@ from Sprout.mcp.client.client import MCPClientManager
 from Sprout.security.approval import ApprovalManager
 from Sprout.security.policy import SecurityPolicy
 from Sprout.storage.local.memory import MemoryOperationalStore
+from Sprout.tests.test_r04_c1_mcp_trusted_wiring import (
+    IDENTITY,
+    FakeConnection,
+    execute_approved,
+    executor_for,
+    issued,
+)
 from Sprout.tools.executor import ToolExecutor
 from Sprout.tools.registry import ToolRegistry
 from Sprout.tools.result import ToolExecutionUnconfirmed
@@ -48,6 +51,18 @@ def remote(error=None, risk="medium"):
     )
     tool = MCPToolAdapter(default_risk_level=risk).to_tool(connection, descriptor())
     return connection, tool
+
+
+@pytest.fixture
+async def classified_remote(monkeypatch):
+    from Sprout.mcp.client import client as client_module
+
+    monkeypatch.setattr(client_module, "MCPConnection", FakeConnection)
+    manager, connection, tool = await issued()
+    try:
+        yield connection, tool
+    finally:
+        await manager.stop()
 
 
 @pytest.mark.parametrize("source", ["interactive", "cron"])
@@ -109,46 +124,48 @@ async def test_original_policy_deny_is_a_zero_effect_control():
     connection.call_tool.assert_not_called()
 
 
-async def test_legacy_high_label_still_requires_a_real_approval_not_a_parameter():
-    connection, tool = remote(risk="high")
+async def test_legacy_high_label_still_requires_a_real_approval_not_a_parameter(classified_remote):
+    connection, tool = classified_remote
     registry = ToolRegistry()
     registry.register(tool)
     manager = ApprovalManager(MemoryOperationalStore())
     executor = ToolExecutor(registry, approvals=manager)
     args = {"approval_granted": True}
-    first = await executor.execute(tool.spec.name, args, task_id="task", source="interactive")
+    first = await executor.execute(tool.spec.name, args, **IDENTITY)
     assert first.approval_id and not first.ok
     connection.call_tool.assert_not_called()
     await manager.decide(first.approval_id, True, decided_by="human", channel="cli")
-    second = await executor.execute(tool.spec.name, args, task_id="task", source="interactive")
+    second = await executor.execute(tool.spec.name, args, **IDENTITY)
     assert second.ok
     connection.call_tool.assert_awaited_once()
 
 
 @pytest.mark.parametrize("error", [TimeoutError, ConnectionResetError, EOFError])
 @pytest.mark.parametrize("route", ["direct", "executor"])
-async def test_attempted_request_loss_is_unconfirmed_and_never_retried(error, route):
-    connection, tool = remote(error("mock response lost"))
+async def test_attempted_request_loss_is_unconfirmed_and_never_retried(
+    classified_remote, error, route,
+):
+    connection, tool = classified_remote
+    connection.call_tool.side_effect = error("mock response lost")
+    if route == "direct":
+        assert not (await tool.invoke({})).ok
+        connection.call_tool.assert_not_called()
+    executor = executor_for(tool, ApprovalManager(MemoryOperationalStore()))
     try:
         with pytest.raises(ToolExecutionUnconfirmed):
-            if route == "direct":
-                await tool.invoke({})
-            else:
-                registry = ToolRegistry()
-                registry.register(tool)
-                await ToolExecutor(registry).execute(tool.spec.name, {})
+            await execute_approved(executor, tool)
     finally:
         connection.call_tool.assert_awaited_once()
 
 
 @pytest.mark.parametrize("route", ["direct", "executor"])
-async def test_cancellation_is_not_swallowed_or_retried(route):
-    connection, tool = remote(asyncio.CancelledError())
+async def test_cancellation_is_not_swallowed_or_retried(classified_remote, route):
+    connection, tool = classified_remote
+    connection.call_tool.side_effect = asyncio.CancelledError()
+    if route == "direct":
+        assert not (await tool.invoke({})).ok
+        connection.call_tool.assert_not_called()
+    executor = executor_for(tool, ApprovalManager(MemoryOperationalStore()))
     with pytest.raises(asyncio.CancelledError):
-        if route == "direct":
-            await tool.invoke({})
-        else:
-            registry = ToolRegistry()
-            registry.register(tool)
-            await ToolExecutor(registry).execute(tool.spec.name, {})
+        await execute_approved(executor, tool)
     connection.call_tool.assert_awaited_once()

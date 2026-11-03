@@ -79,6 +79,7 @@ async def test_supported_delegates_once_without_retry(tmp_path, tool, operation,
         method.return_value = GitResult(action=operation, allowed=outcome == "allow",
                                         output="mock", reason=outcome)
     instance = tool(git_broker=SimpleNamespace(**{operation: method}))
+    supplied = arguments(tmp_path, operation)
     if tool is GitWriteTool:
         # B3 strengthens the old write contract: even an available/allowing or
         # erroring broker is never consulted. Inspect still delegates as in B1.
@@ -86,11 +87,16 @@ async def test_supported_delegates_once_without_retry(tmp_path, tool, operation,
         assert not result.ok and "retired" in result.to_text()
         method.assert_not_called()
         return
+    # Positive read dispatch does not request arbitrary refs or file filters.
+    # Those are separately rejected below rather than silently discarded.
+    if operation in {"log", "diff"}:
+        supplied = {key: value for key, value in supplied.items()
+                    if key not in {"ref", "base", "files", "name_only"}}
     if outcome in errors:
         with pytest.raises(errors[outcome]):
-            await instance.invoke(arguments(tmp_path, operation))
+            await instance.invoke(supplied)
     else:
-        result = await instance.invoke(arguments(tmp_path, operation))
+        result = await instance.invoke(supplied)
         assert result.ok == (outcome == "allow")
     method.assert_awaited_once()
     args, kwargs = method.call_args
@@ -104,6 +110,19 @@ async def test_supported_delegates_once_without_retry(tmp_path, tool, operation,
         assert kwargs == {"files": ("note.txt",)}
     else:
         assert len(args) == 1 and not kwargs
+
+
+@pytest.mark.parametrize("operation", ["log", "diff"])
+@pytest.mark.parametrize("key,value", [("ref", "--exec=forbidden"), ("base", "other"),
+                                     ("files", ["private.txt"]), ("name_only", True)])
+async def test_explicit_inspect_filters_never_disappear_into_broader_dispatch(
+    tmp_path, operation, key, value,
+):
+    method = AsyncMock(return_value=GitResult(action=operation, allowed=True))
+    tool = GitInspectTool(git_broker=SimpleNamespace(**{operation: method}))
+    result = await tool.invoke({"operation": operation, "repo": str(tmp_path), key: value})
+    assert not result.ok and "Task-owned review" in result.error
+    method.assert_not_called()
 
 
 @pytest.mark.parametrize("tool", [GitInspectTool, GitWriteTool])

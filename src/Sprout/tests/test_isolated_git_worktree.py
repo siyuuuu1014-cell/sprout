@@ -25,8 +25,13 @@ async def test_real_worktree_disables_checkout_hook_and_supports_data_diff(tmp_p
     ref = await provider.create()
     (ref.root / "app.py").write_text("value = 2\n", encoding="utf-8", newline="")
     assert "app.py" in await provider.changed_files(ref)
-    diff = await provider.diff(ref)
-    assert "+value = 2" in diff.diff_text
+    with pytest.raises(PermissionError, match="Task-owned GitBroker"):
+        await provider.diff(ref)
+    # Host-owned isolated management can inspect data, but cannot issue a
+    # Task review receipt. This must not reopen the retired Sandbox.diff API.
+    diff = await provider._run("git", "-C", str(ref.root), "diff", "--no-ext-diff",
+                               "--", "app.py")
+    assert "+value = 2" in diff
 
 
 async def test_filter_configuration_blocks_before_worktree_creation(tmp_path):

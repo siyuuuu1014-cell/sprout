@@ -134,22 +134,17 @@ async def test_direct_probe_denial_precedes_path_and_analysis(monkeypatch):
 
 @pytest.mark.parametrize("flag", [None, False, 1, "true"])
 async def test_ordinary_analysis_output_is_preserved(tmp_path, flag):
-    analysis = SimpleNamespace(
-        workspace=SimpleNamespace(id="test"),
-        manifest=SimpleNamespace(detected_languages=("python",),
-                                 framework_hints=(), entry_points=(),
-                                 test_commands=(), build_commands=()),
-        read_plan=SimpleNamespace(resources=()), graph=SimpleNamespace(nodes=(), edges=()),
-        knowledge=SimpleNamespace(items=()),
-    )
-    analyze = AsyncMock(return_value=analysis)
-    args = {"path": str(tmp_path)}
-    if flag is not None:
-        args["include_system_tools"] = flag
-    result = await module.ProjectAnalyzeTool(analyze=analyze).invoke(args)
-    assert result.ok and result.data["languages"] == ["python"]
-    assert "system_tools" not in result.data
-    analyze.assert_awaited_once()
+    from Sprout.tests.owned_analysis_fixture import owned_analysis
+
+    async def operation(tool, call, approvals, workspace):
+        args = {"path": str(workspace.root / "service.py")}
+        if flag is not None:
+            args["include_system_tools"] = flag
+        result = await call(args)
+        assert result.ok and result.data["languages"] == ["python"]
+        assert "system_tools" not in result.data
+        assert result.data["coverage"]["file_count"] == 1
+    await owned_analysis(tmp_path, operation)
 
 
 @pytest.mark.parametrize("plugin", [False, True])
@@ -198,6 +193,18 @@ async def test_caller_mutation_during_approval_cannot_change_frozen_request(tmp_
 @pytest.mark.parametrize("policy_kind", ["allow", "ask", "deny", "scope_deny"])
 @pytest.mark.parametrize("flag", [None, False])
 async def test_non_probe_request_retains_policy_outcome(tmp_path, policy_kind, flag):
+    if policy_kind == "allow":
+        from Sprout.tests.owned_analysis_fixture import owned_analysis
+
+        async def operation(tool, call, approvals, workspace):
+            args = {"path": str(workspace.root / "service.py")}
+            if flag is not None:
+                args["include_system_tools"] = flag
+            result = await call(args)
+            assert result.ok and result.approval_id is None
+            assert result.data["languages"] == ["python"]
+        await owned_analysis(tmp_path, operation)
+        return
     tool = module.ProjectAnalyzeTool()
     tool.invoke = AsyncMock(return_value=ToolResult.success("ordinary"))
     registry = ToolRegistry()

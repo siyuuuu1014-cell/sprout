@@ -141,15 +141,18 @@ async def test_discovery_actual_tool_result(rig, captured, monkeypatch, grant):
     assert await rig.storage.operational.list_approvals() == before
 
 
-async def test_windows_native_enumeration_is_unavailable_not_mock_support(tmp_path):
+async def test_windows_native_enumeration_is_unavailable_not_mock_support(tmp_path, monkeypatch):
     import os
 
     from Sprout.execution.file_access import FileBoundaryError, directory_entries
 
     if os.name != "nt":
         return  # This assertion concerns the current Windows runner only.
+    async def unavailable(*args):
+        raise FileBoundaryError("local_volume_identity_unproved")
+    monkeypatch.setattr("Sprout.execution.file_access._windows_directory_entries", unavailable)
     async def authorize(path):
-        raise AssertionError("Unsupported native backend reached authorization callback")
+        raise AssertionError("Unavailable native backend reached authorization callback")
     with pytest.raises(FileBoundaryError, match="directory_enumeration_unavailable"):
         await directory_entries(tmp_path, tmp_path, 10, authorize)
 

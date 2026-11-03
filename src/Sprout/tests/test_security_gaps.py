@@ -94,7 +94,10 @@ async def test_database_broker_shows_the_statement_to_the_policy(tmp_path) -> No
 
     await broker.query(_workspace(tmp_path), tmp_path / "app.db", "SELECT 1")
 
-    assert [request.arguments for request in policy.requests] == [{"sql": "SELECT 1"}]
+    # Initial admission and secure-open refresh each require a fresh decision.
+    # Every decision must see the exact SQL, not just the outer request.
+    assert policy.requests
+    assert all(request.arguments == {"sql": "SELECT 1"} for request in policy.requests)
 
 
 def test_the_hard_floor_reads_database_statements() -> None:

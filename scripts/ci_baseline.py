@@ -13,11 +13,25 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def pytest_scratch(output: Path) -> Path:
+    """Keep Windows Git fixture metadata below Git's internal path limit.
+
+    Retain the unique directory and publish its location; never reuse/delete an
+    operator directory. Reports and the source snapshot still live in output.
+    """
+    path = (Path(tempfile.mkdtemp(prefix="sr-l1-")) if os.name == "nt"
+            else output / "pytest-temp")
+    (output / "pytest-scratch.json").write_text(
+        json.dumps({"path": str(path), "retained": True}, indent=2), encoding="utf-8")
+    return path
 
 
 def public_summary(output: Path, summary: dict) -> None:
@@ -121,6 +135,7 @@ def main() -> int:
     args = parser.parse_args()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
+    pytest_temp = pytest_scratch(output)
     checkout = output / "checkout"
     checkout.mkdir()
     snapshot(checkout)
@@ -287,7 +302,7 @@ def main() -> int:
                 "src/Sprout/tests",
                 "web/tests",
                 "--baseline-l1",
-                f"--basetemp={output / 'pytest-temp'}",
+                f"--basetemp={pytest_temp}",
                 f"--junitxml={output / 'l1.xml'}",
                 f"--gate-report={output / 'l1-gates.json'}",
             ],

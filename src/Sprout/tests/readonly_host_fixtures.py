@@ -8,6 +8,26 @@ from Sprout.gateway.identity import Principal
 from Sprout.task.models import DelegationScope
 
 
+async def native_analysis_subject(runtime, workspace, paths):
+    """Real local entry identity/session and finite Task; no platform substitute."""
+    from Sprout.gateway.local_identity import current_cli_principal
+    from Sprout.message.models import Message
+
+    principal = current_cli_principal()
+    session = await runtime._sessions.resolve(
+        Message(content="analyze selected files", channel=principal.source), principal=principal)
+    task = await runtime.create_task(
+        workspace.id, "analyze selected files", actor=principal, source=principal.source,
+        execution_mode="read_only", metadata={"required_paths": list(paths),
+                                              "session_id": session.id},
+        delegation_scope=DelegationScope(
+            allowed_paths=tuple(str(workspace.root / path) for path in paths),
+            allowed_actions=frozenset({"tool.invoke", "file.read"}),
+        ),
+    )
+    return {"principal": principal, "analysis_task": task}
+
+
 @pytest.fixture
 def authorized_read_host(tmp_path, monkeypatch):
     """Issue a controlled server subject and bounded selection for host tests.

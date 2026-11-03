@@ -514,7 +514,7 @@ def test_workspace_analysis_marks_sprout_database_separately(tmp_path: Path) -> 
     asyncio.run(run())
 
 
-def test_project_analyze_tool_returns_project_surface(tmp_path: Path) -> None:
+def test_project_analyze_tool_returns_project_surface(tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "tool-project"
     root.mkdir()
     (root / "README.md").write_text("# Tool Project\n", encoding="utf-8")
@@ -522,18 +522,46 @@ def test_project_analyze_tool_returns_project_surface(tmp_path: Path) -> None:
     (root / "openapi.json").write_text('{"openapi":"3.1.0"}', encoding="utf-8")
 
     async def run() -> None:
-        tool = ProjectAnalyzeTool(
-            intelligence=WorkspaceIntelligence(
-                knowledge_store=MemoryKnowledgeStore(),
-                vector_store=MemoryVectorStore(),
-            )
-        )
-        result = await tool.invoke({"path": root.as_posix()})
-        assert result.ok is True
-        assert result.data["languages"] == ["node"]
-        statements = [item["statement"] for item in result.data["knowledge"]]
-        assert any("Documentation files: README.md" in item for item in statements)
-        assert any("Interface contracts: openapi.json" in item for item in statements)
+        from Sprout.tests.conftest import build_runtime
+        from Sprout.tests.readonly_host_fixtures import native_analysis_subject
+
+        storage = StorageBundle.in_memory()
+        from Sprout.storage.local.sqlite.metadata import open_metadata_store
+
+        storage.metadata = open_metadata_store(str(tmp_path / "metadata.db"))
+        runtime, _ = build_runtime(storage=storage)
+        results = []
+        invoke = ProjectAnalyzeTool.invoke
+
+        async def observe(tool, arguments):
+            result = await invoke(tool, arguments)
+            results.append(result)
+            return result
+
+        monkeypatch.setattr(ProjectAnalyzeTool, "invoke", observe)
+        try:
+            workspace = await runtime.open_workspace(root)
+            subject = await native_analysis_subject(
+                runtime, workspace, ("README.md", "package.json", "openapi.json"))
+            await runtime.analyze_workspace(workspace.id, **subject)
+            assert len(results) == 1
+            result = results[0]
+            assert result.ok is True
+            assert result.data["languages"] == ["node"]
+            # Windows resource keys are case-folded by the existing path
+            # contract. Match that identity without weakening evidence scope.
+            statements = [item["statement"].casefold() for item in result.data["knowledge"]]
+            # Captured-view facts explicitly identify their bounded evidence;
+            # the retired disk analyzer's whole-project wording is not reused.
+            assert "captured documentation assets: readme.md" in statements
+            assert "captured interface assets: openapi.json" in statements
+            evidence = {item["statement"].casefold(): [p.casefold() for p in item["evidence_ids"]]
+                        for item in result.data["knowledge"]}
+            assert evidence["captured documentation assets: readme.md"] == ["readme.md"]
+            assert evidence["captured interface assets: openapi.json"] == ["openapi.json"]
+        finally:
+            await runtime.stop()
+            await storage.close()
 
     asyncio.run(run())
 

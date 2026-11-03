@@ -14,6 +14,7 @@ it was covered by the suite that was green at the time:
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from collections.abc import Mapping
@@ -342,9 +343,10 @@ async def test_evaluation_runs_static_checks_on_changed_files(
         task = Task(id="task-static", workspace_id="ws")
         await storage.metadata.save_execution_node(_sandbox_node(task.id, ref.root))
 
+        host_which = shutil.which
         monkeypatch.setattr(
             "Sprout.runtime.nodes.shutil.which",
-            lambda name: "/usr/bin/ruff" if name == "ruff" else None,
+            lambda name: "/usr/bin/ruff" if name == "ruff" else host_which(name),
         )
         executor = _node_executor(storage, RecordingProcessBroker())
         output = await executor._evaluation(
@@ -499,12 +501,14 @@ async def test_approval_lists_the_real_changed_files(tmp_path) -> None:
         task = Task(id="task-files", workspace_id="ws")
         await storage.metadata.save_execution_node(_sandbox_node(task.id, ref.root))
         executor = _node_executor(storage, RecordingProcessBroker())
-        output = await executor._approval(workspace, task)
-
-        proposals = await storage.metadata.list_change_proposals(task.id)
-        assert set(proposals[0].files_changed) == {"tracked.txt", "brand_new.py"}
-        assert output["files_changed"] and "workspace" not in output["files_changed"]
-        storage.metadata.close()
+        try:
+            # A discovered file list is not trusted review provenance. The
+            # actual positive G1 publication path has separate native coverage.
+            with pytest.raises(PermissionError, match="git_diff_unavailable"):
+                await executor._approval(workspace, task)
+            assert await storage.metadata.list_change_proposals(task.id) == []
+        finally:
+            storage.metadata.close()
     finally:
         await sandbox.remove(ref)
 
@@ -647,8 +651,8 @@ async def test_cli_download_tool_blocks_the_metadata_endpoint(tmp_path, monkeypa
     result = await tool.invoke({"url": "http://169.254.169.254/latest/meta-data/"})
 
     assert result.ok is False
-    assert "blocked" in result.error.lower()
-    assert "169.254.169.254" in result.error
+    assert result.error == "download_file_write_contract_unavailable"
+    assert not (tmp_path / "download").exists()
 
 
 def test_cli_download_tool_is_high_risk_under_the_default_policy() -> None:

@@ -138,7 +138,9 @@ def test_approval_prompt_explains_permission_scope(monkeypatch) -> None:
     class_text = _approval_text("similar_scope", command="sprout")
 
     assert "sprout" in class_text, "the class note must name what it covers"
-    assert "this task" in class_text, "a class grant is still task-bound"
+    assert "same session" in class_text
+    assert "principal" in class_text
+    assert "exact arguments and resources" in class_text
     assert "not a global grant" in class_text
     assert "fingerprint" not in class_text, "a name grant is not fingerprint-bound"
 

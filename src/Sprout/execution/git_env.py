@@ -33,6 +33,8 @@ from Sprout.security.secret_broker import SecretBroker
 #: them git can hang on a credential prompt (``GIT_TERMINAL_PROMPT``), page
 #: output through an arbitrary program, or open an editor.
 GIT_ENV_PINS: dict[str, str] = {
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": os.devnull,
     "GIT_TERMINAL_PROMPT": "0",
     "GIT_ASKPASS": "",
     "GIT_PAGER": "cat",

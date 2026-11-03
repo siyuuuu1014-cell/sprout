@@ -7,6 +7,8 @@ import subprocess
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 from Sprout.execution.models import ChangeProposal, SandboxRef
 from Sprout.orchestration.compiler import ExecutionGraphBuilder
 from Sprout.orchestration.models import ExecutionNode, NodeType
@@ -250,15 +252,16 @@ def test_diff_ignores_bytecode_caches(tmp_path: Path) -> None:
         (ref.root / "__pycache__" / "mod.cpython-314.pyc").write_bytes(b"\x00")
         (ref.root / "mod.py").write_text("value = 1\n", encoding="utf-8")
 
-        diff = await sandbox.diff(ref)
-        await sandbox.remove(ref)
-
-        assert "mod.py" in diff.diff_text, "the real edit is missing from the diff"
-        assert "pycache" not in diff.diff_text, (
-            "the patch carries bytecode the approver never wrote:\n"
-            f"{diff.diff_text}"
-        )
-        assert "GIT binary patch" not in diff.diff_text, "a binary .pyc was inlined"
+        try:
+            changed = await sandbox.changed_files(ref)
+            assert "mod.py" in changed
+            assert not any("pycache" in name or name.endswith(".pyc") for name in changed)
+            index = _run_git(ref.root, "ls-files", "--stage")
+            with pytest.raises(PermissionError, match="Task-owned GitBroker"):
+                await sandbox.diff(ref)
+            assert _run_git(ref.root, "ls-files", "--stage") == index
+        finally:
+            await sandbox.remove(ref)
 
     asyncio.run(run())
 
@@ -311,7 +314,7 @@ def test_graph_builder_emits_verify_loop_nodes(tmp_path: Path) -> None:
     assert graph.nodes[4].budget.timeout_seconds == 600.0
     second_agent = graph.nodes[5]
     assert second_agent.metadata["previous_evaluation_node_id"] == "task-1:evaluation"
-    assert graph.nodes[7].dependencies == ("task-1:evaluation:1",)
+    assert graph.nodes[7].dependencies == ("task-1:evaluation", "task-1:evaluation:1")
 
 
 # -- the read tool describes the root it actually has --------------------------

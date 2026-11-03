@@ -9,7 +9,7 @@ from Sprout.orchestration.models import ExecutionGraph, ExecutionNode, NodeBudge
 from Sprout.orchestration.terminal.local import LocalOrchestratorBackend
 from Sprout.storage.local.sqlite.driver import SqliteDatabase
 from Sprout.storage.local.sqlite.metadata import SqliteMetadataStore
-from Sprout.task.models import TaskStatus
+from Sprout.task.models import Task, TaskStatus
 
 
 def test_local_orchestrator_backend_executes_graph(tmp_path: Path) -> None:
@@ -18,10 +18,16 @@ def test_local_orchestrator_backend_executes_graph(tmp_path: Path) -> None:
     graph = ExecutionGraph(task_id="task-1", nodes=(node,), entry_node_ids=(node.id,))
 
     async def run() -> None:
+        await store.save_task(Task(id=graph.task_id, workspace_id="fixture"))
         result = await LocalOrchestratorBackend(store).execute(graph)
         assert result.status is TaskStatus.COMPLETED
+        persisted = await store.get_execution_node(node.id)
+        assert persisted.metadata["execution_guard"]["state"] == "completed"
 
-    asyncio.run(run())
+    try:
+        asyncio.run(run())
+    finally:
+        store.close()
 
 
 def test_local_orchestrator_enforces_node_timeout(tmp_path: Path) -> None:
@@ -33,18 +39,36 @@ def test_local_orchestrator_enforces_node_timeout(tmp_path: Path) -> None:
     )
     graph = ExecutionGraph(task_id="task-1", nodes=(node,), entry_node_ids=(node.id,))
 
-    async def slow_handler(_node: ExecutionNode) -> None:
-        await asyncio.sleep(1)
+    called = []
+    cancelled = []
+
+    async def slow_handler(running: ExecutionNode) -> None:
+        called.append(running.id)
+        try:
+            await asyncio.sleep(1)
+        finally:
+            cancelled.append(running.id)
 
     async def run() -> None:
-        result = await LocalOrchestratorBackend(store).execute(
-            graph, handler=slow_handler
-        )
-        assert result.status is TaskStatus.FAILED
+        await store.save_task(Task(id=graph.task_id, workspace_id="fixture"))
+        backend = LocalOrchestratorBackend(store)
+        result = await backend.execute(graph, handler=slow_handler)
+        # A real owned execution timeout is uncertain, not proof of no effects.
+        assert result.status is TaskStatus.WAITING_RESOURCE
         assert result.error is not None
         assert "TimeoutError" in result.error
+        assert called == cancelled == [node.id]
+        persisted = await store.get_execution_node(node.id)
+        assert persisted.metadata["execution_guard"]["state"] == "uncertain"
+        assert "TimeoutError" in persisted.metadata["error"]
+        repeated = await backend.execute(graph, handler=slow_handler)
+        assert repeated.status is TaskStatus.WAITING_RESOURCE
+        assert called == [node.id]
 
-    asyncio.run(run())
+    try:
+        asyncio.run(run())
+    finally:
+        store.close()
 
 
 def test_orchestrator_skips_verify_loops_after_a_green_evaluation(
@@ -94,6 +118,7 @@ def test_orchestrator_skips_verify_loops_after_a_green_evaluation(
         return {}
 
     async def run() -> None:
+        await store.save_task(Task(id=graph.task_id, workspace_id="fixture"))
         result = await LocalOrchestratorBackend(store).execute(
             graph, handler=handler
         )
@@ -103,5 +128,10 @@ def test_orchestrator_skips_verify_loops_after_a_green_evaluation(
             "task-1:approval",
             "task-1:apply",
         ]
+        for skipped in (agent_two, eval_two):
+            assert (await store.get_execution_node(skipped.id)).status.value == "skipped"
 
-    asyncio.run(run())
+    try:
+        asyncio.run(run())
+    finally:
+        store.close()

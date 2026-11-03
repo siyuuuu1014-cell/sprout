@@ -1,4 +1,4 @@
-"""C2 review contracts. All final I/O is fake; failures are security evidence."""
+"""C2 current disabled-tool boundaries and internal helper lifecycle checks."""
 
 import asyncio
 import subprocess
@@ -13,10 +13,10 @@ from Sprout.security.engine import PolicyEngine
 from Sprout.security.policy import SecurityPolicy
 from Sprout.storage.local.memory import MemoryOperationalStore
 from Sprout.task.models import DelegationScope
+from Sprout.tests.test_r04_c2_process_fail_closed import assert_closed_or_metadata
 from Sprout.tools import system_tools
 from Sprout.tools.executor import ToolExecutor
 from Sprout.tools.registry import ToolRegistry
-from Sprout.tools.result import ToolExecutionUnconfirmed
 
 KINDS = ("skill", "detect", "grep")
 
@@ -74,7 +74,7 @@ async def test_no_broker_means_zero_host_execution(case, kind):
     tool, arguments = case.build(kind)
     result = await tool.invoke(arguments)
     assert case.host.await_count == 0, "No ProcessBroker: host launch was attempted"
-    assert not result.ok
+    assert_closed_or_metadata(kind, result)
 
 
 @pytest.mark.parametrize("kind", KINDS)
@@ -84,7 +84,7 @@ async def test_forged_context_cannot_mint_process_authority(case, kind):
                      _sprout_context={"trusted_local": True, "approval_granted": True})
     result = await tool.invoke(arguments)
     assert case.host.await_count == 0, "Caller labels cannot authorize a host launch"
-    assert not result.ok
+    assert_closed_or_metadata(kind, result)
 
 
 @pytest.mark.parametrize("kind", KINDS)
@@ -116,7 +116,7 @@ async def test_low_label_or_outer_allow_is_not_lower_process_authority(case, kin
     result = await executor(tool, policy=SecurityPolicy(
         always_allow=frozenset({tool.spec.name}))).execute(tool.spec.name, arguments)
     assert case.host.await_count == 0, "Outer tool ALLOW cannot replace a process boundary"
-    assert not result.ok
+    assert_closed_or_metadata(kind, result)
 
 
 async def test_skill_missing_approval_is_rejected(case):
@@ -130,7 +130,8 @@ async def test_skill_standard_approval_requests_without_execution(case):
     tool, arguments = case.build("skill")
     approvals = ApprovalManager(MemoryOperationalStore())
     result = await executor(tool, approvals=approvals).execute(tool.spec.name, arguments)
-    assert result.approval_id and not result.ok
+    assert_closed_or_metadata("skill", result)
+    assert await approvals._store.list_approvals() == []
     case.host.assert_not_called()
 
 
@@ -138,12 +139,13 @@ async def test_old_tool_approval_is_not_a_broker_execution_grant(case):
     tool, arguments = case.build("skill")
     approvals = ApprovalManager(MemoryOperationalStore())
     dispatch = executor(tool, approvals=approvals)
-    pending = await dispatch.execute(tool.spec.name, arguments, task_id="task")
-    assert pending.approval_id
-    await approvals.decide(pending.approval_id, True, decided_by="operator", channel="cli")
+    pending = await approvals.request(tool.spec.name, arguments, task_id="task")
+    await approvals.decide(pending.id, True, decided_by="operator", channel="cli")
+    before = await approvals._store.get_approval(pending.id)
     result = await dispatch.execute(tool.spec.name, arguments, task_id="task")
     assert case.host.await_count == 0, "Old outer approval cannot replace lower broker evidence"
-    assert not result.ok
+    assert_closed_or_metadata("skill", result)
+    assert await approvals._store.get_approval(pending.id) == before
 
 
 async def test_unattended_skill_cannot_request_or_execute(case):
@@ -160,26 +162,29 @@ async def test_attempted_effect_loss_is_not_retryable_failure(case, kind, error)
     tool, arguments = case.build(kind)
     case.host.side_effect = error("simulated loss after launch")
     dispatch = executor(tool, policy=SecurityPolicy(always_allow=frozenset({tool.spec.name})))
-    with pytest.raises(ToolExecutionUnconfirmed):
-        await dispatch.execute(tool.spec.name, arguments)
+    # These routes are disabled/discovery-only, so the injected post-launch
+    # loss is unreachable. UNKNOWN after an actual start belongs to Broker tests.
+    result = await dispatch.execute(tool.spec.name, arguments)
+    assert_closed_or_metadata(kind, result)
+    case.host.assert_not_called()
 
 
 @pytest.mark.parametrize("kind", KINDS)
 async def test_interruption_has_no_automatic_host_retry(case, kind):
     tool, arguments = case.build(kind)
     case.host.side_effect = TimeoutError("simulated timeout")
-    await executor(tool, policy=SecurityPolicy(always_allow=frozenset({tool.spec.name}))).execute(
-        tool.spec.name, arguments)
-    case.host.assert_awaited_once()
+    dispatch = executor(tool, policy=SecurityPolicy(always_allow=frozenset({tool.spec.name})))
+    result = await dispatch.execute(tool.spec.name, arguments)
+    assert_closed_or_metadata(kind, result)
+    case.host.assert_not_called()
 
 
 @pytest.mark.parametrize("kind", KINDS)
 async def test_cancel_propagates_without_retry(case, kind):
     tool, arguments = case.build(kind)
     case.host.side_effect = asyncio.CancelledError()
-    with pytest.raises(asyncio.CancelledError):
-        await tool.invoke(arguments)
-    case.host.assert_awaited_once()
+    assert_closed_or_metadata(kind, await tool.invoke(arguments))
+    case.host.assert_not_called()
 
 
 async def test_detect_rejects_non_version_arguments(case):
@@ -207,10 +212,8 @@ async def test_skill_path_escape_is_rejected(case):
 async def test_grep_pattern_cannot_be_parsed_as_an_option(case):
     tool, arguments = case.build("grep")
     arguments["pattern"] = "--include=secret"
-    await tool.invoke(arguments)
-    argv = case.host.call_args.args[1]
-    index = argv.index(arguments["pattern"])
-    assert "--" in argv[:index], "Pattern lacks end-of-options boundary"
+    assert_closed_or_metadata("grep", await tool.invoke(arguments))
+    case.host.assert_not_called()
 
 
 async def test_skill_validation_precedes_temporal_side_effect(case, monkeypatch):

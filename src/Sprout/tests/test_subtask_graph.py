@@ -8,13 +8,15 @@ waits for every one of them so their evidence reaches the prompt.
 
 from __future__ import annotations
 
-from pathlib import Path
+from uuid import uuid4
+
+import pytest
 
 from Sprout.orchestration.compiler import ExecutionGraphBuilder
 from Sprout.orchestration.models import NodeType
 from Sprout.runtime.nodes import NodeExecutor
 from Sprout.task.models import Task
-from Sprout.workspace.models import ReadPlan, Workspace, WorkspaceKind, WorkspaceManifest
+from Sprout.workspace.models import ReadPlan, WorkspaceManifest
 
 STEPS = (
     {"description": "读现有实现", "kind": "analysis", "target_paths": ["src/a.py"]},
@@ -118,46 +120,92 @@ def test_malformed_steps_are_skipped_not_fatal() -> None:
     assert subtasks[0].id == "T:subtask:3"
 
 
-def test_subtask_findings_reach_the_agent_prompt() -> None:
-    from Sprout.orchestration.models import ExecutionNode, NodeStatus
+@pytest.mark.asyncio
+async def test_subtask_findings_reach_the_agent_prompt(tmp_path, monkeypatch) -> None:
+    from Sprout.execution import file_broker
+    from Sprout.execution.file_snapshot import read_fd
+    from Sprout.gateway.identity import Principal
+    from Sprout.llm.messages import LLMResponse
+    from Sprout.orchestration.models import ExecutionGraph, ExecutionNode
+    from Sprout.orchestration.service import SequentialOrchestrator
+    from Sprout.session.models import Session
+    from Sprout.storage.bundle import StorageBundle
+    from Sprout.storage.local.sqlite.metadata import open_metadata_store
+    from Sprout.task.models import DelegationScope, TaskStatus
+    from Sprout.tests.conftest import ScriptedModel, build_runtime
+    from Sprout.workspace.models import ResourceRef
 
-    def done(index: int, kind: str, description: str, findings: str):
-        return ExecutionNode(
-            id=f"T:subtask:{index}",
-            task_id="T",
-            type=NodeType.SUBTASK,
-            status=NodeStatus.COMPLETED,
-            metadata={
-                "index": index,
-                "kind": kind,
-                "description": description,
-                "output": {
-                    "index": index,
-                    "kind": kind,
-                    "description": description,
-                    "findings": findings,
-                },
-            },
-        )
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "users.py").write_text("def list_users():\n    return []\n")
+    # Controlled secure-open adapter, as in B2 capture tests. Runtime/Policy,
+    # actual file bytes/identity, Guard and source persistence remain real.
+    # This unit test does not claim native Windows open-boundary coverage.
+    def capture_boundary(_root, target, operation, authorize, **kwargs):
+        assert operation == "snapshot"
+        authorize()
+        with target.open("rb") as stream:
+            return read_fd(stream.fileno(), kwargs["content"])
 
-    nodes = [
-        done(1, "test", "补测试", "没有 test_user.py"),
-        done(0, "analysis", "读实现", "只有 list_users()"),
-    ]
-    findings = NodeExecutor._subtask_findings(nodes)
+    monkeypatch.setattr(file_broker, "file_operation", capture_boundary)
+    storage = StorageBundle.in_memory()
+    storage.metadata = open_metadata_store(tmp_path / "sources.db")
+    model = ScriptedModel([LLMResponse(content=text) for text in (
+        "分析现有用户接口", "只有 list_users()", "没有 test_user.py", "收到两个子任务结果")])
+    messages = []
+    chat = model.chat
 
-    assert [item["index"] for item in findings] == [0, 1]  # step order
+    async def observed(history, **kwargs):
+        messages.append(history)
+        return await chat(history, **kwargs)
 
-    task = Task(id="T", workspace_id="ws", instruction="加导出 CSV")
-    workspace = Workspace(id="ws", root=Path("."), kind=WorkspaceKind.LOCAL_DIRECTORY)
-    prompt = NodeExecutor._agent_prompt(task, workspace, (), None, "", findings)
+    model.chat = observed
+    runtime, _ = build_runtime(storage=storage, model=model)
+    workspace = await runtime.open_workspace(str(root))
+    principal = Principal("fixture-owner", source="cli", authenticated=True)
+    session = Session(id=str(uuid4()), user_id=principal.user_id, metadata={"entry_principal_v1": {
+        "user_id": principal.user_id, "source": "cli", "authenticated": True}})
+    await runtime._session_store.save_session(session)
+    task = Task(workspace_id=workspace.id, instruction="加导出 CSV", actor=principal,
+        source="cli", metadata={"session_id": session.id}, delegation_scope=DelegationScope(
+            allowed_actions=frozenset({"file.read", "tool.invoke"}),
+            allowed_paths=(str(root / "users.py"),)))
+    await storage.metadata.save_task(task)
+    read = ExecutionNode(task_id=task.id, type=NodeType.READ)
+    plan = ExecutionNode(task_id=task.id, type=NodeType.PLAN, dependencies=(read.id,))
+    subtasks = tuple(ExecutionNode(task_id=task.id, type=NodeType.SUBTASK,
+        dependencies=(plan.id,), metadata={"index": index, "kind": kind,
+            "description": description}) for index, kind, description in (
+                (0, "analysis", "读实现"), (1, "test", "补测试")))
+    agent = ExecutionNode(task_id=task.id, type=NodeType.AGENT,
+                          dependencies=tuple(n.id for n in subtasks))
+    graph = ExecutionGraph(task_id=task.id, nodes=(read, plan, *subtasks, agent))
+    read_plan = ReadPlan(task_id=task.id,
+                        resources=(ResourceRef(workspace.id, "users.py"),))
+    executor = runtime._executor(storage.metadata)
 
-    assert "只有 list_users()" in prompt
-    assert "没有 test_user.py" in prompt
-    # No findings -> no empty section.
-    assert "Findings from the plan" not in NodeExecutor._agent_prompt(
-        task, workspace, ()
-    )
+    async def execute(node):
+        current = await storage.metadata.get_task(task.id)
+        return await executor.execute_node(node, workspace, read_plan, current)
+
+    try:
+        result = await SequentialOrchestrator(storage.metadata).execute(graph, handler=execute)
+        assert result.status is TaskStatus.COMPLETED
+        await runtime._persist_node_products()
+        nodes = [await storage.metadata.get_execution_node(n.id) for n in reversed(subtasks)]
+        findings = NodeExecutor._subtask_findings(nodes)
+        assert [item["index"] for item in findings] == [0, 1]
+        for node in nodes:
+            source = await storage.metadata.get_node_result_source(node.id)
+            assert source is not None
+            assert source.owner == node.metadata["execution_guard"]["owner"]
+        prompt = str(messages[-1])
+        assert "只有 list_users()" in prompt
+        assert "没有 test_user.py" in prompt
+        assert "Findings from the plan" not in NodeExecutor._agent_prompt(task, workspace, ())
+    finally:
+        await runtime.stop()
+        storage.metadata.close()
 
 
 def test_subtask_findings_ignore_incomplete_nodes() -> None:

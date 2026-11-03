@@ -45,7 +45,8 @@ async def _create_host_task(gateway, workspace, instruction):
     scope = replace(scope, allowed_paths=scope.allowed_paths + tuple(
         str(workspace.root / path) for path in paths))
     return await gateway.create_task(workspace.id, instruction, principal=principal,
-                                     delegation_scope=scope)
+                                     delegation_scope=scope,
+                                     preparation_paths=("src/user.py", "pyproject.toml"))
 
 
 def _repo(tmp_path: Path, *, gitignore: bool = True) -> Path:
