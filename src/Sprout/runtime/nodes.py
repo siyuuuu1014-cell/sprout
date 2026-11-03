@@ -592,6 +592,11 @@ class NodeExecutor:
             "waiting": bool(result.metadata.get("approval_required")),
             "pending_approvals": list(result.metadata.get("approval_ids") or ()),
             "pending_tool_calls": list(result.metadata.get("pending_tool_calls") or ()),
+            # AgentLoop's actual degraded model response is diagnostic data,
+            # separate from tool receipts and the subsequent verification verdict.
+            **({"model_execution": {"degraded": True,
+                "error": str(result.metadata["model_error"])[:_NODE_OUTPUT_LIMIT]}}
+               if result.metadata.get("degraded") and result.metadata.get("model_error") else {}),
         }
 
     async def _plan(
@@ -840,7 +845,8 @@ class NodeExecutor:
                 **({"execution_contract": contract, "session_id": scope.session_id}
                    if contract is not None else {}),
             )
-            if execution is None or not outcome.approval_id or attempt:
+            if (execution is None or not outcome.approval_id or attempt
+                    or outcome.started is not False or outcome.allowed):
                 break
             try:
                 await self._process_broker._wait_frozen_approval(execution, outcome.approval_id)

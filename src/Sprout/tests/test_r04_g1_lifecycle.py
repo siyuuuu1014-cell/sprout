@@ -44,7 +44,7 @@ def command_records(issuer, frame, active):
     return store
 
 
-@pytest.mark.parametrize("fault", ["none", "write-fail", "truncate"])
+@pytest.mark.parametrize("fault", ["none", "write-fail", "truncate", "late_success"])
 @pytest.mark.parametrize("cancel", [False, True])
 async def test_diagnostic_survives_failure_and_cancel(tmp_path, monkeypatch, cancel, fault):
     host = {}
@@ -83,9 +83,14 @@ async def test_diagnostic_survives_failure_and_cancel(tmp_path, monkeypatch, can
             s._review_trace(frame, "phase", "begin")
         if cancel:
             raise asyncio.CancelledError()
+        if fault == "late_success":
+            time.sleep(.03)  # No await: the event-loop timeout callback cannot run yet.
+            return s.GitResult(action="diff", output="{}")
         raise TimeoutError()
 
     monkeypatch.setattr(s, "_run_review", execute)
+    if fault == "late_success":
+        monkeypatch.setattr(s, "REVIEW_TOTAL_SECONDS", .01)
 
     # Real exclusive filesystem recording is replaced only at the native write
     # boundary; no diagnostic can grant execution authority.

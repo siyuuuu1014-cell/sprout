@@ -366,7 +366,7 @@ async def test_native_apply_vertical(tmp_path, monkeypatch, mode):
         storage.metadata.close()
 
 
-async def prepare_apply_fixture(tmp_path, monkeypatch, mode):
+async def prepare_apply_fixture(tmp_path, monkeypatch, mode, *, seven_inputs=False):
     assert os.name == "nt"
     git = Path("D:/dev/Git/mingw64/bin/git.exe")
     assert hashlib.sha256(git.read_bytes()).hexdigest() == (
@@ -387,6 +387,28 @@ async def prepare_apply_fixture(tmp_path, monkeypatch, mode):
         "tests/frozen.py": render_acceptance_tests(spec),
         "examples/demo.py": render_acceptance_demo(spec),
     }
+    if seven_inputs:
+        spec = AcceptanceSpec.from_payload({"cases": [
+            {"id": "positive", "target": "src.app:clamp_zero", "args": [3],
+             "expected_output": 3},
+            {"id": "negative", "target": "src.app:clamp_zero", "args": [-2],
+             "expected_output": 0}]})
+        old = ('def clamp_zero(value):\n'
+               '    """Keep non-negative integers; clamp negative integers to zero."""\n'
+               '    return value\n')
+        new = old.replace('return value', 'return 0 if value < 0 else value')
+        files = {"src/__init__.py": "", "src/app.py": old,
+            "tests/test_app.py": ('from src.app import clamp_zero\n\n\n'
+                'def test_positive():\n    assert clamp_zero(3) == 3\n\n\n'
+                'def test_negative():\n    assert clamp_zero(-2) == 0\n'),
+            "examples/demo.py": ('from src.app import clamp_zero\n\n'
+                                 'print(clamp_zero(3))\nprint(clamp_zero(-2))\n'),
+            "pyproject.toml": ('[project]\nname = "r04-stage-c-fixture"\nversion = "0.1.0"\n'
+                'requires-python = ">=3.12"\n\n[tool.pytest.ini_options]\n'
+                'testpaths = ["tests"]\npythonpath = ["."]\n'
+                'addopts = "-p no:cacheprovider"\n'),
+            "tests/test_acceptance.py": render_acceptance_tests(spec),
+            "examples/acceptance_demo.py": render_acceptance_demo(spec)}
     targets = ["src/app.py"]
     if mode in {"multi", "partial"}:
         files["src/other.py"] = old
@@ -472,8 +494,8 @@ async def prepare_apply_fixture(tmp_path, monkeypatch, mode):
         task.id,
         principal=principal,
         spec=spec.to_payload(),
-        test_path="tests/frozen.py",
-        demo_path="examples/demo.py",
+        test_path="tests/test_acceptance.py" if seven_inputs else "tests/frozen.py",
+        demo_path="examples/acceptance_demo.py" if seven_inputs else "examples/demo.py",
     )
     read = ExecutionNode(task_id=task.id, type=NodeType.READ)
     sandbox = ExecutionNode(task_id=task.id, type=NodeType.SANDBOX, dependencies=(read.id,))

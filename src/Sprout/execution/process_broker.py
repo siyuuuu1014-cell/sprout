@@ -1123,6 +1123,10 @@ class ProcessBroker:
                               "--rootdir", str(cwd_path), "-p", "no:cacheprovider"]
             if dispatch.record.get("verification_command") is not None:
                 pytest_options.extend(["--confcutdir", str(cwd_path)])
+                # Disabling project ini/conftest must not also remove imports
+                # from the independently pinned execution root. This fixed
+                # pytest option grants no file Scope and changes no discovery.
+                pytest_options.extend(["-o", f"pythonpath={cwd_path.as_posix()}"])
             process_env = self._secrets.child_env(base_env=os.environ, extra={
                 "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1", "PYTHONIOENCODING": "utf-8",
                 "PYTEST_ADDOPTS": shlex.join(pytest_options),
@@ -1348,8 +1352,10 @@ class ProcessBroker:
 
     async def _wait_frozen_approval(self, execution, approval_id):
         """Wait in the original node; retained data is not an execution permit."""
+        from contextlib import nullcontext
         from datetime import UTC, datetime
 
+        from Sprout.orchestration.node_budget import current_node_budget
         from Sprout.security.approval import ApprovalStatus
 
         scope = execution["scope"]
@@ -1360,18 +1366,27 @@ class ProcessBroker:
             raise PermissionError("frozen_approval_node_budget_unavailable")
         remaining = scope.node.budget.timeout_seconds - (
             datetime.now(UTC) - datetime.fromisoformat(started)).total_seconds()
-        deadline = time.monotonic() + max(0, remaining - 5)
-        while True:
-            task, workspace = await runtime._project_analysis_subject(scope)
-            if (asyncio.current_task() is not execution["owner"]
-                    or task != execution["task"] or workspace != execution["workspace"]):
-                raise PermissionError("frozen_approval_authority_changed")
-            if time.monotonic() >= deadline:
-                raise PermissionError("frozen_approval_wait_timeout")
-            record = await self._check_frozen_approval(execution, approval_id, arguments)
-            if record.status is ApprovalStatus.APPROVED:
-                return
-            await asyncio.sleep(min(0.5, max(0, deadline - time.monotonic())))
+        clock = current_node_budget(scope.node)
+        deadline = (float("inf") if clock is not None else
+                    time.monotonic() + max(0, remaining - 5))
+        task, workspace = await runtime._project_analysis_subject(scope)
+        if (asyncio.current_task() is not execution["owner"]
+                or task != execution["task"] or workspace != execution["workspace"]):
+            raise PermissionError("frozen_approval_authority_changed")
+        # Only the host's still-unstarted, exact frozen request reaches here.
+        # Approval expiry, authority revalidation and external cancellation remain active.
+        with clock.approval_wait() if clock is not None else nullcontext():
+            while True:
+                task, workspace = await runtime._project_analysis_subject(scope)
+                if (asyncio.current_task() is not execution["owner"]
+                        or task != execution["task"] or workspace != execution["workspace"]):
+                    raise PermissionError("frozen_approval_authority_changed")
+                if time.monotonic() >= deadline:
+                    raise PermissionError("frozen_approval_wait_timeout")
+                record = await self._check_frozen_approval(execution, approval_id, arguments)
+                if record.status is ApprovalStatus.APPROVED:
+                    return
+                await asyncio.sleep(min(0.5, max(0, deadline - time.monotonic())))
 
     def _record_allowlist(
         self,

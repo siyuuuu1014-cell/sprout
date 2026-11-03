@@ -26,6 +26,7 @@ pytestmark = pytest.mark.skipif(
 @pytest.mark.parametrize("mode", [
     "first_success", "second_success", "both_failed", "ambiguous",
     "wrong_owner", "wrong_source", "no_retry",
+    "denied_success", "denied_503",
 ])
 async def test_compiled_receipt_sources_native(tmp_path, monkeypatch, mode):
     ctx = await prepare_apply_fixture(tmp_path, monkeypatch, "cli")
@@ -36,15 +37,38 @@ async def test_compiled_receipt_sources_native(tmp_path, monkeypatch, mode):
     git(ctx["root"], "commit", "-m", "ordinary test discovery fixture")
     task = replace(task, metadata={**task.metadata,
         "required_paths": [*ctx["files"], discovered]})
+    denied_first = mode in {"denied_success", "denied_503"}
+    if denied_first:
+        # Unlike the original no-op simplification fixture, an unedited source
+        # must actually fail its frozen acceptance to exercise conditional retry.
+        ctx["old"] = "def echo(value):\n    return value + 1\n"
+        (ctx["root"] / "src/app.py").write_text(ctx["old"])
+        git(ctx["root"], "add", "--", "src/app.py")
+        git(ctx["root"], "commit", "-m", "known failing source fixture")
+        task = replace(task, metadata={**task.metadata, "cli_write_paths": ["src/app.py"]})
+        runtime._cli_code_writes[task.id] = (
+            task.actor, task.metadata["session_id"], task.workspace_id, ("src/app.py",))
     await store.save_task(task)
     runtime._graph_builder = ExecutionGraphBuilder()  # Actual product compiler, not fixture graph.
     runtime._settings = default_settings()
     runtime._settings.runtime.verify_loops = 1 if mode == "no_retry" else 2
     messages = []
+    write_calls = []
+    broker_write = runtime._file_broker.write_text
+
+    async def observed_write(sandbox, path, *args, **kwargs):
+        write_calls.append(str(path))
+        return await broker_write(sandbox, path, *args, **kwargs)
+
+    monkeypatch.setattr(runtime._file_broker, "write_text", observed_write)
     chat = ctx["model"].chat
 
     async def observed_chat(history, **kwargs):
         messages.append([str(m.content or "") for m in history])
+        if (mode == "denied_503" and len(ctx["model"].responses) == 4):
+            ctx["model"].responses.pop(0)
+            raise RuntimeError(
+                "Model request failed with HTTP 503: controlled offline service busy")
         return await chat(history, **kwargs)
 
     monkeypatch.setattr(ctx["model"], "chat", observed_chat)
@@ -84,6 +108,16 @@ async def test_compiled_receipt_sources_native(tmp_path, monkeypatch, mode):
             LLMResponse(tool_calls=(ToolCall(str(uuid4()), "sandbox_write_file",
                 {"path": "src/app.py", "content": text}),)),
             LLMResponse(content="Finished retry"),
+        ])
+    if denied_first:
+        ctx["model"].responses[1] = LLMResponse(tool_calls=(ToolCall(
+            str(uuid4()), "sandbox_write_file", {"path": discovered, "content": "forbidden"}),))
+        ctx["model"].responses.extend([
+            LLMResponse(tool_calls=(ToolCall(str(uuid4()), "sandbox_read_file",
+                {"path": "src/app.py"}),)),
+            LLMResponse(tool_calls=(ToolCall(str(uuid4()), "sandbox_write_file",
+                {"path": "src/app.py", "content": ctx["new"]}),)),
+            LLMResponse(content="Finished retry after denied first edit"),
         ])
     if mode == "ambiguous":
         # Explicit Host fixture with two independent successful evaluations.
@@ -144,38 +178,50 @@ async def test_compiled_receipt_sources_native(tmp_path, monkeypatch, mode):
             "nodes": [{"id": n.id, "type": n.type.value, "status": n.status.value,
                        "dependencies": n.dependencies, "metadata": n.metadata} for n in nodes],
             "proposals": [p.id for p in proposals],
-            "sources": sources, "model_messages": messages,
+            "sources": sources, "model_messages": messages, "broker_write_calls": write_calls,
         }, default=str, indent=2))
         assert approval is not None, [(n.type.value, n.metadata.get("error")) for n in nodes]
         assert set(approval.dependencies) == {n.id for n in evaluations}
-        if mode in {"second_success", "both_failed"}:
+        if mode in {"second_success", "both_failed", "denied_success", "denied_503"}:
             agents = [n for n in nodes if n.type is NodeType.AGENT]
             assert len(agents) == 2 and all(n.status.value == "completed" for n in agents)
             assert all(n.status.value == "completed" for n in evaluations)
             assert evaluations[0].metadata["output"]["status"] == "failed"
             assert "Previous verification feedback:" in str(messages)
-            assert "return 99" in str(messages)  # Actual Broker read in retry ToolCall.
+            assert ("return 99" if not denied_first else "return value + 1") in str(messages)
             for n in [*agents, *evaluations]:
                 source = sources[n.id]
                 assert source["owner"] == n.metadata["execution_guard"]["owner"]
                 assert source["task_id"] == task.id
             assert all(n.id in sources for n in agents)
-            for agent in agents:
+            for agent in agents[1:] if denied_first else agents:
                 evidence = agent.metadata["output"]["sandbox_tool_results"]
                 assert evidence and all(e["task_id"] == task.id for e in evidence)
                 assert all(e["owner"] == sources[agent.id]["owner"] for e in evidence)
-        if mode in {"first_success", "second_success", "no_retry"}:
+            if denied_first:
+                assert "node_tool_binding_denied" in str(messages)
+                assert discovered not in write_calls  # Rejected before tool/Broker entry.
+                assert not agents[0].metadata["output"].get("sandbox_tool_results")
+                assert (ctx["root"] / discovered).read_text() == (
+                    "def test_discovery():\n    assert True\n")
+                failure = agents[0].metadata["output"].get("model_execution")
+                if mode == "denied_503":
+                    assert failure["degraded"] is True and "HTTP 503" in failure["error"]
+                else:
+                    assert failure is None
+        if mode in {"first_success", "second_success", "no_retry", "denied_success", "denied_503"}:
             assert len(proposals) == 1, [(n.type, n.metadata.get("error")) for n in nodes]
             chosen = observed["receipts"]
             assert len(chosen) == 1
-            expected = task.id + (":evaluation:1" if mode == "second_success" else ":evaluation")
+            expected = task.id + (":evaluation:1" if mode == "second_success" or denied_first
+                                  else ":evaluation")
             assert chosen[0]["node"] == expected
             assert proposals[0].metadata["git_diff_status"] == "available"
             if mode == "first_success":
                 retry = next(n for n in evaluations if n.id.endswith(":evaluation:1"))
                 assert retry.status.value == "skipped"
                 assert next(n for n in nodes if n.id.endswith(":agent:1")).status.value == "skipped"
-            if mode in {"first_success", "second_success"}:
+            if mode in {"first_success", "second_success", "denied_success", "denied_503"}:
                 from Sprout.gateway.rpc_gateway import RPCGateway
 
                 response = await RPCGateway(runtime).handle({"id": 1,
@@ -204,13 +250,78 @@ async def test_compiled_receipt_sources_native(tmp_path, monkeypatch, mode):
                 assert approval.status.value == "completed"
                 assert approval.metadata["output"]["status"] == "failed"
                 assert approval.metadata["output"]["reason"] == "local_acceptance_failed"
-        if mode in {"first_success", "second_success"}:
+        if mode in {"first_success", "second_success", "denied_success", "denied_503"}:
             transaction = await store.get_apply_transaction(str(uuid5(
                 NAMESPACE_URL, "ordinary-apply:" + proposals[0].id)))
             assert transaction["phase"] == "COMPLETED"
         else:
             assert not await store._db.fetchall(
                 "SELECT id FROM isolated_git_transactions WHERE operation='apply_v1'")
+    finally:
+        await runtime.stop()
+        store.close()
+
+
+@pytest.mark.parametrize("mode", ["model_503_no_tool", "write_effect_unknown"])
+async def test_retry_does_not_replay_unconfirmed_agent(tmp_path, monkeypatch, mode):
+    from Sprout.tools.result import ToolExecutionUnconfirmed
+
+    ctx = await prepare_apply_fixture(tmp_path, monkeypatch, "cli")
+    runtime, store, task = ctx["runtime"], ctx["storage"].metadata, ctx["task"]
+    runtime._graph_builder = ExecutionGraphBuilder()
+    runtime._settings = default_settings()
+    runtime._settings.runtime.verify_loops = 2
+    write = runtime._file_broker.write_text
+    calls = []
+
+    async def uncertain(sandbox, path, *args, **kwargs):
+        result = await write(sandbox, path, *args, **kwargs)
+        if path == "src/app.py":
+            assert result.wrote
+            calls.append(str(sandbox.root))
+            raise ToolExecutionUnconfirmed("offline injected loss of write result confirmation")
+        return result
+
+    chat = ctx["model"].chat
+    requests = []
+
+    async def model(history, **kwargs):
+        requests.append([str(m.content or "") for m in history])
+        if mode == "model_503_no_tool" and len(ctx["model"].responses) == 2:
+            raise RuntimeError("Model request failed with HTTP 503: offline no-tool failure")
+        return await chat(history, **kwargs)
+
+    monkeypatch.setattr(ctx["model"], "chat", model)
+    if mode == "write_effect_unknown":
+        monkeypatch.setattr(runtime._file_broker, "write_text", uncertain)
+    try:
+        await runtime._execute_task(task, artifact_snapshot=None)
+        nodes = await store.list_execution_nodes(task.id)
+        agent = next(n for n in nodes if n.id == task.id + ":agent")
+        assert agent.status.value == "waiting"
+        assert agent.metadata["execution_guard"]["state"] == "uncertain"
+        assert ("HTTP 503" if mode == "model_503_no_tool" else "ToolExecutionUnconfirmed") in (
+            agent.metadata["error"])
+        assert await store.get_node_result_source(agent.id) is None
+        assert not any(n.id == task.id + ":agent:1" for n in nodes)
+        assert not await store.list_change_proposals(task.id)
+        assert not runtime._local_acceptance_receipts
+        assert (ctx["root"] / "src/app.py").read_text() == ctx["old"]
+        if mode == "write_effect_unknown":
+            assert len(calls) == 1
+            assert (runtime._frozen_sandboxes[task.id][0].root / "src/app.py").read_text() == (
+                ctx["new"])
+        else:
+            assert not calls
+        # No recovery attempt: inspect the scheduler's ordinary re-entry refusal.
+        request_count = len(requests)
+        await runtime._execute_task(task, artifact_snapshot=None)
+        assert len(requests) == request_count
+        assert len(calls) == (1 if mode == "write_effect_unknown" else 0)
+        (tmp_path / "UNCONFIRMED_AGENT.json").write_text(json.dumps({
+            "mode": mode, "task": task.id, "requests": requests, "write_calls": calls,
+            "nodes": [{"id": n.id, "status": n.status.value, "metadata": n.metadata}
+                      for n in await store.list_execution_nodes(task.id)]}, default=str, indent=2))
     finally:
         await runtime.stop()
         store.close()

@@ -26,7 +26,7 @@ async def cli(rig, captured, monkeypatch):
 
     state = SimpleNamespace(
         terminal=False, classification=0, analysis=True, seen=[], prompts=[],
-        answers=["src/main.py", True], inputs=["帮我分析当前项目的代码架构。"],
+        answers=["src/main.py", True], inputs=["分析 manifest 中指定的文件"],
         display=[], lives=[], session=rig.session.id, user="DISPLAY_NOT_IDENTITY",
         workspace_id=rig.workspace.id, intents=[], query=None,
     )
@@ -307,7 +307,7 @@ async def test_repl_session_continues_without_reclassifying_first_message(cli):
     session_id = cli.create.call_args.kwargs["metadata"]["session_id"]
     turns = await cli.rig.runtime._session_store.recent_turns(session_id, limit=20)
     assert len(turns) == 4
-    assert sum(turn.content == "帮我分析当前项目的代码架构。" for turn in turns) == 1
+    assert sum(turn.content == "分析 manifest 中指定的文件" for turn in turns) == 1
     assert any(turn.content == "你好，继续聊天" for turn in turns)
     assert cli.captured.opens == ["src/main.py"]
 
