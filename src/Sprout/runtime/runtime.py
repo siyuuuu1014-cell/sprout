@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import replace
@@ -220,7 +221,16 @@ def _project_analyze_tool_call(message: Message, intent: str) -> dict[str, Any] 
     if intent != "workspace":
         return None
     text = message.content.casefold()
-    if not any(term.casefold() in text for term in _PROJECT_ANALYZE_TERMS):
+    explicit_analysis = re.search(
+        r"(?:分析|analy[sz]e|inspect)\s+[`\"']?[A-Za-z0-9_./\\-]+(?:\.[a-z0-9_]+|/)",
+        text,
+    )
+    project_analysis = (
+        re.search(r"分析|扫描|\b(?:analy[sz]e|inspect|scan)\b", text)
+        and any(term in text for term in ("项目", "project", "目录", "directory", "folder"))
+    )
+    if not explicit_analysis and not project_analysis and not any(
+            term.casefold() in text for term in _PROJECT_ANALYZE_TERMS):
         return None
     metadata = dict(message.metadata)
     raw_path = (
@@ -331,6 +341,7 @@ class Runtime:
         self._project_analysis_tools = WeakKeyDictionary()
         # Host admissions live only for one local dispatch, never in model metadata.
         self._online_analysis_requests = {}
+        self._cli_code_writes = {}
         # Temporary preparation Tasks are data, not portable read grants.
         self._preparation_tasks = {}
         self._project_analysis_selections = WeakKeyDictionary()
@@ -1813,8 +1824,23 @@ class Runtime:
                 frozen = task.metadata.get("host_acceptance_v1", {}).get("resources", {})
                 if path in frozen:
                     raise PermissionError("frozen_acceptance_write_denied")
+                self._check_cli_write_target(task, path)
         return ActionRequest(task_id=task.id, actor=task.actor, action=ActionType.TOOL_INVOKE,
                              resource=resource, scope=paths)
+
+    def _check_cli_write_target(self, task, path):
+        """Negative restriction only; check before invocation and again before I/O.
+
+        A denied tool entry has no effects to attest. Deferring this restriction
+        until invocation incorrectly leaves the untracked-effects marker set.
+        This never grants a write or clears a marker from a previous operation.
+        """
+        bound = self._cli_code_writes.get(task.id)
+        if bound is not None or "cli_write_paths" in task.metadata:
+            if (bound is None or bound[:3] != (
+                    task.actor, task.metadata.get("session_id"), task.workspace_id)
+                    or path not in bound[3]):
+                raise PermissionError("cli_code_write_target_denied")
 
     async def _node_file_request(self, request, sandbox):
         from Sprout.task.paths import scope_path
@@ -1824,6 +1850,13 @@ class Runtime:
         if frame is None or getattr(frame[0], "_sandbox", None) != sandbox:
             raise PermissionError("node_file_binding_unavailable")
         subject = await self._node_tool_request(frame[0], frame[2])
+        from Sprout.security.access import ActionType
+
+        if request.action is ActionType.FILE_WRITE:
+            task = await self._metadata_or_raise().get_task(subject.task_id)
+            if task is not None:
+                self._check_cli_write_target(task,
+                    Path(request.resource.path).relative_to(sandbox.root).as_posix())
         if (request.task_id != subject.task_id or scope_path(request.resource.path) is None
                 or scope_path(request.resource.path) != scope_path(subject.resource.path)):
             raise PermissionError("node_file_resource_mismatch")
@@ -2550,13 +2583,14 @@ class Runtime:
         )
 
     async def _ordinary_conversation_context(self, message, session, tools, skills):
-        """Restore newly recorded original input, not unlabelled derived memory.
-
-        Old assistant/facts/recall/knowledge rows cannot be certified from a role,
-        scope string or model metadata. Their admission needs the pending Origin
-        contract, so this deliberately reports partial conversation coverage.
-        """
+        """Restore owned dialogue as data, never as project or tool authority."""
         from Sprout.memory.models import ContextMemory
+        from Sprout.runtime.dialogue import (
+            analysis_followup,
+            code_status,
+            dialogue_window,
+            project_answer,
+        )
 
         stored = await self._session_store.get_session(session.id)
         if stored is None:
@@ -2574,14 +2608,34 @@ class Runtime:
         turns = await self._session_store.recent_turns(
             stored.id, limit=self._contexts._settings.working_window,
         )
-        working = tuple(turn for turn in turns if (
-            (turn.role == "user" and self._original_user_turns.get((stored.id, turn.id))
-             == (turn.content, dict(turn.metadata)))
-            or (turn.role == "assistant"
-                and self._ordinary_assistant_turns.get((stored.id, turn.id))
-                == (turn.content, dict(turn.metadata)))))
+        # Project publications have their own source check below; ordinary
+        # role/history rows cannot substitute for a project receipt.
+        dialogue = tuple(turn for turn in turns if not (
+            turn.role == "assistant" and isinstance(turn.metadata.get("agent"), dict)
+            and turn.metadata["agent"].get("project_analysis_ref_v1")))
+        working = dialogue_window(dialogue, stored.id, self._contexts._settings)
         base = self._contexts._isolated_context(message, stored, tools, skills)
-        return replace(base, memory=ContextMemory(session=base.session, working=working))
+        followup = analysis_followup(message.content)
+        answer = await project_answer(self, stored, principal) if followup else None
+        metadata = {**base.metadata, "conversation_history_only": True}
+        if answer is not None:
+            # A validated historical node answer, not raw tool JSON or a new
+            # execution grant. This turn only interprets the existing result.
+            from Sprout.session.models import Turn
+
+            working = (*working, Turn(stored.id, "assistant",
+                "Historical completed analysis; not a claim about current file bytes:\n" + answer,
+                seq=max((turn.seq for turn in working), default=0) + 1))
+            metadata["project_analysis_followup"] = True
+        status = await code_status(self, stored, principal)
+        if status is not None:
+            from Sprout.session.models import Turn
+
+            working = (*working, Turn(stored.id, "assistant", status,
+                seq=max((turn.seq for turn in working), default=0) + 1))
+        working = dialogue_window(working, stored.id, self._contexts._settings)
+        return replace(base, memory=ContextMemory(session=base.session, working=working),
+                       tools={} if answer is not None else base.tools, metadata=metadata)
 
     def _ordinary_response_has_source(self, context, agent, result):
         """Only the normal online call may attest a resource-free response.
@@ -2594,7 +2648,8 @@ class Runtime:
         from Sprout.agent.loop import AgentLoop
         from Sprout.memory.models import ContextMemory
 
-        if (context is None or context.workspace is not None or context.files
+        if (context is None or context.metadata.get("conversation_history_only")
+                or context.workspace is not None or context.files
                 or context.knowledge or type(context.memory) is not ContextMemory
                 or context.memory.summary or context.memory.facts
                 or context.memory.recalled or context.memory.knowledge
@@ -2963,6 +3018,7 @@ class Runtime:
         if self._agent_step_store is not None:
             self._agent_step_store.close()
         self._local_git_reviews.clear()
+        self._cli_code_writes.clear()
         getattr(self, "_verification_hosts", {}).clear()
         for frame in getattr(self, "_verification_frames", {}):
             frame.active = False
@@ -3023,6 +3079,11 @@ class Runtime:
         This local-only lane does not select Tasks by Session, create a Scope,
         or reinterpret old/running graphs. The existing guard owns execution.
         """
+        from Sprout.runtime.dialogue import analysis_followup, project_answer
+
+        if (analysis_task is None and principal is not None and analysis_followup(message.content)
+                and await project_answer(self, session, principal) is not None):
+            return None
         if _project_analyze_tool_call(message, str(classification.get("intent", ""))) is None:
             return None
         from Sprout.orchestration.service import SequentialOrchestrator
@@ -3159,6 +3220,11 @@ class Runtime:
                     "unavailable_reason", "project_analysis_unavailable"))
             await self._persist_node_products()
             content = output["content"]
+            current_session.metadata = {**current_session.metadata,
+                "project_analysis_ref_v1": {"task_id": task.id, "node_id": node.id}}
+            if not self.session_workspace_id(current_session):
+                current_session.metadata[self.SESSION_WORKSPACE_KEY] = workspace.id
+            await self._session_store.save_session(current_session)
             coverage = admission["analysis_result"].data.get("coverage", {})
             if coverage.get("mode") == "discovery":
                 content += ("\n\n覆盖范围 / coverage: authorized project files; "
@@ -3174,7 +3240,9 @@ class Runtime:
                                    session_id=session.id, correlation_id=message.id,
                                    metadata={"analysis_status": "unavailable" if reason else "ok",
                                              "reason": reason})
-        await self._persist_turns(session, message, AgentResult(content=content))
+        await self._persist_turns(session, message, AgentResult(content=content, metadata=(
+            {"project_analysis_ref_v1": {"task_id": task.id, "node_id": node.id}}
+            if not reason else {})))
         return outbound
 
     async def handle(
@@ -3183,6 +3251,7 @@ class Runtime:
         _resume_calls: list | None = None,
         analysis_task: Task | None = None,
         analysis_task_provider: Callable[..., Awaitable[Task | None]] | None = None,
+        code_task_provider: Callable[..., Awaitable[Task | None]] | None = None,
     ) -> OutboundMessage:
         """Run one online turn. Middleware -> session -> router -> context -> agent."""
         if self._router is None:
@@ -3249,7 +3318,8 @@ class Runtime:
         # was answered by an agent that could not do it, and nothing said why.
         # Now it asks which directory instead of degrading.
         handled = await self._dispatch_task_intent(
-            message, context, session, principal=principal, foreground=foreground
+            message, context, session, principal=principal, foreground=foreground,
+            code_task_provider=code_task_provider,
         )
         if handled is not None:
             outbound, held = handled
@@ -3334,6 +3404,7 @@ class Runtime:
     async def _handle_task(
         self, message: Message, session, *, principal: Principal | None = None,
         foreground: bool = False,
+        code_task_provider=None,
     ) -> OutboundMessage:
         """Queue a coding task for background execution and ack immediately.
 
@@ -3358,27 +3429,57 @@ class Runtime:
         # No caller-selected channel or metadata can turn unattended input into
         # an interactive approval source. Unresolved embeddings are unattended.
         source = principal.source if principal is not None else "automation"
-        task = await self.create_task(
-            workspace_id,
-            message.content,
-            actor=principal or Principal(user_id="anonymous", source=source),
-            source=source,
-            # Recorded so a later turn can report this task back to the session
-            # that asked for it. Without it a parked task belongs to no
-            # conversation, and the person who asked is never told.
-            metadata={
-                **({"session_id": session.id} if session.id else {}),
-                "response_language": str(
-                    message.metadata.get("cli_language")
-                    or message.metadata.get("response_language")
-                    or detect_language(message.content)
-                ),
-            },
-        )
+        if code_task_provider is not None:
+            from copy import deepcopy
+
+            owned = await self._sessions.require_owner(session.id, principal)
+            if self._sessions.frozen_principal(owned) != principal:
+                raise PermissionError("code_task_subject_unavailable")
+            task = await code_task_provider(
+                message=replace(message, metadata={}), session=deepcopy(owned), principal=principal)
+            if task is None:
+                return OutboundMessage("code_task_cancelled", message.channel, session.id,
+                                       message.id, {"intent": "task", "cancelled": True})
+            stored = await self._metadata_or_raise().get_task(task.id)
+            current_session = await self._sessions.require_owner(session.id, principal)
+            if (stored != task or task.actor != principal or task.source != principal.source
+                    or self._sessions.frozen_principal(current_session) != principal
+                    or task.workspace_id != workspace_id
+                    or task.execution_mode is not TaskExecutionMode.CODE
+                    or task.status is not TaskStatus.CREATED
+                    or task.metadata.get("session_id") != session.id
+                    or not task.delegation_scope.allowed_paths
+                    or task.delegation_scope.is_expired()
+                    or await self._metadata_or_raise().list_execution_nodes(task.id)):
+                raise PermissionError("code_task_subject_unavailable")
+        else:
+            task = await self.create_task(
+                workspace_id,
+                message.content,
+                actor=principal or Principal(user_id="anonymous", source=source),
+                source=source,
+                # Preserve execution attribution without deriving authority
+                # from Message metadata or a display user name.
+                metadata={
+                    **({"session_id": session.id} if session.id else {}),
+                    "response_language": str(
+                        message.metadata.get("cli_language")
+                        or message.metadata.get("response_language")
+                        or detect_language(message.content)
+                    ),
+                },
+            )
         if foreground:
+            if code_task_provider is not None:
+                current_session = await self._sessions.require_owner(session.id, principal)
+                current_session.metadata = {
+                    **current_session.metadata, "last_code_task_id": task.id}
+                await self._session_store.save_session(current_session)
             result = await self.execute(task)
+            content = f"Task {task.id}: {result.status.value}"
+            await self._persist_turns(session, message, AgentResult(content=content))
             return OutboundMessage(
-                content="",
+                content=content,
                 channel=message.channel,
                 session_id=session.id,
                 correlation_id=message.id,
@@ -3498,6 +3599,7 @@ class Runtime:
     async def _dispatch_task_intent(
         self, message: Message, context, session, *, principal: Principal | None = None,
         foreground: bool = False,
+        code_task_provider=None,
     ) -> tuple[OutboundMessage, Message | None] | None:
         """Handle a coding intent, or return ``None`` to run the turn normally.
 
@@ -3530,7 +3632,8 @@ class Runtime:
             # The message names its workspace: the resume from a consent grant,
             # or a caller that bound one deliberately. Already an instruction.
             return await self._handle_task(
-                message, session, principal=principal, foreground=foreground
+                message, session, principal=principal, foreground=foreground,
+                code_task_provider=code_task_provider,
             ), None
         # A workspace the operator consented to earlier in this session. Without
         # this the session only stopped *asking*; the coding intent still fell
@@ -3555,7 +3658,8 @@ class Runtime:
             metadata={**dict(message.metadata), "workspace_id": workspace_id},
         )
         return await self._handle_task(
-            message, session, principal=principal, foreground=foreground
+            message, session, principal=principal, foreground=foreground,
+            code_task_provider=code_task_provider,
         ), None
 
     async def _workspace_request_from_agent(
@@ -3863,7 +3967,8 @@ class Runtime:
         }
         if isinstance(cli_command_family, str) and cli_command_family:
             metadata["cli_command_family"] = cli_command_family
-        project_analyze_call = _project_analyze_tool_call(message, intent)
+        project_analyze_call = (None if context.metadata.get("project_analysis_followup")
+                                else _project_analyze_tool_call(message, intent))
         if project_analyze_call is not None:
             metadata["resume_tool_calls"] = [project_analyze_call]
         enriched = replace(message, metadata=metadata)
@@ -4058,6 +4163,7 @@ class Runtime:
         self, message: Message, *, principal: Principal | None = None, foreground: bool = False,
         analysis_task: Task | None = None,
         analysis_task_provider: Callable[..., Awaitable[Task | None]] | None = None,
+        code_task_provider: Callable[..., Awaitable[Task | None]] | None = None,
     ):
         """Run one online turn and stream the agent's text chunks."""
         if self._router is None:
@@ -4118,7 +4224,8 @@ class Runtime:
         # present — the ask-for-workspace fix would have been unreachable from
         # the one surface a user types into.
         handled = await self._dispatch_task_intent(
-            message, context, session, principal=principal, foreground=foreground
+            message, context, session, principal=principal, foreground=foreground,
+            code_task_provider=code_task_provider,
         )
         if handled is not None:
             outbound, held = handled
@@ -4393,6 +4500,12 @@ class Runtime:
         publishes the stored turn ids/seqs so derived lanes and observers can
         react without re-reading the session store.
         """
+        if (ordinary_context is not None
+                and ordinary_context.metadata.get("project_analysis_followup")):
+            stored = await self._session_store.get_session(session.id)
+            if stored is not None:
+                result = replace(result, metadata={**result.metadata,
+                    "project_analysis_ref_v1": stored.metadata.get("project_analysis_ref_v1")})
         user_body, user_envelope = await self._offload_body(message.content, turn_envelope(message))
         assistant_body, assistant_envelope_dict = await self._offload_body(
             result.content, assistant_envelope(message, result.metadata)

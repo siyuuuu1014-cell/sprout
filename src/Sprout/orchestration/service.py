@@ -8,7 +8,6 @@ until a human decides (spec 8.3, 11.5).
 
 from __future__ import annotations
 
-import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
@@ -214,9 +213,10 @@ class SequentialOrchestrator:
                 return await result if hasattr(result, "__await__") else result
 
             if running.budget.timeout_seconds > 0:
-                return await asyncio.wait_for(
-                    call_handler(), timeout=running.budget.timeout_seconds,
-                )
+                from Sprout.orchestration.node_budget import NodeExecutionBudget
+
+                async with NodeExecutionBudget(running):
+                    return await call_handler()
             return await call_handler()
 
         # Claim, cached results, cancellation and uncertain effects all retain

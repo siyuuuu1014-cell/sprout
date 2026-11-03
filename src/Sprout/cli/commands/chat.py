@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import shlex
 import shutil
 import sys
@@ -37,6 +38,7 @@ from rich.text import Text
 from rich.theme import Theme
 
 from Sprout.cli import ui
+from Sprout.cli.code_task import provider as _cli_code_task_provider
 from Sprout.cli.diff import render_diff
 from Sprout.cli.i18n import L as _L
 from Sprout.cli.i18n import current_language as _current_cli_language
@@ -47,7 +49,7 @@ from Sprout.cli.i18n import supported_languages as _supported_languages
 from Sprout.gateway.identity import Principal
 from Sprout.gateway.local_identity import current_cli_principal
 from Sprout.llm.messages import Usage
-from Sprout.message.models import Message
+from Sprout.message.models import Message, StreamChunk
 from Sprout.security.redact import Redactor
 
 _CHAT_HISTORY = InMemoryHistory()
@@ -260,7 +262,7 @@ async def _chat(runtime, settings, *, message: str | None, session: str | None, 
 
     try:
         async with managed(runtime):
-            workspace_id = await _confirm_cli_workspace(runtime)
+            session, workspace_id = await _prepare_cli_context(runtime, session, user)
             gateway = CLIGateway(runtime)
             if message is not None:
                 if _handle_natural_language_request(message):
@@ -281,11 +283,12 @@ async def _chat(runtime, settings, *, message: str | None, session: str | None, 
                 )
                 _render_cli_markdown(reply.content)
                 _print_reply_meta(reply.metadata)
+                session = str(reply.metadata.get("session_id") or session or "")
                 # One-shot mode (``sprout chat "..."``) can still answer: the
                 # prompt runs here rather than being silently dropped, which
                 # would leave a held task nobody knows about.
                 handled = await _handle_cli_workspace_consent(
-                    runtime, reply.session_id or session, dict(reply.metadata), user
+                    runtime, session, dict(reply.metadata), user
                 )
                 if not handled:
                     if dict(reply.metadata).get("foreground_task"):
@@ -295,9 +298,9 @@ async def _chat(runtime, settings, *, message: str | None, session: str | None, 
                         handled = True
                     else:
                         await _handle_cli_approval_prompt(
-                            runtime, reply.session_id or session, dict(reply.metadata), user
+                            runtime, session, dict(reply.metadata), user
                         )
-                await _report_parked_tasks(runtime, reply.session_id or session)
+                await _report_parked_tasks(runtime, session)
                 _print_session_separator()
                 return
             await _repl(
@@ -358,11 +361,12 @@ async def _provide_cli_analysis_task(runtime, workspace_id, *, message, session,
     typer.echo(_L(
         "选择范围不替代 Policy/Scope 授权。", "Selection does not override Policy/Scope.",
     ))
-    if any(term in message.content.casefold() for term in (
-            "整个项目", "完整项目", "whole project", "entire project")):
-        return await _provide_cli_directory_task(runtime, workspace, session, principal, message)
+    selection = _analysis_selection(message.content)
+    if selection and selection[0] == "directory":
+        return await _provide_cli_directory_task(
+            runtime, workspace, session, principal, message, label=selection[1])
     try:
-        raw = await questionary.text(_L(
+        raw = selection[1] if selection else await questionary.text(_L(
             "输入 Workspace 相对文件路径或 JSON 文件清单（空白取消）：",
             "Enter a workspace-relative file or JSON file list (blank cancels):",
         )).ask_async()
@@ -420,7 +424,33 @@ async def _provide_cli_analysis_task(runtime, workspace_id, *, message, session,
     )
 
 
-async def _provide_cli_directory_task(runtime, workspace, session, principal, message):
+def _analysis_selection(content: str) -> tuple[str, str] | None:
+    """Select a request, never grant it. Ambiguous lists retain explicit selection."""
+    token = r"[A-Za-z0-9_./\\-]+"
+    files = re.findall(
+        rf"(?<![A-Za-z0-9_/\\])({token}\.[A-Za-z0-9_]+)(?![A-Za-z0-9_/\\])", content)
+    directories = re.findall(
+        rf"({token})\s*(?:子目录|目录|directory\b|folder\b)", content, re.IGNORECASE)
+    directories += re.findall(
+        rf"(?:子目录|目录|directory\b|folder\b)\s*[:：]?\s*[`\"']?({token})",
+        content, re.IGNORECASE)
+    if not files:
+        directories += re.findall(rf"(?<![A-Za-z0-9_/\\])({token}[/\\])", content)
+    paths = {(kind, path.replace("\\", "/")) for kind, values in (
+        ("file", files), ("directory", directories)) for path in values}
+    if len(paths) == 1:
+        return next(iter(paths))
+    if paths:
+        return None
+    if any(term in content.casefold() for term in (
+            "项目", "架构", "依赖", "project", "architecture", "dependencies")):
+        return "directory", "."
+    return None
+
+
+async def _provide_cli_directory_task(
+    runtime, workspace, session, principal, message, *, label=None,
+):
     """Confirm a finite directory request; only server policy grants enumeration."""
     from Sprout.security.access import AccessDecision, ActionRequest, ActionType
     from Sprout.task.models import DelegationScope, TaskExecutionMode
@@ -428,7 +458,7 @@ async def _provide_cli_directory_task(runtime, workspace, session, principal, me
     from Sprout.workspace.models import ResourceKind, ResourceRef
 
     try:
-        raw = await questionary.text(_L(
+        raw = label if label is not None else await questionary.text(_L(
             "本次自动分析目录（Workspace 相对路径，. 表示项目根；空白取消）：",
             "Analysis directory (workspace-relative, . for root; blank cancels):",
         )).ask_async()
@@ -481,6 +511,15 @@ def _cli_analysis_task_provider(runtime, workspace_id, live=None):
             if live is not None:
                 live.start()
     return provide
+
+
+async def _cli_turn_stream(runtime, message, **kwargs):
+    """Display a denied turn without granting, retrying or settling its effects."""
+    try:
+        async for chunk in runtime.handle_stream(message, **kwargs):
+            yield chunk
+    except PermissionError as exc:
+        yield StreamChunk(error=str(exc))
 
 
 async def _repl(
@@ -738,9 +777,10 @@ async def _repl(
                 refresh_per_second=12,
                 vertical_overflow="crop",
             ) as live:
-                async for chunk in runtime.handle_stream(
-                    stream_message, principal=principal, foreground=True,
+                async for chunk in _cli_turn_stream(
+                    runtime, stream_message, principal=principal, foreground=True,
                     analysis_task_provider=_cli_analysis_task_provider(runtime, workspace_id, live),
+                    code_task_provider=_cli_code_task_provider(runtime, workspace_id, live),
                 ):
                     if chunk.error is not None:
                         response_error = chunk.error
@@ -758,9 +798,10 @@ async def _repl(
                         reply_metadata = dict(chunk.outbound.metadata)
         else:
             typer.echo(ui.muted(_L("  正在生成…", "  Generating…")))
-            async for chunk in runtime.handle_stream(
-                stream_message, principal=principal, foreground=True,
+            async for chunk in _cli_turn_stream(
+                runtime, stream_message, principal=principal, foreground=True,
                 analysis_task_provider=_cli_analysis_task_provider(runtime, workspace_id),
+                code_task_provider=_cli_code_task_provider(runtime, workspace_id),
             ):
                 if chunk.error is not None:
                     response_error = chunk.error
@@ -861,6 +902,22 @@ async def _approve_task_gates(runtime: Any, task: Any, user: str) -> None:
             typer.echo(ui.key_value("files", ", ".join(proposal.files_changed) or "-"))
             for diff in proposal.diffs:
                 render_diff(diff.path, diff.diff_text)
+            if proposal.id in runtime._local_apply_plans:
+                body = proposal.metadata["apply_plan"]
+                typer.echo(f"Plan SHA256: {proposal.metadata['apply_plan_sha256']}")
+                for item in body["files"]:
+                    typer.echo(f"{item['path']}: {item['before']} -> {item['after']}")
+                content = proposal.metadata.get("content_diff")
+                if content:
+                    typer.echo("Exact Workspace replacement (content snapshots; not Git output):")
+                    render_diff("workspace_replacement", content["text"])
+                if await _prompt_task_gate_choice(
+                        "Approve this entire exact Apply Plan?") != "approve":
+                    return
+                await runtime.approve_change_proposal(proposal.id, decided_by="cli",
+                                                     principal=current_cli_principal())
+                typer.echo(ui.success("Exact Apply Plan approved; checking persisted result."))
+                continue
             has_failures = any(item.failed for item in proposal.test_results)
             if has_failures:
                 typer.echo(
@@ -1135,6 +1192,35 @@ async def _handle_cli_workspace_consent(
             typer.echo(ui.muted(_workspace_consent_text("submitted", task_id=task_id)))
             runtime.schedule_background(_watch_background_task(runtime, task_id))
     return True
+
+
+async def _prepare_cli_context(runtime: Any, session_id: str | None, user: str):
+    """Restore an owned session before consulting this process' current directory."""
+    principal = current_cli_principal()
+    if not principal.authenticated or principal.source != "cli":
+        raise PermissionError("cli_session_identity_unavailable")
+    if session_id:
+        session = await runtime._sessions.require_owner(session_id, principal)
+        if runtime._sessions.frozen_principal(session) != principal:
+            raise PermissionError("cli_session_identity_unavailable")
+        workspace_id = runtime.session_workspace_id(session)
+        if workspace_id:
+            workspace = await runtime.get_workspace(workspace_id)
+            if workspace is None or not workspace.root.is_dir():
+                raise PermissionError("cli_session_workspace_unavailable")
+            return session.id, workspace_id
+    workspace_id = await _confirm_cli_workspace(runtime)
+    session = await runtime._sessions.resolve(
+        Message("", channel="cli", user_id=user, session_id=session_id), principal=principal)
+    # Confirmation yielded to terminal input. Recheck ownership before binding.
+    session = await runtime._sessions.require_owner(session.id, principal)
+    if runtime._sessions.frozen_principal(session) != principal:
+        raise PermissionError("cli_session_identity_unavailable")
+    if workspace_id:
+        if await runtime.get_workspace(workspace_id) is None:
+            raise PermissionError("cli_session_workspace_unavailable")
+        await runtime._remember_session_workspace(session.id, workspace_id)
+    return session.id, workspace_id
 
 
 async def _confirm_cli_workspace(runtime: Any) -> str:

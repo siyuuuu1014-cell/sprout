@@ -13,7 +13,7 @@ from Sprout.tests.test_r04_pa2_b1_binding import rig as rig
 @pytest.fixture
 def automatic(cli, monkeypatch):
     cli.state.inputs = ["分析当前整个项目"]
-    cli.state.answers = [".", True]
+    cli.state.answers = [True]
     policy = LayeredPolicyEngine(workspace=PolicyLayer("auto-host", (
         PolicyRule(action="directory.list", decision=AccessDecision.ALLOW, id="host-directory"),
         PolicyRule(action="file.read", path_glob="*private*", decision=AccessDecision.DENY,
@@ -59,7 +59,8 @@ async def test_whole_project_natural_language_repl_not_manual_manifest(automatic
 
 async def test_whole_project_can_limit_to_known_subtree(automatic):
     cli = automatic
-    cli.state.answers = ["src", True]
+    cli.state.inputs = ["分析 src 子目录的项目结构"]
+    cli.state.answers = [True]
     await cli.run()
     assert cli.create.call_args.kwargs["delegation_scope"].allowed_paths == (
         str(cli.rig.root / "src"),)
@@ -74,7 +75,7 @@ async def test_whole_project_query_uses_current_discovery(automatic):
                for m in cli.state.seen if str(m.role) == "tool")
 
 
-@pytest.mark.parametrize("answers", [["", True], [".", False], ["../outside", True]])
+@pytest.mark.parametrize("answers", [[False], [None], [KeyboardInterrupt()]])
 async def test_auto_cancel_or_invalid_does_not_create_task(automatic, answers):
     cli = automatic
     cli.state.answers = answers

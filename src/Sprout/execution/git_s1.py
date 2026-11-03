@@ -643,6 +643,7 @@ async def _run_review(binding, issuer, frame, broker):
     """Task-only Git-generated snapshot diffs; the original repository is never executed."""
     import hashlib
     import json
+    import re
     from contextlib import ExitStack
     from dataclasses import asdict
     from uuid import uuid4
@@ -667,6 +668,18 @@ async def _run_review(binding, issuer, frame, broker):
         broker._check_review_policy(frame.task, paths, binding.sandbox.root)
     def authorize():
         check_selected(binding.paths)
+    object_resource = None
+    def selected_object(path, read, *arguments):
+        nonlocal object_resource
+        if path not in binding.paths:
+            raise PermissionError("git_object_selection_denied")
+        previous, object_resource = object_resource, path
+        try:
+            # Only synchronous Host object reads run in this association. No
+            # await, process effect or saved ALLOW may cross this boundary.
+            return read(*arguments)
+        finally:
+            object_resource = previous
     def for_resource(root, relative):
         # Source files and their exact Host materializations have one owning
         # selected resource. Metadata, installation and control retain the full
@@ -674,6 +687,13 @@ async def _run_review(binding, issuer, frame, broker):
         selected = None
         if root == binding.sandbox.root and relative in binding.paths:
             selected = relative
+        elif (root == binding.common and object_resource is not None
+              and len(Path(relative).parts) == 3 and Path(relative).parts[0] == "objects"
+              and re.fullmatch(r"objects/[0-9a-f]{2}/[0-9a-f]{38}",
+                               Path(relative).as_posix())):
+            # The Host is resolving this exact selected file through its
+            # pinned baseline/index. Shared management data still uses ALL.
+            selected = object_resource
         else:
             active = issuer._git_review_state(frame.task.id).get("git_active")
             parts = Path(relative).parts
@@ -703,7 +723,7 @@ async def _run_review(binding, issuer, frame, broker):
             raise PermissionError("git_metadata_root_changed")
         index, metadata, reader = _source(binding, authorize)
         objects = _LooseObjects(binding, reader)
-        base = {path: objects.file(path) for path in binding.paths}
+        base = {path: selected_object(path, objects.file, path) for path in binding.paths}
         current, current_state, total_current = {}, {}, 0
         for path in binding.paths:
             await refresh()
@@ -742,7 +762,7 @@ async def _run_review(binding, issuer, frame, broker):
             if (path not in binding.paths or stage != "0" or path in indexed
                     or mode not in {"100644", "100755"}):
                 raise PermissionError("git_unmerged_or_nonregular_index")
-            indexed[path] = objects.object(oid, "blob")
+            indexed[path] = selected_object(path, objects.object, oid, "blob")
         if sum(map(len, indexed.values())) > 1_000_000:
             raise PermissionError("git_index_content_budget")
         for path in binding.paths:
@@ -763,15 +783,18 @@ async def _run_review(binding, issuer, frame, broker):
             await _check_review_files(view, payload, refresh, authorize)
         for key, left, right in (("tracked", "base", "current"), ("staged", "base", "index"),
                                  ("unstaged", "index", "current"), ("untracked", "empty", "new")):
-            await _check_review_files(view, payload, refresh, authorize)
+            # ready() is the command's mandatory pre/post View check. Scanning
+            # here too only repeats its precheck before authority-only awaits;
+            # no Git command can run without ready() checking the full View.
             _, result = await _review_command(binding, view,
                 ("diff", "--no-index", "--no-color", "--no-ext-diff", "--no-textconv",
                  "--find-renames", "--", left, right), ready,
                 issuer=issuer, frame=frame, broker=broker)
             logs.append(result)
             patches[key] = result["stdout"]
-        await _check_review_files(view, payload, refresh, authorize)
         # Re-read exact original resources before publishing, not just export bytes.
+        # The final ready() below checks the complete View after these source
+        # reads; none of them consumes exported View contents or executes Git.
         _source(binding, authorize)  # Recheck pairing/HEAD as well as the exact source bytes.
         for name, expected in metadata.items():
             path = Path(name)
@@ -873,6 +896,11 @@ async def run_review(binding, issuer, frame, broker):
         raise PermissionError("git_review_node_budget_unproved")
     remaining = current.budget.timeout_seconds - (
         datetime.now(UTC) - datetime.fromisoformat(guard["started_at"])).total_seconds()
+    from Sprout.orchestration.node_budget import active_seconds_remaining
+
+    active_remaining = active_seconds_remaining(current)
+    if active_remaining is not None:
+        remaining = active_remaining
     if remaining < REVIEW_TOTAL_SECONDS + CLEANUP_SECONDS:
         raise PermissionError("git_review_node_budget_insufficient:" + str(remaining))
     host = issuer._git_review_state(frame.task.id)
@@ -886,7 +914,12 @@ async def run_review(binding, issuer, frame, broker):
     host["git_active"] = active
     try:
         async with asyncio.timeout(REVIEW_TOTAL_SECONDS):
-            return await _run_review(binding, issuer, frame, broker)
+            result = await _run_review(binding, issuer, frame, broker)
+            # Synchronous native checks/audit may finish after the deadline
+            # without yielding to the timeout callback. Never publish that result.
+            if time.monotonic() - active["started"] >= REVIEW_TOTAL_SECONDS:
+                raise TimeoutError()
+            return result
     except TimeoutError:
         raise ToolExecutionUnconfirmed("git_review_total_timeout; no automatic retry") from None
     finally:

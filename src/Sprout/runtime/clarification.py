@@ -183,19 +183,32 @@ async def route_clarification(
         elif choice == "read":
             # No Agent executor or tools are available on this strict analysis
             # route, even if a model emits unsolicited tool calls.
+            from Sprout.runtime.dialogue import analysis_followup, project_answer
+
+            answer = (await project_answer(runtime, session, frozen)
+                      if analysis_followup(snapshot["request"]) else None)
+            messages = [LLMMessage.system(
+                "Analyze only the supplied request/context. Do not execute tools "
+                "or claim to have inspected files you have not read.")]
+            if answer is not None:
+                messages.append(LLMMessage.assistant(
+                    "Historical completed project analysis, not a fresh scan:\n" + answer))
+            messages.append(LLMMessage.user("只分析，不修改、不执行：\n" + snapshot["request"]))
             try:
-                response = await runtime.models.default().chat([
-                    LLMMessage.system("Analyze only the supplied request/context. Do not execute "
-                                      "tools or claim to have inspected files you have not read."),
-                    LLMMessage.user("只分析，不修改、不执行：\n" + snapshot["request"]),
-                ], tools=())
+                response = await runtime.models.default().chat(messages, tools=())
                 content = response.text
             except Exception:
                 content = "已选择只读分析，但分析模型暂不可用。未执行任何操作，请重新发起只读请求。"
-            content = "说明：以下仅基于你提供的请求文本，未读取或检查真实仓库文件。\n\n" + content
+            content = (("说明：以下复用已完成且来源核验通过的项目分析，未重新扫描或修改文件。\n\n"
+                        if answer is not None else
+                        "说明：以下仅基于你提供的请求文本，未读取或检查真实仓库文件。\n\n")
+                       + content)
             return await _reply(runtime, message, session, content, intent="conversation",
-                                clarification_resolution="read", analysis_scope="request_text_only",
-                                repository_inspected=False)
+                clarification_resolution="read", repository_inspected=False,
+                analysis_scope="completed_project_analysis" if answer is not None
+                else "request_text_only",
+                **({"project_analysis_ref_v1": session.metadata["project_analysis_ref_v1"]}
+                   if answer is not None else {}))
         else:
             return await _reply(runtime, message, session,
                                 "已取消，未执行原请求。" if choice == "cancel" else
