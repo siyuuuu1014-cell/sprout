@@ -67,7 +67,7 @@ async def _run_command(
     )
     try:
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
-    except TimeoutError:
+    except (TimeoutError, asyncio.CancelledError):
         process.kill()
         await process.wait()
         raise
@@ -652,6 +652,10 @@ class GitInspectTool:
         method = getattr(self._git_broker, operation, None)
         if not callable(method):
             return ToolResult.denied(f"GitBroker capability '{operation}' is unavailable")
+        if operation in {"log", "diff"} and any(
+            key in arguments for key in ("ref", "base", "files", "name_only")
+        ):
+            return ToolResult.denied("Git filters require a Task-owned review contract")
         if operation in {"status", "log", "branch", "diff"}:
             workspace = _workspace_for(repo)
             if operation == "status":

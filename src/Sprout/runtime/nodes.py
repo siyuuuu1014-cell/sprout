@@ -251,6 +251,10 @@ class NodeExecutor:
             with task_model_budget(self._metadata, task.id, node.id, task.budget.max_model_calls):
                 result = await self._execute_node(node, workspace, read_plan, task)
                 if scope is not None:
+                    if scope.sandbox_tool_results and isinstance(result, dict):
+                        result = {
+                            **result, "sandbox_tool_results": list(scope.sandbox_tool_results),
+                        }
                     scope.runtime._remember_node_product(scope, result)
                 return result
 
@@ -385,7 +389,7 @@ class NodeExecutor:
             context = replace(context, tools=tools)
         for tool in context.tools.values():
             scope.runtime._node_tool_scopes[tool] = scope
-        return await agent.run(message, context)
+        return await scope.runtime._run_recorded_agent(agent, message, context)
 
     async def _read(
         self, workspace: Workspace, read_plan: ReadPlan, task: Task
@@ -686,6 +690,7 @@ class NodeExecutor:
             except (OSError, ValueError, ImportError):
                 return self._acceptance_wait("local_executor_unavailable")
         if payload is None:
+            await self._check_model_publication(node, workspace, task)
             resources = self._resources(self._output_for(nodes, NodeType.READ), workspace)
             prompt = acceptance_prompt(task.instruction) + "\nProject evidence:\n" + json.dumps(
                 resources, ensure_ascii=False,
@@ -1204,6 +1209,21 @@ class NodeExecutor:
         output["verification_report"] = build_verification_report(
             test_results, output,
         ).to_payload()
+        if (local_scope is not None and task.id in local_scope.runtime._frozen_sandboxes
+                and not pending_approvals and records
+                and len(records) == len(planned)
+                and all(r["started"] and r["allowed"]
+                        and type(r["exit_code"]) is int for r in records)):
+            # Data provenance for a completed check (including failures), not
+            # a successful verification credential or permission to execute.
+            await local_scope.runtime._project_analysis_subject(local_scope)
+            await local_scope.runtime._persist_node_products()
+            upstream = await self._metadata.list_execution_nodes(task.id)
+            sources = [await self._metadata.get_node_result_source(n.id)
+                       for n in upstream if n.metadata.get("output") is not None]
+            if sources and all(source is not None for source in sources):
+                await self._check_model_publication(node, workspace, task)
+                local_scope.local_evaluation_result = output
         return output
 
     async def _run_verification_command(
@@ -1225,7 +1245,11 @@ class NodeExecutor:
                 task=task, node=node, command=parts, cwd=cwd, command_slot=command_slot)
         outcome = None
         for attempt in range(attempts):
-            outcome = await self._process_broker.run(
+            controlled = (self._local_acceptance and task.metadata.get("host_acceptance_v1")
+                          and node is not None and node.type is NodeType.EVALUATION)
+            runner = (self._process_broker.run_evaluation_command if controlled
+                      else self._process_broker.run)
+            outcome = await runner(
                 workspace,
                 parts,
                 cwd=cwd,
@@ -1239,8 +1263,9 @@ class NodeExecutor:
                 source=str(task.actor.source or "interactive"),
                 requested_by=task.actor.user_id or "system",
                 resource_scope=task.workspace_id,
+                session_id=task.metadata.get("session_id", ""),
             )
-            if outcome.allowed and outcome.exit_code == 0:
+            if controlled or outcome.allowed and outcome.exit_code == 0:
                 break
             if attempt + 1 < attempts and not outcome.allowed:
                 break
@@ -1300,6 +1325,25 @@ class NodeExecutor:
             await runtime._persist_node_products()
             if any(r.task_id == task.id for r in runtime._local_acceptance_receipts):
                 return await runtime._prepare_local_apply_proposal(_current_project_node())
+            scope = _current_project_node()
+            if (scope is not None and task.id in runtime._frozen_sandboxes
+                    and task.metadata.get("host_acceptance_v1")):
+                nodes = await self._metadata.list_execution_nodes(task.id)
+                evaluations = [n for n in nodes if n.id in scope.node.dependencies
+                               and n.type is NodeType.EVALUATION]
+                if (evaluations and all(n.status.value == "completed"
+                        and n.metadata.get("output", {}).get("status") == "failed"
+                        for n in evaluations)):
+                    # Only authoritative, completed check products may report a
+                    # known failure. This neither issues a Receipt nor a Plan.
+                    await runtime._project_analysis_subject(scope)
+                    await runtime._admit_node_products(scope, nodes)
+                    return {
+                        "status": "failed", "reason": "local_acceptance_failed",
+                        "verified": False, "files_changed": [],
+                        "evaluation_nodes": [n.id for n in evaluations],
+                        "failed_commands": evaluations[-1].metadata["output"]["failed_commands"],
+                    }
         nodes = await self._metadata.list_execution_nodes(task.id)
         recorded = self._output_for(nodes, NodeType.EVALUATION)
         review = None

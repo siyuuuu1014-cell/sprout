@@ -101,12 +101,14 @@ async def test_approved_skill_is_disabled_but_executor_consumption_is_disclosed(
     approvals = ApprovalManager(MemoryOperationalStore())
     record = await approvals.request(tool.spec.name, args, task_id="task", single_use=single_use)
     await approvals.decide(record.id, True, decided_by="operator", channel="cli")
+    before = await approvals._store.get_approval(record.id)
     result = await dispatcher(tool, approvals=approvals).execute(
         tool.spec.name, args, task_id="task")
     assert_closed_or_metadata("skill", result)
     after = await approvals._store.get_approval(record.id)
-    # Current Executor consumes before invoke. Do not claim zero consumption.
-    assert after.status.value == ("consumed" if single_use else "approved")
+    # Refusing an unavailable tool is not an execution. An old tool-level
+    # approval neither enables it nor becomes a consumed process permit.
+    assert after == before and after.status.value == "approved"
 
 
 @pytest.mark.parametrize("version_args", [["--version"], ["--help"], []])

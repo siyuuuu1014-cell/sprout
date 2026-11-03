@@ -1,7 +1,9 @@
-"""Internal Apply target contracts. Intentional RED; final I/O is memory-only.
+"""Retired Internal Apply refusal contracts; final I/O is memory-only.
 
 The fake index is an explicit Git semantic model, not a native Git experiment.
 No private fixture imports from historical untracked investigations are used.
+Ordinary Runtime Plan Apply UNKNOWN/PARTIAL is tested in the apply_v1/native
+tests; unreachable old Git stages must not pretend an effect was attempted.
 """
 
 import asyncio
@@ -122,6 +124,18 @@ async def attempt(broker, item, workspace, **kwargs):
         return exc
 
 
+def assert_retired_before_effect(probe, result, *, rollback=False):
+    assert not result.applied
+    assert result.reason == ("internal_rollback_execution_unavailable" if rollback
+                             else "internal_apply_execution_unavailable")
+    probe.runner.assert_not_called()
+    probe.writer.assert_not_called()
+    probe.undo.assert_not_called()
+    probe.capture.assert_not_called()
+    probe.unlink.assert_not_called()
+    assert not probe.state.committed and not probe.state.worktree_changed
+
+
 @pytest.mark.parametrize("boundary", ["empty_files", "staged_other", "target_extra", "mismatch"])
 async def test_file_index_boundary_must_refuse_before_unreviewed_commit(probe, boundary):
     item = proposal(files_changed=() if boundary == "empty_files" else
@@ -234,12 +248,7 @@ async def test_post_effect_interruption_requires_uncertain_evidence_without_undo
         probe.runner.side_effect = interrupted
     result = await attempt(ApplyBroker(PolicyEngine(), approvals=await approved(item)),
                            item, probe.workspace)
-    probe.undo.assert_not_called()
-    assert not getattr(result, "applied", False), "Unknown effects cannot be reported delivered"
-    assert ("UNCONFIRMED" in str(result).upper()
-            or getattr(result, "effect", None) == "UNCONFIRMED"), (
-        "Plain interruption/failed bool does not preserve execution uncertainty"
-    )
+    assert_retired_before_effect(probe, result)
 
 
 @pytest.mark.parametrize("identity", ["short_oid", "moved_head"])
@@ -256,9 +265,7 @@ async def test_conflicting_rollback_preserves_no_reset_contract(probe):
     probe.state.failure = ("revert", "nonzero")
     result = await ApplyBroker(PolicyEngine(), approvals=await approved(item)).rollback(
         item, probe.workspace)
-    assert not result.applied and "manual reconciliation" in result.reason
-    assert [call.args[1] for call in probe.runner.await_args_list] == ["revert"]
-    probe.undo.assert_not_called()
+    assert_retired_before_effect(probe, result, rollback=True)
 
 
 @pytest.mark.parametrize("mode", ["concurrent", "restart"])
@@ -336,7 +343,7 @@ async def test_empty_file_set_refuses_before_all_io_and_has_no_broad_add(probe):
     item = proposal(files_changed=())
     result = await ApplyBroker(PolicyEngine(), approvals=await approved(item)).apply(
         item, probe.workspace)
-    assert not result.applied and "files_changed" in result.reason
+    assert_retired_before_effect(probe, result)
     probe.runner.assert_not_called()
     probe.writer.assert_not_called()
     probe.undo.assert_not_called()
@@ -355,8 +362,7 @@ async def test_existing_staging_refuses_without_touching_index_or_patch(probe, s
     item = proposal()
     result = await ApplyBroker(PolicyEngine(), approvals=await approved(item)).apply(
         item, probe.workspace)
-    assert not result.applied and "Index" in result.reason
-    probe.runner.assert_awaited_once_with(probe.workspace, *INDEX_CHECK)
+    assert_retired_before_effect(probe, result)
     probe.writer.assert_not_called()
     probe.undo.assert_not_called()
     probe.capture.assert_not_called()
@@ -372,8 +378,7 @@ async def test_uncertain_index_result_is_not_a_clean_index(probe, reply):
     item = proposal()
     result = await ApplyBroker(PolicyEngine(), approvals=await approved(item)).apply(
         item, probe.workspace)
-    assert not result.applied and "Index" in result.reason
-    probe.runner.assert_awaited_once_with(probe.workspace, *INDEX_CHECK)
+    assert_retired_before_effect(probe, result)
     probe.writer.assert_not_called()
     probe.undo.assert_not_called()
     assert not probe.state.committed and not probe.state.worktree_changed
@@ -385,8 +390,7 @@ async def test_index_exception_refuses_without_mutation_or_compensation(probe, e
     item = proposal()
     result = await ApplyBroker(PolicyEngine(), approvals=await approved(item)).apply(
         item, probe.workspace)
-    assert not result.applied and "Index" in result.reason
-    probe.runner.assert_awaited_once_with(probe.workspace, *INDEX_CHECK)
+    assert_retired_before_effect(probe, result)
     probe.writer.assert_not_called()
     probe.undo.assert_not_called()
     assert not probe.state.committed and not probe.state.worktree_changed
@@ -395,10 +399,9 @@ async def test_index_exception_refuses_without_mutation_or_compensation(probe, e
 async def test_index_cancellation_propagates_before_patch_or_mutation(probe):
     probe.state.index_error = asyncio.CancelledError()
     item = proposal()
-    with pytest.raises(asyncio.CancelledError):
-        await ApplyBroker(PolicyEngine(), approvals=await approved(item)).apply(
-            item, probe.workspace)
-    probe.runner.assert_awaited_once_with(probe.workspace, *INDEX_CHECK)
+    result = await ApplyBroker(PolicyEngine(), approvals=await approved(item)).apply(
+        item, probe.workspace)
+    assert_retired_before_effect(probe, result)
     probe.writer.assert_not_called()
     probe.undo.assert_not_called()
     assert not probe.state.committed and not probe.state.worktree_changed
@@ -408,8 +411,5 @@ async def test_clean_index_keeps_existing_explicit_file_apply_sequence(probe):
     item = proposal()
     result = await ApplyBroker(PolicyEngine(), approvals=await approved(item)).apply(
         item, probe.workspace)
-    assert result.applied
-    assert probe.runner.await_args_list[0].args == (probe.workspace, *INDEX_CHECK)
-    assert [call.args[1] for call in probe.runner.await_args_list] == [
-        "diff", "apply", "rev-parse", "apply", "add", "commit", "rev-parse"]
-    assert probe.state.committed == [frozenset({"task.txt"})]
+    assert_retired_before_effect(probe, result)
+    assert not probe.state.index

@@ -10,6 +10,7 @@ from Sprout.storage.local.memory import MemoryCacheStore
 from Sprout.storage.local.sqlite.driver import SqliteDatabase
 from Sprout.storage.local.sqlite.metadata import SqliteMetadataStore
 from Sprout.task.models import Task
+from Sprout.workspace.authorized_content import AuthorizedContentView, AuthorizedEntry
 from Sprout.workspace.cache import WorkspaceAnalysisCache
 from Sprout.workspace.intelligence import WorkspaceIntelligence
 from Sprout.workspace.invalidation import snapshot_id
@@ -22,7 +23,12 @@ async def analyses(tmp_path):
     source.mkdir()
     (source / "app.py").write_text("def run():\n    return 1\n", encoding="utf-8")
     workspace = Workspace(id="project", root=source)
-    first = await WorkspaceIntelligence().analyze(workspace, Task(instruction="analyze"))
+    # Cache algorithms consume captured data; this synthetic view grants no
+    # file access or publication authority to the Runtime/SQLite store.
+    view = AuthorizedContentView(workspace.id, (
+        AuthorizedEntry.synthetic("app.py", b"def run():\n    return 1\n"),))
+    first = await WorkspaceIntelligence().analyze_view(
+        workspace, Task(workspace_id=workspace.id, instruction="analyze"), view)
     fact = first.knowledge.items[0]
     second = replace(first, knowledge=replace(first.knowledge, items=(
         replace(fact, statement="New published fact"), *first.knowledge.items[1:],
@@ -78,7 +84,11 @@ async def test_hot_cache_failure_cannot_block_project_authority(tmp_path):
     await storage.projects.save_analysis(first, expected_snapshot_id=None)
     service = WorkspaceService(storage)
     try:
-        current = await service.analyze("project")
+        # Raw workspace-id analysis is retired; persisted-data reads are a
+        # separate store contract and do not grant file/publication authority.
+        with pytest.raises(PermissionError, match="authorized_workspace_analysis_required"):
+            await service.analyze("project")
+        current = await storage.projects.load_analysis("project")
         assert snapshot_id(current) == snapshot_id(first)
         assert await storage.projects.current_snapshot_id("project") == snapshot_id(first)
     finally:

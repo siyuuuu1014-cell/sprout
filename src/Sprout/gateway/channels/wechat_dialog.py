@@ -17,7 +17,7 @@ import sqlite3
 import struct
 import time
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any
 
 import httpx
@@ -264,6 +264,7 @@ class WeChatDialogGateway:
         workspace_by_channel: dict[str, str] | None = None,
         workspace_by_user: dict[str, str] | None = None,
         dedup_store: _InMemoryDedupStore | SqliteDedupStore | None = None,
+        scopes_by_workspace: dict[str, DelegationScope] | None = None,
     ) -> None:
         self._runtime = runtime
         self._gateway = RuntimeGateway(runtime, transport="wechat_dialog")
@@ -273,8 +274,12 @@ class WeChatDialogGateway:
         self._default_appid = default_appid
         self._workspace_by_channel = dict(workspace_by_channel or {})
         self._workspace_by_user = dict(workspace_by_user or {})
+        self._scopes_by_workspace = dict(scopes_by_workspace or {})
         self._dedup_window_seconds = dedup_window_seconds
         self._dedup = dedup_store or _InMemoryDedupStore(dedup_window_seconds)
+        # In-process handoff from authenticated decrypt/claim to the existing
+        # Web background callback. Plain Event/JSON objects confer no identity.
+        self._claimed_events: dict[int, tuple] = {}
 
     async def handle_callback(self, body: dict[str, Any]) -> dict[str, Any]:
         event, reason = await self._claim_event(body)
@@ -295,18 +300,29 @@ class WeChatDialogGateway:
     async def process_event(self, event: WeChatDialogEvent) -> dict[str, Any]:
         if self._client is None:
             raise ValueError("WeChatDialogGateway requires a client for callbacks")
+        claimed = self._claimed_events.pop(id(event), None)
+        if (claimed is None or claimed[0] is not event or claimed[1] != asdict(event)
+                or claimed[3] <= time.monotonic()):
+            raise PermissionError("wechat_event_source_required")
+        principal = claimed[2]
         key = self._event_key(event)
+        execution_entered = False
         try:
+            workspace_id = self._resolve_workspace(event)
+            scope = self._scopes_by_workspace.get(workspace_id)
+            if (principal is None or principal.authenticated is not True
+                    or principal.source != "wechat_dialog" or principal.user_id != event.userid
+                    or scope is None):
+                raise PermissionError("wechat_workspace_authority_required")
+            execution_entered = True
             response = await self._gateway.execute(
                 GatewayRequest(
                     transport="wechat_dialog",
                     execution_mode="read_only",
                     instruction=event.content,
-                    caller=Principal(user_id=event.userid),
-                    workspace_id=self._resolve_workspace(event),
-                    delegation_scope=DelegationScope(
-                        allowed_actions=frozenset({"file.read"}),
-                    ),
+                    caller=principal,
+                    workspace_id=workspace_id,
+                    delegation_scope=scope,
                 )
             )
             reply = response.content or f"Task status: {response.status}"
@@ -323,7 +339,10 @@ class WeChatDialogGateway:
                 "send_result": send_result,
             }
         except Exception:
-            await self._dedup.release(key)
+            # Once execution was entered, an exception is not proof of zero
+            # effects. Keep dedup ownership rather than replaying a Task.
+            if not execution_entered:
+                await self._dedup.release(key)
             logger.exception("Failed to process WeChat Dialog callback")
             raise
 
@@ -347,6 +366,14 @@ class WeChatDialogGateway:
             self._dedup_window_seconds,
         ):
             return None, "duplicate"
+        now = time.monotonic()
+        self._claimed_events = {key: record for key, record in self._claimed_events.items()
+                                if record[3] > now}
+        self._claimed_events[id(event)] = (
+            event, asdict(event),
+            Principal(user_id=event.userid, source="wechat_dialog", authenticated=True),
+            now + self._dedup_window_seconds,
+        )
         return event, ""
 
     async def handle_query(

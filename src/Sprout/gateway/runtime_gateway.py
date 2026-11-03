@@ -37,6 +37,26 @@ class RuntimeGateway:
 
     async def execute(self, request: GatewayRequest) -> GatewayResponse:
         task = self._adapter.to_task(request)
+        if (request.workspace_id and request.caller.authenticated is True
+                and request.caller.source and request.caller.user_id
+                and request.delegation_scope.allowed_paths
+                and not request.delegation_scope.is_expired()):
+            # A transport label/user name is not an authenticated entry. Bind
+            # the supplied host identity to a real Session and persisted Task;
+            # request metadata cannot select another Session's authority.
+            session = await self._runtime._sessions.resolve(
+                Message(content=request.instruction, channel=request.caller.source),
+                principal=request.caller,
+            )
+            task = await self._runtime.create_task(
+                request.workspace_id, request.instruction, actor=request.caller,
+                source=request.caller.source, delegation_scope=request.delegation_scope,
+                budget=request.budget, execution_mode=request.execution_mode,
+                metadata={**dict(task.metadata), "session_id": session.id},
+            )
+        # Missing authority remains an unprivileged request. The existing
+        # Runtime/Broker refusal (including its public result/error shape) is
+        # authoritative; do not authenticate it or manufacture a Session.
         result = await self._runtime.execute(task)
         return GatewayResponse(
             task_id=result.task_id,

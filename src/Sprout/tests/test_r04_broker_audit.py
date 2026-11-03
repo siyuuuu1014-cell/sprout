@@ -1,8 +1,4 @@
-"""R04 red contracts: all host/process/network effects replaced by spies.
-
-These failures are intentional review evidence, not an implementation or a
-claim that the existing restricted node allowlist is already bypassed.
-"""
+"""R04 current dispatch/refusal contracts; final external effects are controlled."""
 
 import asyncio
 from contextlib import asynccontextmanager
@@ -77,7 +73,8 @@ async def test_every_git_write_operation_obeys_injected_broker(
     })
     assert not host_calls, operation
     assert not result.ok
-    assert len(broker.calls) == 1
+    assert not broker.calls, "Retired generic writes must not dispatch even to an injected broker"
+    assert "retired" in result.error
 
 
 @pytest.mark.parametrize("operation", sorted(GitInspectTool._OPERATIONS))
@@ -86,11 +83,14 @@ async def test_every_git_inspect_operation_obeys_injected_broker(
 ):
     broker = DeniedGit()
     result = await GitInspectTool(git_broker=broker).invoke({
-        "operation": operation, "repo": str(tmp_path), "ref": "HEAD",
+        "operation": operation, "repo": str(tmp_path),
     })
     assert not host_calls, operation
     assert not result.ok
-    assert len(broker.calls) == 1
+    if operation in {"status", "log", "branch", "diff"}:
+        assert len(broker.calls) == 1
+    else:
+        assert not broker.calls and "not supported" in result.error
 
 
 class AllowPolicy:
@@ -164,10 +164,27 @@ async def test_unclassified_remote_requires_trusted_risk_before_call(source):
     assert not result.ok
 
 
-async def test_remote_timeout_does_not_prove_no_effects():
-    connection = Remote(TimeoutError("test timeout"))
-    with pytest.raises(ToolExecutionUnconfirmed):
-        await remote_tool(connection).invoke({})
+async def test_remote_timeout_does_not_prove_no_effects(monkeypatch):
+    from Sprout.mcp.client import client as client_module
+    from Sprout.tests.test_r04_c1_mcp_trusted_wiring import (
+        FakeConnection,
+        execute_approved,
+        executor_for,
+        issued,
+    )
+
+    # Only the transport is substituted. Real manager issuance, risk binding,
+    # Executor approval consumption and UNKNOWN classification remain in place.
+    monkeypatch.setattr(client_module, "MCPConnection", FakeConnection)
+    manager, connection, tool = await issued()
+    connection.call_tool.side_effect = TimeoutError("test timeout")
+    try:
+        with pytest.raises(ToolExecutionUnconfirmed):
+            await execute_approved(executor_for(tool, ApprovalManager(MemoryOperationalStore())),
+                                   tool)
+        connection.call_tool.assert_awaited_once()
+    finally:
+        await manager.stop()
 
 
 @pytest.mark.parametrize("source", ["cron", "automation"])
@@ -230,7 +247,11 @@ async def test_skill_script_has_no_unbrokered_host_execution(tmp_path, host_call
 async def test_low_risk_label_is_not_process_authority(tool, arguments, host_calls):
     result = await tool().invoke(arguments)
     assert not host_calls
-    assert not result.ok
+    if tool is system_tools.CliDetectTool:
+        assert result.ok and result.data["found"] is True
+        assert result.data["version_executed"] is False
+    else:
+        assert not result.ok
 
 
 @pytest.mark.parametrize("sql", [
@@ -277,7 +298,7 @@ async def test_download_without_network_broker_has_no_effect(tmp_path, monkeypat
         return SimpleNamespace(allowed=True)
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(system_tools.httpx, "AsyncClient", lambda **kwargs: FakeClient())
+    monkeypatch.setattr("httpx.AsyncClient", lambda **kwargs: FakeClient())
     result = await system_tools.CliDownloadTool(guard=SimpleNamespace(acheck=check)).invoke({
         "url": "https://example.invalid/program", "destination": "download/program",
     })

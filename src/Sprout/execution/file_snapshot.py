@@ -26,7 +26,11 @@ class ResourceIdentity:
 
     @classmethod
     def from_stat(cls, info):
-        return cls(info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        # Windows path stat and CRT-backed fstat disagree on deprecated ctime
+        # in Python 3.13. Keep its historical Windows creation-time meaning
+        # using the explicit field shared by both APIs. POSIX keeps change time.
+        ctime = info.st_birthtime_ns if os.name == "nt" else info.st_ctime_ns
+        return cls(info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, ctime)
 
 
 @dataclass(frozen=True, slots=True)

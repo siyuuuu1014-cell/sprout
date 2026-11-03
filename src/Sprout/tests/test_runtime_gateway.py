@@ -29,6 +29,7 @@ def test_runtime_gateway_executes_task(tmp_path: Path, authorized_read_host) -> 
     settings.storage.knowledge = "memory://"
     settings.storage.observations.enabled = False
     settings.storage.metadata = f"sqlite:///{tmp_path / 'metadata.db'}"
+    settings.storage.session = settings.storage.metadata
     settings.storage.trajectory_dir = str(tmp_path / "trajectory")
     settings.storage.blobs_dir = str(tmp_path / "blobs")
     # Keep the audit stream in tmp_path too: the default points at the real

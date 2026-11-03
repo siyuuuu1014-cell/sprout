@@ -149,7 +149,29 @@ def check_module_dependencies(spec, contents):
             continue
         visited.add(path)
         tree = ast.parse(contents[path])
+        aliases = {"open": "builtins.open"}
+        for imported in ast.walk(tree):
+            if isinstance(imported, ast.Import):
+                aliases.update({item.asname or item.name: item.name for item in imported.names})
+            elif isinstance(imported, ast.ImportFrom) and imported.module:
+                aliases.update({item.asname or item.name: imported.module + "." + item.name
+                                for item in imported.names})
+
+        def qualified(node, aliases=aliases):
+            if isinstance(node, ast.Name):
+                return aliases.get(node.id, node.id)
+            if isinstance(node, ast.Attribute):
+                return qualified(node.value) + "." + node.attr
+            return ""
+
         for node in ast.walk(tree):
+            # Reject known direct host effects before executing frozen inputs.
+            # This preflight is not a general Python confinement mechanism.
+            if isinstance(node, ast.Call) and qualified(node.func) in {
+                "builtins.open", "os.unlink", "os.remove", "os.rename", "os.replace",
+                "os.system", "os.popen", "subprocess.run", "subprocess.Popen", "shutil.rmtree",
+            }:
+                raise PermissionError("frozen_host_effect_unavailable")
             if isinstance(node, ast.Call) and (
                 isinstance(node.func, ast.Name) and node.func.id in {"eval", "exec", "__import__"}
                 or isinstance(node.func, ast.Attribute) and node.func.attr in {

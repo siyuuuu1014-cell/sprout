@@ -173,6 +173,8 @@ async def test_s1_no_issuer_still_blocks_generic_reads(tmp_path, effects, operat
 async def test_internal_apply_retains_separate_approval_commit_and_recorded_rollback(
     tmp_path, effects, monkeypatch,
 ):
+    from unittest.mock import Mock
+
     manager = ApprovalManager(MemoryOperationalStore())
     broker = ApplyBroker(PolicyEngine(), approvals=manager)
     proposal = ChangeProposal(id="proposal", task_id="task", files_changed=("note.txt",),
@@ -186,16 +188,15 @@ async def test_internal_apply_retains_separate_approval_commit_and_recorded_roll
         task_id="task", single_use=False)
     await manager.decide(record.id, True, decided_by="human", channel="cli")
     # No patch file is created; all Git mutation and reads terminate at mocks.
-    monkeypatch.setattr(broker, "_write_patch", lambda *args: str(tmp_path / "absent-mock.patch"))
+    writer = Mock(return_value=str(tmp_path / "absent-mock.patch"))
+    monkeypatch.setattr(broker, "_write_patch", writer)
     applied = await broker.apply(proposal, ws)
-    assert applied.applied
-    calls = [call.args for call in effects.apply.await_args_list]
-    assert any("commit" in call for call in calls)
-    assert any("add" in call and "--" in call and "note.txt" in call for call in calls)
+    assert not applied.applied and applied.reason == "internal_apply_execution_unavailable"
+    writer.assert_not_called()
+    effects.apply.assert_not_called()
     rolled = await broker.rollback(replace(proposal, metadata={"applied_commit": "b" * 40}), ws)
-    assert rolled.applied
-    assert "revert" in effects.apply.call_args.args
-    assert "b" * 40 in effects.apply.call_args.args
+    assert not rolled.applied and rolled.reason == "internal_rollback_execution_unavailable"
+    effects.apply.assert_not_called()
     effects.git.assert_not_awaited()
 
 
@@ -225,10 +226,14 @@ async def test_proposal_service_keeps_gate_and_approval_independent(tmp_path, ef
 async def test_internal_sandbox_diff_and_changed_files_do_not_use_generic_broker(tmp_path, effects):
     provider = GitWorktreeSandbox(workspace(tmp_path))
     ref = SandboxRef("sandbox", "git_worktree", tmp_path)
-    diff = await provider.diff(ref)
-    paths = await provider.changed_files(ref)
-    assert diff.diff_text == "mock diff" and paths == ("note.txt",)
-    assert any("add" in call.args and "-N" in call.args for call in effects.sandbox.await_args_list)
+    with pytest.raises(PermissionError, match="Task-owned GitBroker"):
+        await provider.diff(ref)
+    effects.sandbox.assert_not_called()
+    # A caller's GIT_REPOSITORY label is not a registered native Git root.
+    with pytest.raises(ValueError, match="Regular isolated repository Git directory required"):
+        await provider.changed_files(ref)
+    effects.sandbox.assert_not_called()
+    assert not any("-N" in call.args for call in effects.sandbox.await_args_list)
     effects.git.assert_not_awaited()
 
 

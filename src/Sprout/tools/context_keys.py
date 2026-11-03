@@ -68,6 +68,8 @@ class _ProjectNodeScope:
     known_paths: tuple = ()
     captured_paths: tuple = ()
     untracked_tool_use: bool = False
+    sandbox_tool_results: tuple = ()
+    local_evaluation_result: object = None
     read_captured: bool = False
     resource_receipts: tuple = ()
     parent_receipts: tuple = ()

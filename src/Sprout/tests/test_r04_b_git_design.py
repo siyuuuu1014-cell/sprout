@@ -21,7 +21,7 @@ from Sprout.task.models import DelegationScope
 from Sprout.tools import system_tools
 from Sprout.tools.executor import ToolExecutor
 from Sprout.tools.registry import ToolRegistry
-from Sprout.tools.result import ToolExecutionUnconfirmed, ToolResult
+from Sprout.tools.result import ToolResult
 from Sprout.tools.system_tools import GitInspectTool, GitWriteTool
 from Sprout.workspace.models import ResourceKind, ResourceRef, Workspace, WorkspaceKind
 
@@ -77,20 +77,18 @@ async def test_delegated_inspect_does_not_drop_requested_filters(
 ):
     method = AsyncMock(return_value=GitResult(action=operation, allowed=False, reason="denied"))
     tool = GitInspectTool(git_broker=SimpleNamespace(**{operation: method}))
-    await tool.invoke({**invocation(tmp_path, operation), **expected})
-    method.assert_awaited_once()
-    for key, value in expected.items():
-        assert method.call_args.kwargs.get(key) == value
+    result = await tool.invoke({**invocation(tmp_path, operation), **expected})
+    assert not result.ok and "Task-owned review" in result.error
+    method.assert_not_called()
     effects.fallback.assert_not_awaited()
 
 
 async def test_delegated_pull_keeps_remote_and_upstream(tmp_path, effects):
     method = AsyncMock(return_value=GitResult(action="pull", allowed=False, reason="denied"))
     tool = GitWriteTool(git_broker=SimpleNamespace(pull=method))
-    await tool.invoke({**invocation(tmp_path, "pull"), "remote": "reviewed-remote"})
-    method.assert_awaited_once()
-    assert method.call_args.kwargs.get("remote") == "reviewed-remote"
-    assert method.call_args.kwargs.get("branch") == "topic"
+    result = await tool.invoke({**invocation(tmp_path, "pull"), "remote": "reviewed-remote"})
+    assert not result.ok and "retired" in result.error
+    method.assert_not_called()
     effects.fallback.assert_not_awaited()
 
 
@@ -111,13 +109,11 @@ async def test_genuine_outer_commit_approval_has_one_prompt_and_bound_identity(t
     supplied = invocation(tmp_path, "commit")
     identity = dict(task_id="task", session_id="session", requested_by="owner", source="cli")
     first = await executor.execute("git_write", supplied, **identity)
-    assert first.approval_id and not first.ok
-    await manager.decide(first.approval_id, True, decided_by="owner", channel="cli")
+    assert not first.approval_id and not first.ok
     result = await executor.execute("git_write", supplied, **identity)
-    assert result.ok, "Approved outer arguments must not lose their binding inside GitBroker"
-    assert requests[-1].task_id == "task"
-    assert requests[-1].actor.user_id == "owner"
-    assert effects.capture.await_count == 2
+    assert not result.ok and "retired" in result.error
+    assert not await manager.pending()
+    effects.capture.assert_not_called()
     effects.fallback.assert_not_awaited()
 
 
@@ -172,22 +168,24 @@ async def test_push_rejects_force_delete_wildcard_or_helper_operands(
 
 
 async def test_broker_diff_explicitly_disables_textconv(tmp_path, effects):
-    await GitBroker(AllowPolicy()).diff(workspace(tmp_path))
-    assert "--no-ext-diff" in effects.capture.call_args.args
-    assert "--no-textconv" in effects.capture.call_args.args
+    result = await GitBroker(AllowPolicy()).diff(workspace(tmp_path))
+    assert not result.allowed and result.reason.startswith("s1_")
+    effects.capture.assert_not_called()
+    effects.spawn.assert_not_called()
 
 
 async def test_broker_execution_has_a_finite_timeout(tmp_path, effects):
-    await GitBroker(AllowPolicy()).status(workspace(tmp_path))
-    timeout = effects.capture.call_args.kwargs.get("timeout")
-    assert isinstance(timeout, int | float) and 0 < timeout <= 120
+    result = await GitBroker(AllowPolicy()).status(workspace(tmp_path))
+    assert not result.allowed and result.reason.startswith("s1_")
+    effects.capture.assert_not_called()
+    effects.spawn.assert_not_called()
 
 
 async def test_mutating_timeout_is_unknown_and_never_retried(tmp_path, effects):
     effects.capture.side_effect = TimeoutError("mock timeout after possible effect")
-    with pytest.raises(ToolExecutionUnconfirmed):
-        await GitBroker(AllowPolicy()).commit(workspace(tmp_path), "test", files=("note.txt",))
-    effects.capture.assert_awaited_once()
+    result = await GitBroker(AllowPolicy()).commit(workspace(tmp_path), "test", files=("note.txt",))
+    assert not result.allowed
+    effects.capture.assert_not_called()
     effects.fallback.assert_not_awaited()
 
 
@@ -220,9 +218,14 @@ async def test_delegated_broker_interruption_is_not_host_retry(tmp_path, effects
     broker = SimpleNamespace(**{operation: method})
     tool = (GitInspectTool(git_broker=broker) if kind == "inspect"
             else GitWriteTool(git_broker=broker))
-    with pytest.raises(failure):
-        await tool.invoke(invocation(tmp_path, operation))
-    method.assert_awaited_once()
+    if kind == "inspect":
+        with pytest.raises(failure):
+            await tool.invoke(invocation(tmp_path, operation))
+        method.assert_awaited_once()
+    else:
+        result = await tool.invoke(invocation(tmp_path, operation))
+        assert not result.ok and "retired" in result.error
+        method.assert_not_called()
     effects.fallback.assert_not_awaited()
     effects.capture.assert_not_awaited()
 

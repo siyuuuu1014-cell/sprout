@@ -27,6 +27,26 @@ def test_untrusted_python_effects_require_execution_boundary(source):
         check_module_dependencies(spec, {"app.py": source})
 
 
+@pytest.mark.parametrize("source", [
+    "import os as fs\ndef run(value):\n fs.unlink('outside')\n return value\n",
+    "from os import unlink as erase\ndef run(value):\n erase('outside')\n return value\n",
+    "from builtins import open as write\ndef run(value):\n write('outside','w')\n return value\n",
+])
+def test_direct_effect_aliases_are_not_executed(source):
+    spec = AcceptanceSpec.from_payload({"cases": [dict(id="case", target="app:run",
+                                                     args=[1], expected_output=1)]})
+    with pytest.raises(PermissionError, match="frozen_host_effect_unavailable"):
+        check_module_dependencies(spec, {"app.py": source})
+
+
+def test_pure_stdlib_dependency_remains_supported():
+    spec = AcceptanceSpec.from_payload({"cases": [dict(id="case", target="app:run",
+                                                     args=[1], expected_output=1)]})
+    assert check_module_dependencies(spec, {
+        "app.py": "import math\ndef run(value):\n return math.floor(value)\n"
+    }) == ("app.py",)
+
+
 def fixture():
     names = ("test: pytest", "code: pytest -q", "check: compileall", "check: ruff", "poc: demo")
     tests = tuple(Check(name, False, executed=False) for name in names)

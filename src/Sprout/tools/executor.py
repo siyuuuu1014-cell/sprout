@@ -415,8 +415,12 @@ class ToolExecutor:
                 scope.untracked_tool_use = True
             with handoff:
                 result = await tool.invoke(contextual)
+                tracked_sandbox = (generic_binding and await scope.runtime._track_sandbox_result(
+                    scope, tool, arguments, result))
             if generic_binding and scope.runtime._same_admitted_read(
                     scope, tool, arguments, result):
+                scope.untracked_tool_use = previous_untracked
+            elif tracked_sandbox:
                 scope.untracked_tool_use = previous_untracked
             if generic_binding and self.audit is not None:
                 from hashlib import sha256

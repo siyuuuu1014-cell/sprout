@@ -811,6 +811,58 @@ class ProcessBroker:
                                                              binding.exported)
         return await capture(command, 55 if action == "start" else 3)
 
+    async def run_evaluation_command(self, workspace, command, **kwargs):
+        """Exact live EVALUATION plan, using the existing pinned execution contract."""
+        from Sprout.execution.host_acceptance import check_binding
+        from Sprout.tools.context_keys import _current_project_node
+
+        frame = _current_project_node()
+        if frame is None:
+            raise PermissionError("evaluation_owner_required")
+        issuer = frame.runtime
+        task, current_workspace = await issuer._project_analysis_subject(frame)
+        if (workspace.id != current_workspace.id
+                or Path(workspace.root) != Path(current_workspace.root)
+                or workspace.kind != current_workspace.kind
+                or issuer._process_broker is not self):
+            raise PermissionError("evaluation_workspace_changed")
+        workspace = current_workspace
+        frozen = task.metadata.get("host_acceptance_v1")
+        spec = check_binding(task, workspace, frozen)
+        binding = local_executor_binding()
+        command = tuple(command)
+        permit = await issuer._issue_frozen_execution(
+            kwargs.get("cwd"), spec, frozen["test_path"], spec.cases[0].id,
+            binding, verification_command=command)
+        issuer._frozen_executions[permit]["native_command"] = command
+        token = self._acceptance_context.set((command, binding))
+        try:
+            for attempt in range(2):
+                execution = issuer._frozen_execution_record(permit, self)
+                outcome = await self._run_frozen_contract(
+                    permit, workspace, spec, frozen["test_path"], spec.cases[0].id,
+                    binding, command, kwargs)
+                # Only a positively unstarted approval request can continue.
+                # A started, completed or UNKNOWN effect is never retried.
+                if (attempt or not outcome.approval_id or outcome.started is not False
+                        or outcome.allowed):
+                    return outcome
+                try:
+                    await self._wait_frozen_approval(execution, outcome.approval_id)
+                    permit = await issuer._issue_frozen_execution(
+                        kwargs.get("cwd"), spec, frozen["test_path"], spec.cases[0].id,
+                        binding, verification_command=command)
+                    fresh = issuer._frozen_execution_record(permit, self)
+                    fresh["native_command"] = command
+                    # Reopening the contract must not approve a newer snapshot.
+                    fresh["inputs"] = execution["inputs"]
+                    fresh["approved_record"] = outcome.approval_id
+                except (OSError, ValueError) as exc:
+                    return replace(outcome, error=str(exc), approval_id=None)
+        finally:
+            issuer._frozen_executions.pop(permit, None)
+            self._acceptance_context.reset(token)
+
     async def run_local_acceptance(
         self, workspace, spec, path, case_id, frozen, *, execution_contract=None, **kwargs,
     ) -> ProcessResult:
@@ -857,6 +909,9 @@ class ProcessBroker:
             issuer = permit.issuer
             record = issuer._frozen_execution_record(permit, self, claim=True)
             task, sandbox = record["task"], record["sandbox"]
+            if (record.get("verification_command") is not None
+                    and record.get("native_command") != command):
+                raise PermissionError("evaluation_command_changed")
             if (workspace.id != record["workspace"].id or workspace.root != record["workspace"].root
                     or workspace.kind != record["workspace"].kind
                     or spec.to_payload() != record["spec"].to_payload()
@@ -1064,10 +1119,13 @@ class ProcessBroker:
                                      error="Frozen execution pre-spawn revalidation denied")
             import shlex
 
+            pytest_options = ["--noconftest", "-c", os.devnull,
+                              "--rootdir", str(cwd_path), "-p", "no:cacheprovider"]
+            if dispatch.record.get("verification_command") is not None:
+                pytest_options.extend(["--confcutdir", str(cwd_path)])
             process_env = self._secrets.child_env(base_env=os.environ, extra={
                 "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1", "PYTHONIOENCODING": "utf-8",
-                "PYTEST_ADDOPTS": shlex.join(["--noconftest", "-c", os.devnull,
-                    "--rootdir", str(cwd_path), "-p", "no:cacheprovider"]),
+                "PYTEST_ADDOPTS": shlex.join(pytest_options),
             })
             for name in tuple(process_env):
                 if any(part in name.upper() for part in ("KEY", "TOKEN", "SECRET", "PASSWORD")):
@@ -1202,7 +1260,7 @@ class ProcessBroker:
             approval_arguments["local_acceptance_executor_v1"] = context[1]
         dispatch = self._frozen_dispatch.get()
         if dispatch is not None:
-            approval_arguments["frozen_execution_v1"] = dispatch.record["approval_binding"]
+            approval_arguments = self._frozen_approval_arguments(dispatch.record)
         if dispatch is not None and dispatch.record.get("approved_record") is not None:
             try:
                 await self._check_frozen_approval(
@@ -1237,9 +1295,10 @@ class ProcessBroker:
             resource_scope=resource_scope,
             source=source,
             session_id=session_id,
-            # Reusable so the rest of the round lands on the same grant; still
-            # bounded by task_id and expiry.
-            single_use=False,
+            # Exact ordinary commands are single-use. Preserve legacy round
+            # and frozen Local Acceptance reuse, bounded by Task and expiry.
+            single_use=bool(dispatch is not None
+                            and dispatch.record.get("verification_command") is not None),
         )
         return replace(withheld, approval_id=record.id)
 
@@ -1247,7 +1306,11 @@ class ProcessBroker:
         return {"action": "verification_commands", "task_id": record["task"].id,
                 "resource_scope": record["workspace"].id,
                 "local_acceptance_executor_v1": record["executor"],
-                "frozen_execution_v1": record["approval_binding"]}
+                "frozen_execution_v1": record["approval_binding"],
+                **({"argv": list(record["native_command"]),
+                    "cwd": str(record["sandbox"].root),
+                    "pytest_confcutdir": str(record["sandbox"].root)}
+                   if record.get("verification_command") is not None else {})}
 
     async def _check_frozen_approval(self, execution, approval_id, arguments, *, approved=False,
                                      consumed=False):

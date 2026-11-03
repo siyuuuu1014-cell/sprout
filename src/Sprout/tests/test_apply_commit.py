@@ -1,4 +1,8 @@
-"""Integration: apply commits the change and rollback reverts the commit."""
+"""Retired Git Apply/Rollback cannot alter real fixture repositories.
+
+Ordinary Runtime conditional Apply is covered by the E3 native tests, not this
+legacy generic-check/coarse-approval path.
+"""
 
 from __future__ import annotations
 
@@ -69,14 +73,17 @@ async def test_apply_commits_and_rollback_reverts(tmp_path: Path) -> None:
         (ref.root / "tracked.txt").write_text("two\n", encoding="utf-8")
         (ref.root / "new.py").write_text("print('hi')\n", encoding="utf-8")
 
-        diff = await sandbox.diff(ref)
+        with pytest.raises(PermissionError, match="Task-owned GitBroker"):
+            await sandbox.diff(ref)
+        before_head = _git(repo, "rev-parse", "HEAD")
+        before_index = (repo / ".git" / "index").read_bytes()
         files_changed = await sandbox.changed_files(ref)
         proposal = ChangeProposalBuilder().build(
             task_id="task-commit",
             sandbox_ref=ref,
             files_changed=files_changed,
             test_results=(CaseResult(name="test: pytest -q", passed=True),),
-            diffs=(diff,),
+            diffs=(),
             risk="medium",
         )
         proposal = replace(proposal, metadata={"summary": "add new feature"})
@@ -98,26 +105,27 @@ async def test_apply_commits_and_rollback_reverts(tmp_path: Path) -> None:
         assert approved.status is ChangeProposalStatus.APPROVED
 
         # This legacy fixture has only a generic check, not requirement cases.
-        # Ordinary apply must refuse; commit/rollback exercise an audited override.
+        # Coarse approval and an audited waiver cannot reopen retired Git I/O.
         blocked = await service.apply(proposal.id)
         assert not blocked.applied and "legacy proposal" in blocked.reason
         applied = await service.apply(
             proposal.id, force=True, override_reason="Legacy commit/rollback integration fixture",
             decided_by="test",
         )
-        assert applied.applied is True, applied.reason
-        assert (repo / "tracked.txt").read_text(encoding="utf-8") == "two\n"
-        assert (repo / "new.py").read_text(encoding="utf-8") == "print('hi')\n"
-        assert "add new feature" in _git(repo, "log", "-1", "--oneline")
+        assert not applied.applied and applied.reason == "internal_apply_execution_unavailable"
+        assert (repo / "tracked.txt").read_text(encoding="utf-8") == "one\n"
+        assert not (repo / "new.py").exists()
+        assert _git(repo, "rev-parse", "HEAD") == before_head
+        assert (repo / ".git" / "index").read_bytes() == before_index
 
         stored = await storage.metadata.get_change_proposal(proposal.id)
         assert stored is not None
-        assert stored.metadata.get("applied_commit")
-        assert stored.metadata.get("base_commit")
+        assert not stored.metadata.get("applied_commit")
+        assert not stored.metadata.get("base_commit")
 
-        rolled_back = await service.rollback(proposal.id)
-        assert rolled_back.applied is True, rolled_back.reason
-        assert "Revert" in _git(repo, "log", "-1", "--oneline")
+        with pytest.raises(ValueError, match="must be applied before rollback"):
+            await service.rollback(proposal.id)
+        assert _git(repo, "rev-parse", "HEAD") == before_head
         storage.metadata.close()
     finally:
         await sandbox.remove(ref)
@@ -131,8 +139,8 @@ async def test_failed_revert_never_attempts_reset_or_reports_success(tmp_path):
     broker._git = AsyncMock(return_value=(1, "", "revert conflict"))
     workspace = Workspace(id="fixture", root=tmp_path)
     result = await broker.rollback(proposal, workspace)
-    assert not result.applied and "manual reconciliation" in result.reason
-    broker._git.assert_awaited_once_with(workspace, "revert", "--no-edit", "b" * 40)
+    assert not result.applied and result.reason == "internal_rollback_execution_unavailable"
+    broker._git.assert_not_called()
 
 
 async def test_failed_real_revert_preserves_user_changes_and_proposal_state(tmp_path):
@@ -166,7 +174,7 @@ async def test_failed_real_revert_preserves_user_changes_and_proposal_state(tmp_
             AccessDecision.ALLOW, "explicit test-owned rollback fixture"))
         service = ChangeProposalService(storage.metadata, storage.operational, ApplyBroker(policy))
         result = await service.rollback(proposal.id)
-        assert not result.applied and "manual reconciliation" in result.reason
+        assert not result.applied and result.reason == "internal_rollback_execution_unavailable"
         assert tracked.read_text() == "operator uncommitted work\n"
         assert notes.read_text() == "operator untracked notes\n"
         assert _git(repo, "rev-parse", "HEAD").strip() == applied
