@@ -409,6 +409,11 @@ async def test_real_rich_live_pauses_and_restarts_around_controlled_prompt(cli):
     from rich.console import Console
     from rich.live import Live
 
+    from Sprout.security.layered_policy import LayeredPolicyEngine
+
+    # Match the real CLI's default engine, without pre-injecting a directory grant.
+    policy = LayeredPolicyEngine()
+    cli.rig.runtime._policy_engine = cli.rig.runtime._file_broker._policy = policy
     cli.state.classification = 1
     cli.state.answers = [None]
     with Live("loading", console=Console(file=StringIO(), force_terminal=True),

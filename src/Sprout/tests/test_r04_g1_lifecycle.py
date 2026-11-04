@@ -160,7 +160,7 @@ async def test_spawn_cancel_without_handle_stays_unconfirmed(tmp_path, monkeypat
 
 
 def test_budget_constants_are_separate():
-    assert s.REVIEW_TOTAL_SECONDS == 90
+    assert s.REVIEW_TOTAL_SECONDS == 150
     assert s.TIMEOUT_SECONDS == 30
     assert s.CLEANUP_SECONDS == 5
 
@@ -230,7 +230,7 @@ async def test_insufficient_authoritative_node_budget_refuses_before_effect(tmp_
     )
     node = SimpleNamespace(
         task_id="task",
-        budget=SimpleNamespace(timeout_seconds=94),
+        budget=SimpleNamespace(timeout_seconds=154),
         metadata={
             "execution_guard": {
                 "owner": "owner",

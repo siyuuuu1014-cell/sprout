@@ -19,22 +19,20 @@ def analysis_followup(text):
     text = re.sub(r"(?:不要|无需|不必|不)(?:再|重新)?扫描", "", text)
     if re.search(r"重新|扫描|整个项目|当前项目|\b(?:scan|entire|whole)\b", text):
         return False
-    if re.search(r"[A-Za-z0-9_/\\-]+\.[A-Za-z0-9_]+", text):
-        return False  # An explicit new file selection goes through the normal provider.
     return bool(re.search(
         r"进一步分析|继续分析|核心模块|模块之间|刚才.*分析|上一轮.*分析|之前.*分析|分析了什么|"
         r"上述.*(?:模块|分析)|"
         r"\b(?:further analysis|core modules|relationships between modules)\b", text))
 
 
-async def project_answer(runtime, session, principal):
+async def project_answer(runtime, session, principal, *, requested_text=""):
     try:
-        return await _project_answer(runtime, session, principal)
+        return await _project_answer(runtime, session, principal, requested_text=requested_text)
     except (ValueError, TypeError, KeyError):
         return None  # Corrupt persisted data never acquires provenance.
 
 
-async def _project_answer(runtime, session, principal):
+async def _project_answer(runtime, session, principal, *, requested_text=""):
     """Read a historical answer only after validating its real publication chain."""
     ref = session.metadata.get("project_analysis_ref_v1")
     if type(ref) is not dict or set(ref) != {"task_id", "node_id"}:
@@ -66,6 +64,12 @@ async def _project_answer(runtime, session, principal):
         return None
     resources = json.loads(source.resources_json)
     if not resources:
+        return None
+    # Only exact paths recorded by the settled publication may be continued.
+    # A new filename, basename guess, or traversal uses normal analysis routing.
+    requested = re.findall(r"[A-Za-z0-9_./\\-]+\.[A-Za-z0-9_]+", requested_text)
+    recorded = {resource["path"].replace("\\", "/") for resource in resources}
+    if any(path.replace("\\", "/") not in recorded for path in requested):
         return None
     # Recheck current read policy for every recorded resource. No enumeration,
     # reread, or cached ALLOW; historical output never asserts current file bytes.
@@ -100,16 +104,58 @@ async def code_status(runtime, session, principal):
     if (task.metadata.get("session_id") != session.id
             or task.workspace_id != runtime.session_workspace_id(session)):
         return None
+    query = await TaskQueries(runtime).report(task.id, principal=principal)
+    workspace = await runtime.get_workspace(task.workspace_id)
+    if workspace is None:
+        return None
+    verification = query["verification"]
+    historical = verification.get("historical_verification", verification)
+    checks = []
+    for item in historical.get("checks", []):
+        check = {key: item.get(key) for key in
+                 ("name", "outcome", "executed", "passed", "exit_code")}
+        command = item.get("command", [])
+        check["command"] = (command if len(json.dumps(command)) <= 512 else {
+            "display": "frozen executor argv; full command in verification report",
+            "argv_sha256": payload_digest(command)})
+        checks.append(check)
     reports = []
     for proposal in await runtime.list_change_proposals(task.id):
         row = await runtime._metadata_or_raise().get_apply_transaction(
             str(uuid5(NAMESPACE_URL, "ordinary-apply:" + proposal.id)))
         reports.append({"proposal": proposal.id, "status": proposal.status.value,
                         "files": list(proposal.files_changed),
-                        "apply_phase": row.get("phase") if row else "NOT_STARTED"})
-    return "Persisted Task observation (not execution authority): " + json.dumps({
+                        "apply_phase": row.get("phase") if row else "NOT_STARTED",
+                        "receipt_sha256": proposal.metadata.get("apply_plan", {}).get(
+                            "receipt_sha256", "NOT_AVAILABLE")})
+    return ("Persisted Task observation (not execution authority). These observations supersede "
+        "earlier Agent claims about execution. A bound Workspace is not a file access grant. "
+        "Task completed and Proposal applied do NOT prove tests passed. Report the checks "
+        "below separately; missing evidence is NOT_AVAILABLE. Receipt references are historical, "
+        "not a restored live credential.\n" + json.dumps({
+        "session_id": session.id,
+        "workspace": {"id": workspace.id, "root": str(workspace.root), "bound": True},
         "task": task.id, "instruction": task.instruction, "status": task.status.value,
-        "proposals": reports}, ensure_ascii=False)
+        "proposals": reports,
+        "verification": {"source": "TaskQueries.report/get_verification_report",
+            "status": historical.get("status", "NOT_AVAILABLE") if checks else "NOT_AVAILABLE",
+            "verified": historical.get("verified", False), "checks": checks,
+            "current_applicability": verification.get("current_applicability", "NOT_AVAILABLE"),
+            "evaluation_node_id": verification.get("evaluation_node_id"),
+            "failure_codes": historical.get("failure_codes", [])}}, ensure_ascii=False))
+
+
+def history_question(text):
+    """Only state questions; negated execution wording does not request new work."""
+    text = text.casefold()
+    text = re.sub(
+        r"(?:不要|不必|无需|不)(?:再|重新)?(?:执行任务|执行|修改文件|修改代码|扫描)", "", text)
+    if re.search(r"修复|新增|实现|重新执行|重新运行|分析当前项目|分析这个项目|"
+                 r"\b(?:fix|implement|rerun|analyze the project)\b", text):
+        return False
+    return bool(re.search(
+        r"上一轮.*修改|上次.*任务|刚才.*任务|测试.*(?:通过|结果)|apply.*(?:成功|结果)|"
+        r"当前\s*workspace|\b(?:previous task|last task|tests pass|apply status)\b", text))
 
 
 def dialogue_window(turns, session_id, settings):

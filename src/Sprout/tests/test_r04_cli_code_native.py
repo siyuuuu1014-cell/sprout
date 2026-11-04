@@ -44,7 +44,7 @@ async def test_native_cli_code_preparation_and_exact_apply(tmp_path, monkeypatch
     values = iter([",".join(ctx["files"]), "src/app.py", str(spec), "tests/frozen.py",
                    "examples/demo.py", str(ctx["git"]),
                    "cab4c4eea1d869cf9f7be73868dc9a90ad2df1b1b673e5f8c8714a576c25ea96",
-                   bool(decision)])
+                   "24", bool(decision)])
 
     class Prompt:
         async def ask_async(self):
@@ -131,14 +131,14 @@ async def test_native_cli_code_preparation_and_exact_apply(tmp_path, monkeypatch
         assert len(proposal.metadata["git_diff"]["commands"]) == 5
         confirmations = []
 
-        async def approve(prompt):
-            confirmations.append(prompt)
-            return "approve"  # Test user only, not a real execution approval.
+        async def approve(digest):
+            confirmations.append(digest)
+            return True  # Test user only, not a real execution approval.
 
-        monkeypatch.setattr(chat, "_prompt_task_gate_choice", approve)
+        monkeypatch.setattr(chat, "_confirm_exact_apply_plan", approve)
         monkeypatch.setattr(chat, "current_cli_principal", lambda: task.actor)
         await chat._approve_task_gates(runtime, prepared, "display-only")
-        assert confirmations == ["Approve this entire exact Apply Plan?"]
+        assert confirmations == [proposal.metadata["apply_plan_sha256"]]
         assert (ctx["root"] / "src/app.py").read_text() == ctx["new"]
         transaction_id = str(uuid5(NAMESPACE_URL, "ordinary-apply:" + proposal.id))
         row = await runtime.storage.metadata.get_apply_transaction(transaction_id)

@@ -205,6 +205,13 @@ class LayeredPolicyEngine:
     def layers(self) -> tuple[PolicyLayer, ...]:
         return self._layers
 
+    def add_runtime_layer(self, layer: PolicyLayer) -> None:
+        """Host-only tightening/preapproval layer on this same engine instance."""
+        if not isinstance(layer, PolicyLayer):
+            raise TypeError("PolicyLayer required")
+        if layer not in self._layers:
+            self._layers = (*self._layers, layer)
+
     # -- assembly ----------------------------------------------------------
     @classmethod
     def from_settings(

@@ -27,7 +27,7 @@ from Sprout.tools.result import ToolExecutionUnconfirmed
 from Sprout.workspace.models import Workspace
 
 TIMEOUT_SECONDS = 30.0
-REVIEW_TOTAL_SECONDS = 90.0
+REVIEW_TOTAL_SECONDS = 150.0
 CLEANUP_SECONDS = 5.0
 MAX_OUTPUT_BYTES = 1024 * 1024
 

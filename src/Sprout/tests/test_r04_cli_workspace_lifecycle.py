@@ -136,17 +136,21 @@ async def test_workspace_binding_requires_session_owner(cli, monkeypatch):
 
 
 async def test_project_denied_does_not_prompt_for_files(automatic):
-    from Sprout.security.engine import PolicyEngine
+    from Sprout.security.access import AccessDecision
+    from Sprout.security.layered_policy import LayeredPolicyEngine, PolicyLayer, PolicyRule
 
     cli = automatic
-    cli.rig.runtime._policy_engine = PolicyEngine()
+    # No configured ALLOW now means "ask", not an operator's explicit DENY.
+    cli.rig.runtime._policy_engine = LayeredPolicyEngine(workspace=PolicyLayer('operator', (
+        PolicyRule(action='directory.list', decision=AccessDecision.DENY, id='deny-project'),)))
     cli.rig.runtime._file_broker._policy = cli.rig.runtime._policy_engine
     cli.state.inputs = ["分析这个项目的结构和依赖，指出风险点"]
     cli.state.answers = [True]
     await cli.run()
     cli.create.assert_not_called()
-    assert len(cli.state.prompts) == 1
-    assert any("explicit server directory authorization" in s for s in cli.state.display)
+    assert not cli.state.prompts
+    assert any('directory.list denied' in s for s in cli.state.display)
+    assert not cli.captured.opens and not await cli.rig.runtime.approvals.pending()
 
 
 async def test_bound_context_does_not_grant_directory_access(cli, monkeypatch):

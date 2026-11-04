@@ -211,6 +211,7 @@ async def test_status_handles_distinct_approval_gates_in_one_interaction(
 
     class _Runtime:
         approvals = SimpleNamespace(store=_Store())
+        _local_apply_plans = {}
         gate = "approval"
 
         async def get_task(self, _task_id):

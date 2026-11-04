@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -42,6 +43,29 @@ class TaskSpec:
 
 class ExecutionPlanner:
     """Turn a :class:`StrategyPlan` into a concrete :class:`TaskSpec`."""
+
+    @staticmethod
+    def bind_file_contract(instruction: str, *, reads: tuple[str, ...],
+                           writes: tuple[str, ...]) -> str:
+        """Render a Host-confirmed restriction; this text grants no authority."""
+        # Generic strategy steps can demand new tests even when all tests are
+        # Host-confirmed read-only. Replace those suggestions, not verification
+        # criteria, with an executable sequence consistent with the boundary.
+        for heading in ("Implementation steps:", "Test files to add or update:"):
+            instruction = re.sub(r"(?m)^" + re.escape(heading) + r"\n(?:- .*\n?)*",
+                                 "", instruction)
+        heading = "\n\nHost-confirmed file contract (overrides planning suggestions):\n"
+        return instruction.rstrip() + heading + (
+            "READ inputs:\n" + "\n".join(f"- {p}" for p in reads)
+            + "\nWRITE targets (exclusive):\n" + "\n".join(f"- {p}" for p in writes)
+            + "\nREAD-only verification inputs:\n"
+            + "\n".join(f"- {p}" for p in reads if p not in writes)
+            + "\nImplementation: read the inputs, repair only WRITE targets, "
+            "then run every required verification check."
+            + "\nNever edit files outside WRITE targets, including tests. "
+            "Use read-only tests for verification, not modification. "
+            "All required checks, including Ruff and frozen acceptance, must pass. "
+            "A failed check requires repairing permitted source files, not weakening checks.")
 
     def plan_to_task_spec(self, plan: StrategyPlan) -> TaskSpec:
         # Cap the automatic reads, strongest evidence first. The raw report

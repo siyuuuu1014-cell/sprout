@@ -187,7 +187,7 @@ async def test_seven_input_git_review(tmp_path, monkeypatch, iteration):
         assert len(evidence["commands"]) == 5
         assert [c["exit_code"] for c in evidence["commands"]] == [0, 1, 0, 1, 0]
         assert "return 0 if value < 0 else value" in evidence["patches"]["tracked"]
-        assert evidence["budgets"]["elapsed_seconds"] < 90
+        assert evidence["budgets"]["elapsed_seconds"] < git_s1.REVIEW_TOTAL_SECONDS
         assert metrics["view_check"]["calls"] == 10
         assert metrics["source"]["calls"] == 2
         assert object_selections and all(len(paths) == 1 and paths[0] in ctx["files"]
