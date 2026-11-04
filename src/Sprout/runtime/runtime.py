@@ -342,6 +342,8 @@ class Runtime:
         # Host admissions live only for one local dispatch, never in model metadata.
         self._online_analysis_requests = {}
         self._cli_code_writes = {}
+        self._cli_directory_tasks = {}
+        self._cli_directory_layer = None
         # Temporary preparation Tasks are data, not portable read grants.
         self._preparation_tasks = {}
         self._project_analysis_selections = WeakKeyDictionary()
@@ -2239,6 +2241,9 @@ class Runtime:
             frame.node_scope.session_id,
         )
         task, current = await self._project_analysis_subject(frame.node_scope)
+        from Sprout.runtime.analysis_consent import refresh as refresh_directory_consent
+
+        await refresh_directory_consent(self, task, current)
         if (subject.actor != initial.actor or subject.task_id != initial.task_id
                 or subject.scope != initial.scope or current.id != workspace.id
                 or current.root != workspace.root or current.revision != workspace.revision):
@@ -2589,6 +2594,7 @@ class Runtime:
             analysis_followup,
             code_status,
             dialogue_window,
+            history_question,
             project_answer,
         )
 
@@ -2616,7 +2622,8 @@ class Runtime:
         working = dialogue_window(dialogue, stored.id, self._contexts._settings)
         base = self._contexts._isolated_context(message, stored, tools, skills)
         followup = analysis_followup(message.content)
-        answer = await project_answer(self, stored, principal) if followup else None
+        answer = await project_answer(self, stored, principal,
+            requested_text=message.content) if followup else None
         metadata = {**base.metadata, "conversation_history_only": True}
         if answer is not None:
             # A validated historical node answer, not raw tool JSON or a new
@@ -2633,9 +2640,12 @@ class Runtime:
 
             working = (*working, Turn(stored.id, "assistant", status,
                 seq=max((turn.seq for turn in working), default=0) + 1))
+            if history_question(message.content):
+                metadata["session_task_history_query"] = True
         working = dialogue_window(working, stored.id, self._contexts._settings)
         return replace(base, memory=ContextMemory(session=base.session, working=working),
-                       tools={} if answer is not None else base.tools, metadata=metadata)
+                       tools={} if answer is not None or metadata.get(
+                           "session_task_history_query") else base.tools, metadata=metadata)
 
     def _ordinary_response_has_source(self, context, agent, result):
         """Only the normal online call may attest a resource-free response.
@@ -3019,6 +3029,7 @@ class Runtime:
             self._agent_step_store.close()
         self._local_git_reviews.clear()
         self._cli_code_writes.clear()
+        self._cli_directory_tasks.clear()
         getattr(self, "_verification_hosts", {}).clear()
         for frame in getattr(self, "_verification_frames", {}):
             frame.active = False
@@ -3079,12 +3090,29 @@ class Runtime:
         This local-only lane does not select Tasks by Session, create a Scope,
         or reinterpret old/running graphs. The existing guard owns execution.
         """
-        from Sprout.runtime.dialogue import analysis_followup, project_answer
+        from Sprout.runtime.analysis_consent import explicit_request
+        from Sprout.runtime.dialogue import (
+            analysis_followup,
+            code_status,
+            history_question,
+            project_answer,
+        )
 
-        if (analysis_task is None and principal is not None and analysis_followup(message.content)
-                and await project_answer(self, session, principal) is not None):
+        if (analysis_task is None and principal is not None
+                and history_question(message.content)
+                and await code_status(self, session, principal) is not None):
             return None
-        if _project_analyze_tool_call(message, str(classification.get("intent", ""))) is None:
+
+        cli_request = (analysis_task_provider is not None and principal is not None
+                       and principal.authenticated and principal.source == 'cli'
+                       and explicit_request(message.content))
+        if (not cli_request and analysis_task is None and principal is not None
+                and analysis_followup(message.content)
+                and await project_answer(self, session, principal,
+                    requested_text=message.content) is not None):
+            return None
+        intent = 'workspace' if cli_request else str(classification.get('intent', ''))
+        if _project_analyze_tool_call(message, intent) is None:
             return None
         from Sprout.orchestration.service import SequentialOrchestrator
         from Sprout.security.access import AccessDecision, ActionRequest, ActionType
@@ -3993,6 +4021,9 @@ class Runtime:
     ) -> dict[str, Any]:
         from Sprout.intents import capability_question
 
+        if pending_question is None and context.metadata.get("session_task_history_query"):
+            return {"intent": "conversation", "confidence": 1.0,
+                    "reason": "owned_session_task_history"}
         if pending_question is None and capability_question(message.content or ""):
             return {"intent": "conversation", "confidence": 1.0,
                     "reason": "resource_free_capability_question"}

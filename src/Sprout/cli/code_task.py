@@ -7,12 +7,21 @@ from pathlib import Path
 import questionary
 import typer
 
-from Sprout.strategy.acceptance import AcceptanceSpec
-from Sprout.task.models import DelegationScope
-from Sprout.workspace.authorized_content import relative_label
+
+def model_request_budget(value):
+    """A finite, whole-Task allowance, confirmed before any Task is created."""
+    limit = int(value)
+    if not 1 <= limit <= 128:
+        raise ValueError("Task model request budget must be between 1 and 128")
+    return limit
 
 
 async def prepare(runtime, workspace_id, *, message, session, principal):
+    from Sprout.strategy.acceptance import AcceptanceSpec
+    from Sprout.strategy.execution import ExecutionPlanner
+    from Sprout.task.models import DelegationScope
+    from Sprout.workspace.authorized_content import relative_label
+
     workspace = await runtime.get_workspace(workspace_id)
     if workspace is None:
         raise PermissionError("cli_code_workspace_unavailable")
@@ -35,6 +44,12 @@ async def prepare(runtime, workspace_id, *, message, session, principal):
             if not value or not value.strip():
                 return None
             values[key] = value.strip()
+        calls = await questionary.text(
+            "Task model request budget (Plan and all Agent retries; 1-128):",
+            default="24").ask_async()
+        if calls is None:
+            return None
+        model_calls = model_request_budget(calls or "24")
         reads = tuple(dict.fromkeys(relative_label(p.strip()) for p in values["reads"].split(",")))
         writes = tuple(dict.fromkeys(
             relative_label(p.strip()) for p in values["writes"].split(",")))
@@ -51,6 +66,7 @@ async def prepare(runtime, workspace_id, *, message, session, principal):
             "instruction": message.content, "read_paths": reads, "write_paths": writes,
             "acceptance": spec.to_payload(), "test": test, "demo": demo,
             "git_executable": str(git), "git_sha256": values["git_sha"],
+            "max_model_calls": model_calls,
             "actions": ["tool.invoke", "file.read", "file.write", "process.run",
                         "git.diff", "file.apply"],
             "notice": "Preparation only. Execution and final Apply require separate approvals."
@@ -76,7 +92,11 @@ async def prepare(runtime, workspace_id, *, message, session, principal):
     task = await runtime.create_task_planned(workspace_id, message.content,
         actor=principal, source=principal.source, delegation_scope=scope,
         preparation_paths=reads)
-    task = replace(task, metadata={**task.metadata, "session_id": current.id,
+    task = replace(task,
+        instruction=ExecutionPlanner.bind_file_contract(
+            task.instruction, reads=reads, writes=writes),
+        budget=replace(task.budget, max_model_calls=model_calls),
+        metadata={**task.metadata, "session_id": current.id,
                                   "cli_write_paths": list(writes)})
     await runtime._metadata_or_raise().save_task(task)
     task = await runtime.bind_task_acceptance(task.id, principal=principal,

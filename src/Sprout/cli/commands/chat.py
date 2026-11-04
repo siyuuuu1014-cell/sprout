@@ -451,11 +451,10 @@ def _analysis_selection(content: str) -> tuple[str, str] | None:
 async def _provide_cli_directory_task(
     runtime, workspace, session, principal, message, *, label=None,
 ):
-    """Confirm a finite directory request; only server policy grants enumeration."""
-    from Sprout.security.access import AccessDecision, ActionRequest, ActionType
-    from Sprout.task.models import DelegationScope, TaskExecutionMode
+    """Confirm an exact read-only scope through Runtime's existing approvals."""
+    from Sprout.runtime.analysis_consent import bind, context
+    from Sprout.task.models import TaskExecutionMode
     from Sprout.workspace.authorized_content import relative_label
-    from Sprout.workspace.models import ResourceKind, ResourceRef
 
     try:
         raw = label if label is not None else await questionary.text(_L(
@@ -470,33 +469,33 @@ async def _provide_cli_directory_task(
         except (ValueError, TypeError) as exc:
             raise PermissionError("analysis_directory_selection_invalid") from exc
         target = workspace.root if label == "." else workspace.root / label
+        owned, scope, arguments, reusable = await context(
+            runtime, workspace, session, principal, target)
+        target = Path(arguments['path'])
         typer.echo(_L("自动分析授权范围：", "Automatic analysis scope: ") + str(target))
-        if not await questionary.confirm(_L(
-                "确认请求读取此目录下获准的项目文件？",
-                "Confirm analysis of authorized project files in this directory?"),
+        if reusable is None and not await questionary.confirm(_L(
+                "授权列举此目录及子目录，并只读分析 Policy 允许的项目文件？",
+                "Authorize directory/subdirectory listing and analysis of policy-allowed files?"),
                 default=False).ask_async():
             return None
     except (EOFError, KeyboardInterrupt):
         return None
-    owned = await runtime._sessions.require_owner(session.id, principal)
-    if runtime._sessions.frozen_principal(owned) != principal:
-        raise PermissionError("cli_analysis_identity_unavailable")
-    scope = DelegationScope(
-        allowed_actions=frozenset({"tool.invoke", "file.read", "directory.list"}),
-        allowed_paths=(str(target),),
-    )
-    decision = runtime._policy_engine.decide(ActionRequest(
-        actor=principal, action=ActionType.DIRECTORY_LIST,
-        resource=ResourceRef(workspace.id, str(target), ResourceKind.OTHER), scope=scope,
-    ))
-    if (decision.decision is not AccessDecision.ALLOW
-            or not any(rule.startswith("directory:grant:") for rule in decision.matched_rules)):
-        raise PermissionError("directory.list requires explicit server directory authorization")
-    return await runtime.create_task(
+    except PermissionError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise PermissionError('analysis_directory_selection_invalid') from exc
+    # The terminal yielded: ownership, binding and Policy must still hold.
+    owned, scope, current_arguments, _ = await context(
+        runtime, workspace, session, principal, target)
+    if current_arguments != arguments:
+        raise PermissionError('cli_directory_selection_changed')
+    task = await runtime.create_task(
         workspace.id, message.content, actor=principal, source=principal.source,
         execution_mode=TaskExecutionMode.READ_ONLY, delegation_scope=scope,
         metadata={"session_id": owned.id, "analysis_directory": label},
     )
+    await bind(runtime, task, workspace, owned, principal, arguments)
+    return task
 
 
 def _cli_analysis_task_provider(runtime, workspace_id, live=None):
@@ -911,8 +910,14 @@ async def _approve_task_gates(runtime: Any, task: Any, user: str) -> None:
                 if content:
                     typer.echo("Exact Workspace replacement (content snapshots; not Git output):")
                     render_diff("workspace_replacement", content["text"])
-                if await _prompt_task_gate_choice(
-                        "Approve this entire exact Apply Plan?") != "approve":
+                plan_sha256 = proposal.metadata["apply_plan_sha256"]
+                if not await _confirm_exact_apply_plan(plan_sha256):
+                    typer.echo(ui.warning("Not confirmed; no Apply write."))
+                    return
+                current_proposal = await runtime.find_change_proposal(proposal.id)
+                if (current_proposal is None or
+                        current_proposal.metadata.get("apply_plan_sha256") != plan_sha256):
+                    typer.echo(ui.warning("Apply Plan changed; review it again before confirming."))
                     return
                 await runtime.approve_change_proposal(proposal.id, decided_by="cli",
                                                      principal=current_cli_principal())
@@ -955,6 +960,23 @@ async def _approve_task_gates(runtime: Any, task: Any, user: str) -> None:
             )
         )
         return
+
+
+async def _confirm_exact_apply_plan(plan_sha256: str) -> bool:
+    """Require fresh plan-specific text; buffered Enter/y cannot approve Apply."""
+    if (not isinstance(plan_sha256, str) or len(plan_sha256) != 64 or
+            any(char not in "0123456789abcdef" for char in plan_sha256)):
+        return False
+    expected = f"APPLY {plan_sha256[:8]}"
+    try:
+        answer = await questionary.text(
+            f"Approve this entire exact Apply Plan? Type {expected} to confirm:",
+            default="",
+            style=_select_style(),
+        ).ask_async()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return answer == expected
 
 
 async def _prompt_task_gate_choice(prompt: str) -> str | None:

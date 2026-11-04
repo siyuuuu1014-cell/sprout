@@ -272,10 +272,11 @@ class ApprovalManager:
     def session_key_for(self, tool: str, arguments: Mapping[str, Any]) -> str:
         """Exact operation identity, excluding only the envelope event identifier.
 
-        Only CLI handoffs currently provide a server-pinned command/cwd/env.
-        Frozen verification, MCP and Proposal grants keep their existing contracts.
+        CLI handoffs pin command/cwd/env; CLI directory confirmation pins the
+        Workspace and canonical directory. Frozen verification, MCP and Proposal
+        grants keep their existing contracts.
         """
-        if tool != "cli_tool_run":
+        if tool not in {"cli_tool_run", "directory.list"}:
             return ""
         return "session-exact-v1:" + self.fingerprint({
             "tool": tool, "arguments": {k: v for k, v in arguments.items() if k != "event_id"},
