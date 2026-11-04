@@ -7,12 +7,12 @@ from pathlib import Path
 import questionary
 import typer
 
-from Sprout.strategy.acceptance import AcceptanceSpec
-from Sprout.task.models import DelegationScope
-from Sprout.workspace.authorized_content import relative_label
-
 
 async def prepare(runtime, workspace_id, *, message, session, principal):
+    from Sprout.strategy.acceptance import AcceptanceSpec
+    from Sprout.task.models import DelegationScope
+    from Sprout.workspace.authorized_content import relative_label
+
     workspace = await runtime.get_workspace(workspace_id)
     if workspace is None:
         raise PermissionError("cli_code_workspace_unavailable")
