@@ -361,7 +361,11 @@ async def _provide_cli_analysis_task(runtime, workspace_id, *, message, session,
     typer.echo(_L(
         "选择范围不替代 Policy/Scope 授权。", "Selection does not override Policy/Scope.",
     ))
+    from Sprout.runtime.analysis_consent import code_metrics_request
+
     selection = _analysis_selection(message.content)
+    if code_metrics_request(message.content) and selection and selection[0] != "file":
+        selection = None
     if selection and selection[0] == "directory":
         return await _provide_cli_directory_task(
             runtime, workspace, session, principal, message, label=selection[1])

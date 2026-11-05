@@ -131,6 +131,7 @@ class AgentLoop:
         steps = 0
         model_calls = 0
         tool_calls = 0
+        seen_calls = {}
         task_budget = context.metadata.get("task_budget", {})
         budget_model_calls = _budget_int(task_budget, "max_model_calls", self.max_model_calls)
         budget_tool_calls = _budget_int(task_budget, "max_tool_calls", self.max_tool_calls)
@@ -149,6 +150,7 @@ class AgentLoop:
                 tool_calls=tool_calls,
                 budget_tool_calls=budget_tool_calls,
                 node_tools=context.tools,
+                seen_calls=seen_calls,
             )
             messages.extend(tool_messages)
             if tool_summary.get("workspace_requested"):
@@ -236,6 +238,7 @@ class AgentLoop:
                 tool_calls=tool_calls,
                 budget_tool_calls=budget_tool_calls,
                 node_tools=context.tools,
+                seen_calls=seen_calls,
             )
             if not tool_messages:
                 continue
@@ -338,6 +341,7 @@ class AgentLoop:
         steps = 0
         model_calls = 0
         tool_calls = 0
+        seen_calls = {}
         task_budget = context.metadata.get("task_budget", {})
         budget_model_calls = _budget_int(task_budget, "max_model_calls", self.max_model_calls)
         budget_tool_calls = _budget_int(task_budget, "max_tool_calls", self.max_tool_calls)
@@ -374,6 +378,7 @@ class AgentLoop:
                     tool_calls=tool_calls,
                     budget_tool_calls=budget_tool_calls,
                     node_tools=context.tools,
+                    seen_calls=seen_calls,
                 )
                 if not tool_messages:
                     continue
@@ -429,6 +434,7 @@ class AgentLoop:
                 tool_calls=tool_calls,
                 budget_tool_calls=budget_tool_calls,
                 node_tools=context.tools,
+                seen_calls=seen_calls,
             )
             if not tool_messages:
                 continue
@@ -473,6 +479,7 @@ class AgentLoop:
         tool_calls: int,
         budget_tool_calls: int,
         node_tools: Mapping[str, Any] | None = None,
+        seen_calls: dict | None = None,
     ) -> tuple[list[LLMMessage], int, list[str], dict[str, int]]:
         summary = {"success": 0, "failure": 0, "approval": 0}
         if self.executor is None:
@@ -504,6 +511,7 @@ class AgentLoop:
         )
         outcomes = await executor.run_calls_detailed(
             allowed_calls,
+            seen_calls=seen_calls,
             requested_by=requested_by,
             session_id=session_id,
         )
@@ -516,9 +524,9 @@ class AgentLoop:
             for outcome in outcomes
         ]
         tool_calls += len(allowed_calls)
-        approval_ids = [
+        approval_ids = list(dict.fromkeys(
             outcome.result.approval_id for outcome in outcomes if outcome.requires_approval
-        ]
+        ))
         for outcome in outcomes:
             if outcome.result.workspace_request:
                 summary["workspace_requested"] = True

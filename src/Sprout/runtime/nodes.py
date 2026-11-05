@@ -425,6 +425,20 @@ class NodeExecutor:
         tool = await scope.runtime._issue_project_analysis_tool(
             paths=paths or None, discover=not paths,
         )
+        if admission.get("code_metrics"):
+            from Sprout.llm.messages import ToolCall
+
+            runtime = scope.runtime
+            runtime._node_tool_scopes[tool] = scope
+            agent = self._router.route(admission["message"])
+            executor = agent.executor.with_scoped_tools(
+                {tool.spec.name: tool}, strict=True)
+            result = await executor.run_call(ToolCall(
+                id="host-code-metrics", name=tool.spec.name,
+                arguments={"path": admission["target"],
+                           "instruction": admission["message"].content},
+            ), requested_by=task.actor.user_id, session_id=scope.session_id)
+            return {"content": result.to_text(), "analysis_ok": result.ok}
         tools = {tool.spec.name: tool}
         query = await scope.runtime._issue_project_query_tool(
             paths=paths or None, discover=not paths)
