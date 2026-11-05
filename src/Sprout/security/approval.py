@@ -303,6 +303,7 @@ class ApprovalManager:
         source: str = "unknown",
         session_id: str = "",
         request_approval: bool = True,
+        additional_events: EventBus | None = None,
     ) -> ApprovalRecord:
         timeout = self._policy.timeout_seconds if ttl_seconds is None else ttl_seconds
         expires_at = datetime.now(UTC) + timedelta(seconds=timeout) if timeout else None
@@ -321,7 +322,13 @@ class ApprovalManager:
             approval_class=(self.session_key_for(tool, arguments) if session_id
                             else self.class_key_for(tool, arguments)),
         )
-        await self._store.save_approval(record)
+        create_pending = getattr(self._store, "get_or_create_pending_approval", None)
+        if request_approval and task_id and requested_by and session_id and callable(create_pending):
+            stored = await create_pending(record)
+            if stored.id != record.id:
+                return stored
+        else:
+            await self._store.save_approval(record)
         if request_approval:
             await self._emit(
                 APPROVAL_REQUESTED,
@@ -337,6 +344,7 @@ class ApprovalManager:
                     "action_summary": record.action_summary,
                     "expires_at": expires_at.isoformat() if expires_at else "",
                 },
+                additional_events=additional_events,
             )
         return record
 
@@ -679,6 +687,11 @@ class ApprovalManager:
             },
         )
 
-    async def _emit(self, name: str, payload: dict[str, Any]) -> None:
+    async def _emit(
+        self, name: str, payload: dict[str, Any], *, additional_events: EventBus | None = None
+    ) -> None:
+        event = Event(name, payload)
         if self._events is not None:
-            await self._events.publish(Event(name, payload))
+            await self._events.publish(event)
+        if additional_events is not None and additional_events is not self._events:
+            await additional_events.publish(event)

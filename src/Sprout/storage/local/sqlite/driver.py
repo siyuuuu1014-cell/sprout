@@ -218,6 +218,30 @@ class SqliteDatabase:
                 self._conn.rollback()
                 raise
 
+    async def fetchone_or_execute(
+        self,
+        read: tuple[str, tuple[Any, ...]],
+        write: tuple[str, tuple[Any, ...]],
+        *,
+        before_read: tuple[str, tuple[Any, ...]] | None = None,
+    ) -> sqlite3.Row | None:
+        def transaction() -> sqlite3.Row | None:
+            with self._lock:
+                self._conn.execute("BEGIN IMMEDIATE")
+                try:
+                    if before_read is not None:
+                        self._conn.execute(*before_read)
+                    row = self._conn.execute(*read).fetchone()
+                    if row is None:
+                        self._conn.execute(*write)
+                    self._conn.commit()
+                except BaseException:
+                    self._conn.rollback()
+                    raise
+                return row
+
+        return await asyncio.to_thread(transaction)
+
     # -- reads ----------------------------------------------------------------
     async def fetchone(
         self, sql: str, parameters: tuple[Any, ...] = ()

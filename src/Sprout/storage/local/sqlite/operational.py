@@ -204,8 +204,37 @@ class SqliteOperationalStore:
         return int(await self._db.scalar("SELECT COUNT(*) FROM turns") or 0)
 
     # Approvals
+    async def get_or_create_pending_approval(self, record: ApprovalRecord) -> ApprovalRecord:
+        keys = (
+            "tool", "arguments_fingerprint", "requested_by", "task_id", "session_id",
+            "source", "resource_scope", "action_hash", "single_use", "approval_class",
+        )
+        where = " AND ".join(f"{key} = ?" for key in keys)
+        where += " AND status = 'pending' AND (expires_at IS NULL OR expires_at > ?)"
+        bindings = (*[getattr(record, key) for key in keys], record.created_at.isoformat())
+        candidate = f"FROM approvals WHERE {where} ORDER BY created_at, id LIMIT 1"
+        deadline = _dt(record.expires_at)
+        shorten = None
+        if deadline is not None:
+            shorten = (
+                "UPDATE approvals SET expires_at = ? "
+                f"WHERE id = (SELECT id {candidate}) "
+                "AND (expires_at IS NULL OR expires_at > ?)",
+                (deadline, *bindings, deadline),
+            )
+        row = await self._db.fetchone_or_execute(
+            (f"SELECT * {candidate}", bindings),
+            self._approval_upsert(record),
+            before_read=shorten,
+        )
+        return self._row_to_approval(row) if row is not None else record
+
     async def save_approval(self, record: ApprovalRecord) -> None:
-        await self._db.execute(
+        await self._db.execute(*self._approval_upsert(record))
+
+    @staticmethod
+    def _approval_upsert(record: ApprovalRecord) -> tuple[str, tuple[Any, ...]]:
+        return (
             "INSERT INTO approvals (id, tool, arguments_fingerprint, status, "
             "requested_by, decided_by, reason, created_at, decided_at, "
             "task_id, single_use, expires_at, used_at, resource_scope, "

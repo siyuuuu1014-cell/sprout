@@ -1010,11 +1010,13 @@ async def _handle_cli_approval_prompt(
     metadata: dict,
     user: str,
 ) -> bool:
-    approval_ids = [
-        str(approval_id)
-        for approval_id in metadata.get("approval_ids", ())
-        if approval_id
-    ]
+    from datetime import UTC, datetime
+
+    from Sprout.security.approval import ApprovalStatus
+
+    approval_ids = dict.fromkeys(
+        str(approval_id) for approval_id in metadata.get("approval_ids", ()) if approval_id
+    )
     if not session_id or not metadata.get("approval_required") or not approval_ids:
         return False
 
@@ -1024,6 +1026,10 @@ async def _handle_cli_approval_prompt(
         record = await runtime.approvals.store.get_approval(approval_id)
         if record is None:
             typer.echo(ui.warning(_approval_text("missing", approval_id=approval_id)))
+            continue
+        if record.status != ApprovalStatus.PENDING or (
+            record.expires_at is not None and record.expires_at <= datetime.now(UTC)
+        ):
             continue
         _print_approval_record(record, metadata.get("pending_tool_calls"))
         choice = await _prompt_approval_decision(record)
@@ -1088,13 +1094,13 @@ async def _handle_cli_approval_prompt(
         _render_cli_markdown(outbound.content)
         _print_reply_meta(dict(outbound.metadata))
         if dict(outbound.metadata).get("approval_required"):
-            await _handle_cli_approval_prompt(
+            if await _handle_cli_approval_prompt(
                 runtime,
                 outbound.session_id,
                 dict(outbound.metadata),
                 user,
-            )
-            return True
+            ):
+                return True
         _print_session_separator()
     elif decided:
         _print_session_separator()
@@ -1439,19 +1445,16 @@ def _format_tool_arguments(tool: str, arguments: dict[str, Any]) -> str:
 
 def _approval_action_lines(record: Any, pending: object) -> list[str]:
     """The concrete action(s) a grant would authorise, ready for a terminal."""
-    matching = [
-        item
-        for item in (pending or ())
-        if isinstance(item, dict) and item.get("name") == getattr(record, "tool", "")
-    ]
-    if matching:
-        return [
-            _format_tool_arguments(
-                getattr(record, "tool", ""),
-                item.get("arguments") or {},
-            )
-            for item in matching
-        ]
+    from Sprout.security.approval import ApprovalManager
+
+    tool = getattr(record, "tool", "")
+    fingerprint = getattr(record, "arguments_fingerprint", "")
+    for item in pending or ():
+        if not isinstance(item, dict) or item.get("name") != tool:
+            continue
+        arguments = item.get("arguments")
+        if isinstance(arguments, dict) and ApprovalManager.fingerprint(arguments) == fingerprint:
+            return [_format_tool_arguments(tool, arguments)]
     summary = getattr(record, "action_summary", "") or ""
     return [summary] if summary else []
 

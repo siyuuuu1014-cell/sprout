@@ -22,7 +22,6 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 from Sprout.events import (
-    APPROVAL_REQUESTED,
     TOOL_DENIED,
     TOOL_EXECUTED,
     Event,
@@ -367,9 +366,7 @@ class ToolExecutor:
                     resource_scope=resource_scope,
                     source=source,
                     session_id=session_id,
-                )
-                await self._publish(
-                    APPROVAL_REQUESTED, {"tool": name, "approval_id": record.id}
+                    additional_events=self.events,
                 )
                 return ToolResult.needs_approval(record.id)
 
