@@ -60,8 +60,17 @@ class ProjectAnalyzeTool:
             return ToolResult.denied("project_analysis_scope_unavailable")
         try:
             return await frame.node_scope.runtime._invoke_project_tool(self, arguments)
-        except (PermissionError, ValueError):
-            return ToolResult.denied("project_analysis_scope_unavailable")
+        except (PermissionError, ValueError) as exc:
+            from Sprout.workspace.authorized_content import ProjectAnalysisError
+
+            reason = (str(exc) if isinstance(exc, ProjectAnalysisError) else
+                      "project_analysis_failed" if isinstance(exc, ValueError) else
+                      "project_analysis_scope_unavailable")
+            admission = frame.node_scope.runtime._online_analysis_requests.get(
+                frame.node_scope.node.id)
+            if admission is not None:
+                admission.setdefault("unavailable_reason", reason)
+            return ToolResult.denied(reason)
 
 
 async def _system_tool_probe(root: Path) -> dict[str, Any]:

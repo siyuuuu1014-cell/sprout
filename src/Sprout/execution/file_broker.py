@@ -317,6 +317,9 @@ class FileBroker:
             finally:
                 if final_decisions:
                     await emit_policy_decision(self._events, request, final_decisions[-1])
+            if (type(result) is SnapshotResult and result.ok is False
+                    and result.reason == "snapshot_not_found"):
+                return SnapshotResult(reason="snapshot_not_found")
             result = checked_snapshot(result, max_bytes, expected_identity)
             if not result.ok:
                 return result
@@ -326,6 +329,14 @@ class FileBroker:
                 return SnapshotResult(reason="snapshot_authority_changed")
             await decide(replace(request, scope=latest.scope, actor=latest.actor))
             return result
+        except FileBoundaryError as exc:
+            reason = str(exc)
+            return SnapshotResult(reason=reason if reason in {
+                "snapshot_budget_exceeded", "snapshot_identity_changed",
+                "snapshot_authorization_denied", "snapshot_identity_unavailable",
+            } else "snapshot_unavailable")
+        except PermissionError:
+            return SnapshotResult(reason="snapshot_authorization_denied")
         except (OSError, ValueError):
             return SnapshotResult(reason="snapshot_unavailable")
         finally:

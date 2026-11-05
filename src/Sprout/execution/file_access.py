@@ -97,6 +97,10 @@ def file_operation(
 
 def _missing(operation, authorize):
     authorize()
+    if operation == "snapshot":
+        from Sprout.execution.file_snapshot import SnapshotResult
+
+        return SnapshotResult(reason="snapshot_not_found")
     return "" if operation == "read" else False
 
 
@@ -215,6 +219,8 @@ def _posix(root, target, operation, authorize, content, newline):
             fd = os.open(name, access | os.O_NOFOLLOW | os.O_NONBLOCK
                          | getattr(os, "O_CLOEXEC", 0), 0o666, dir_fd=parent)
         except FileNotFoundError:
+            if operation == "snapshot":
+                return _missing(operation, authorize)
             return "" if operation == "read" else False
         stack.callback(os.close, fd)
         info = os.fstat(fd)
@@ -473,6 +479,8 @@ def _windows(root, target, operation, authorize, content, newline):
             handle = _win_open(parent / relative[-1], access,
                                disposition=4 if operation == "write" else 3)
         except FileNotFoundError:
+            if operation == "snapshot":
+                return _missing(operation, authorize)
             return "" if operation == "read" else False
         try:
             info = _win_info(handle)
