@@ -14,6 +14,7 @@ import pytest
 from Sprout.mcp.adapter.tool import MCPTool, MCPToolAdapter, _content_to_text
 from Sprout.mcp.server.server import build_server, server_definitions
 from Sprout.tests.conftest import build_runtime
+from Sprout.tools.result import ToolExecutionUnconfirmed
 
 
 class FakeConnection:
@@ -73,38 +74,78 @@ def test_to_tool_wraps_connection_and_spec() -> None:
 # -- MCPTool.invoke --------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_invoke_proxies_success() -> None:
-    result_obj = SimpleNamespace(isError=False, content=[SimpleNamespace(text="found 2 files")])
-    connection = FakeConnection(result=result_obj)
-    tool = MCPToolAdapter().to_tool(connection, _remote_tool())
+@pytest.fixture
+async def trusted_remote(monkeypatch):
+    from Sprout.mcp.adapter.tool import descriptor_fingerprint
+    from Sprout.mcp.client import client as client_module
+    from Sprout.tests.test_r04_c1_mcp_trusted_wiring import (
+        IDENTITY,
+        config,
+        executor_for,
+        issued,
+    )
+    from Sprout.tests.test_r04_c1_mcp_trusted_wiring import (
+        FakeConnection as ManagerTransport,
+    )
 
-    result = await tool.invoke({"path": "/tmp"})
+    class Transport(ManagerTransport):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.descriptors = [_remote_tool()]
+
+    monkeypatch.setattr(client_module, "MCPConnection", Transport)
+    # A known test descriptor is reviewed by the Host before discovery. The
+    # transport response cannot enroll itself as trusted.
+    declaration = config(name="fake", risk="low", operation="search",
+                         digest=descriptor_fingerprint(_remote_tool()))
+    manager, connection, tool = await issued(configured=declaration)
+    executor = executor_for(tool)
+
+    async def invoke(arguments):
+        return await executor.execute(tool.spec.name, arguments, **IDENTITY)
+
+    try:
+        yield connection, invoke
+    finally:
+        await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_invoke_proxies_success(trusted_remote) -> None:
+    result_obj = SimpleNamespace(isError=False, content=[SimpleNamespace(text="found 2 files")])
+    connection, invoke = trusted_remote
+    connection.call_tool.return_value = result_obj
+
+    result = await invoke({"path": "/tmp"})
     assert result.ok
     assert result.content == "found 2 files"
     assert result.data == {"server": "fake"}
-    assert connection.calls == [("search", {"path": "/tmp"})]
+    connection.call_tool.assert_awaited_once_with("search", {"path": "/tmp"})
 
 
 @pytest.mark.asyncio
-async def test_invoke_maps_remote_error_to_failure() -> None:
+async def test_invoke_maps_remote_error_to_failure(trusted_remote) -> None:
     result_obj = SimpleNamespace(isError=True, content=[SimpleNamespace(text="boom")])
-    connection = FakeConnection(result=result_obj)
-    tool = MCPToolAdapter().to_tool(connection, _remote_tool())
+    connection, invoke = trusted_remote
+    connection.call_tool.return_value = result_obj
 
-    result = await tool.invoke({})
+    result = await invoke({})
     assert not result.ok
     assert "boom" in result.error
+    connection.call_tool.assert_awaited_once_with("search", {})
 
 
 @pytest.mark.asyncio
-async def test_invoke_maps_transport_exception_to_failure() -> None:
-    connection = FakeConnection(error=RuntimeError("subprocess died"))
-    tool = MCPToolAdapter().to_tool(connection, _remote_tool())
-
-    result = await tool.invoke({})
-    assert not result.ok
-    assert "subprocess died" in result.error
+async def test_invoke_maps_transport_exception_to_failure(trusted_remote) -> None:
+    connection, invoke = trusted_remote
+    connection.call_tool.side_effect = RuntimeError("subprocess died")
+    with pytest.raises(ToolExecutionUnconfirmed, match="mcp_remote_execution_unconfirmed"):
+        await invoke({})
+    connection.call_tool.assert_awaited_once_with("search", {})
+    # Transport loss revokes the live binding. An explicit subsequent request
+    # cannot silently execute again or reinterpret UNKNOWN as a retryable error.
+    assert not (await invoke({})).ok
+    connection.call_tool.assert_awaited_once()
 
 
 # -- content extraction -----------------------------------------------------------

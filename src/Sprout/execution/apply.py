@@ -6,10 +6,8 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from Sprout.execution.git_env import git_args, git_env
 from Sprout.execution.models import ApplyResult, ChangeProposal
 from Sprout.execution.policy_emit import emit_policy_decision
-from Sprout.execution.proc import run_capture
 from Sprout.security.access import AccessDecision, ActionRequest, ActionType
 from Sprout.security.approval import ApprovalManager
 from Sprout.security.engine import PolicyEngine
@@ -18,6 +16,11 @@ from Sprout.workspace.models import ResourceKind, ResourceRef, Workspace
 
 if TYPE_CHECKING:
     from Sprout.events import EventBus
+
+
+async def run_capture(*args: object, **kwargs: object) -> tuple[int, str, str]:
+    """Refusal-only compatibility symbol; never a host process runner."""
+    raise RuntimeError("internal_apply_git_execution_unavailable")
 
 
 class ApplyBroker:
@@ -29,7 +32,9 @@ class ApplyBroker:
         *,
         approvals: ApprovalManager | None = None,
         events: EventBus | None = None,
+        runtime=None,
     ) -> None:
+        self._runtime = runtime
         self._policy = policy
         self._approvals = approvals
         self._events = events
@@ -76,8 +81,20 @@ class ApplyBroker:
         workspace: Workspace,
         *,
         scope: DelegationScope | None = None,
+        principal=None,
     ) -> ApplyResult:
-        """Apply an approved proposal to the real workspace."""
+        """Only a live Runtime exact plan can reach conditional Workspace writes."""
+        if self._runtime is not None and proposal.id in self._runtime._local_apply_plans:
+            from Sprout.execution.apply_plan import execute
+
+            return await execute(self._runtime, proposal, workspace, principal)
+        return ApplyResult(
+            proposal_id=proposal.id, applied=False,
+            reason="internal_apply_execution_unavailable",
+        )
+
+        # Retain A1/A2 guards for a separately authorized future restoration.
+        # Nothing below is an executable alternate admission path.
         result = await self.evaluate(proposal, workspace, scope=scope)
         if not result.applied:
             return result
@@ -85,6 +102,31 @@ class ApplyBroker:
         patch = "\n".join(item.diff_text for item in proposal.diffs if item.diff_text)
         if not patch:
             return ApplyResult(proposal_id=proposal.id, applied=True, reason="No diff to apply")
+
+        files = tuple(proposal.files_changed)
+        if not files:
+            return ApplyResult(
+                proposal_id=proposal.id, applied=False,
+                reason="Non-empty patch requires explicit files_changed",
+            )
+
+        # Point-in-time guard only: do not mix existing staging into this
+        # proposal. This does not lock the index against concurrent writers.
+        try:
+            index_code, _, _ = await self._git(
+                workspace, "diff", "--cached", "--quiet", "--exit-code",
+                "--no-ext-diff", "--no-textconv", "--ita-visible-in-index", "--",
+            )
+        except Exception:
+            return ApplyResult(
+                proposal_id=proposal.id, applied=False,
+                reason="Index inspection failed; refusing apply",
+            )
+        if type(index_code) is not int or index_code != 0:
+            return ApplyResult(
+                proposal_id=proposal.id, applied=False,
+                reason="Index is staged or its state is uncertain; refusing apply",
+            )
 
         patch_path = self._write_patch(proposal.id, patch)
         try:
@@ -112,13 +154,9 @@ class ApplyBroker:
                     reason=detail or "git apply failed",
                 )
 
-            files = tuple(proposal.files_changed)
-            if files:
-                code, _, stderr = await self._git(
-                    workspace, "add", "--", *files
-                )
-            else:
-                code, _, stderr = await self._git(workspace, "add", "-A")
+            code, _, stderr = await self._git(
+                workspace, "add", "--", *files
+            )
             if code != 0:
                 await self._undo(workspace, patch_path, files)
                 return ApplyResult(
@@ -162,67 +200,16 @@ class ApplyBroker:
         *,
         scope: DelegationScope | None = None,
     ) -> ApplyResult:
-        """Revert a recorded commit, or reverse a legacy patch without hard reset."""
-        result = await self.evaluate(proposal, workspace, scope=scope)
-        if not result.applied:
-            return result
-
-        applied_commit = str(proposal.metadata.get("applied_commit", ""))
-        if applied_commit:
-            code, stdout, stderr = await self._git(
-                workspace, "revert", "--no-edit", applied_commit
-            )
-            if code == 0:
-                return ApplyResult(
-                    proposal_id=proposal.id,
-                    applied=True,
-                    reason="reverted committed change",
-                    applied_commit=applied_commit,
-                )
-            return ApplyResult(
-                proposal_id=proposal.id,
-                applied=False,
-                reason=(stderr.strip() or f"git revert {applied_commit[:8]} failed")
-                       + "; repository retained for manual reconciliation; no hard reset",
-            )
-
-        patch = "\n".join(item.diff_text for item in proposal.diffs if item.diff_text)
-        if not patch:
-            return ApplyResult(proposal_id=proposal.id, applied=False, reason="No diff to rollback")
-
-        patch_path = self._write_patch(proposal.id, patch)
-        try:
-            code, _, stderr = await run_capture(
-                "git",
-                *git_args(
-                    "-C",
-                    str(workspace.root),
-                    "apply",
-                    "-R",
-                    "--whitespace=nowarn",
-                    patch_path,
-                ),
-                env=git_env(),
-            )
-            if code != 0:
-                detail = stderr.strip()
-                return ApplyResult(
-                    proposal_id=proposal.id,
-                    applied=False,
-                    reason=detail or "git apply -R failed",
-                )
-        finally:
-            Path(patch_path).unlink(missing_ok=True)
-        return ApplyResult(proposal_id=proposal.id, applied=True, reason="rolled_back")
+        """Rollback execution is unavailable, including legacy patch reversal."""
+        return ApplyResult(
+            proposal_id=proposal.id, applied=False,
+            reason="internal_rollback_execution_unavailable",
+        )
 
     async def _git(
         self, workspace: Workspace, *args: str
     ) -> tuple[int, str, str]:
-        return await run_capture(
-            "git",
-            *git_args("-C", str(workspace.root), *args),
-            env=git_env(),
-        )
+        raise RuntimeError("internal_apply_git_execution_unavailable")
 
     async def _head_commit(self, workspace: Workspace) -> str:
         code, stdout, stderr = await self._git(workspace, "rev-parse", "HEAD")
@@ -236,9 +223,7 @@ class ApplyBroker:
         patch_path: str,
         files: tuple[str, ...],
     ) -> None:
-        if files:
-            await self._git(workspace, "restore", "--staged", "--", *files)
-        await self._git(workspace, "apply", "-R", "--whitespace=nowarn", patch_path)
+        raise RuntimeError("internal_apply_undo_execution_unavailable")
 
     @staticmethod
     def _write_patch(proposal_id: str, patch: str) -> str:

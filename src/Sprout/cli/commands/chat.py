@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import shlex
 import shutil
 import sys
@@ -37,6 +38,7 @@ from rich.text import Text
 from rich.theme import Theme
 
 from Sprout.cli import ui
+from Sprout.cli.code_task import provider as _cli_code_task_provider
 from Sprout.cli.diff import render_diff
 from Sprout.cli.i18n import L as _L
 from Sprout.cli.i18n import current_language as _current_cli_language
@@ -47,7 +49,7 @@ from Sprout.cli.i18n import supported_languages as _supported_languages
 from Sprout.gateway.identity import Principal
 from Sprout.gateway.local_identity import current_cli_principal
 from Sprout.llm.messages import Usage
-from Sprout.message.models import Message
+from Sprout.message.models import Message, StreamChunk
 from Sprout.security.redact import Redactor
 
 _CHAT_HISTORY = InMemoryHistory()
@@ -260,7 +262,7 @@ async def _chat(runtime, settings, *, message: str | None, session: str | None, 
 
     try:
         async with managed(runtime):
-            workspace_id = await _confirm_cli_workspace(runtime)
+            session, workspace_id = await _prepare_cli_context(runtime, session, user)
             gateway = CLIGateway(runtime)
             if message is not None:
                 if _handle_natural_language_request(message):
@@ -281,11 +283,12 @@ async def _chat(runtime, settings, *, message: str | None, session: str | None, 
                 )
                 _render_cli_markdown(reply.content)
                 _print_reply_meta(reply.metadata)
+                session = str(reply.metadata.get("session_id") or session or "")
                 # One-shot mode (``sprout chat "..."``) can still answer: the
                 # prompt runs here rather than being silently dropped, which
                 # would leave a held task nobody knows about.
                 handled = await _handle_cli_workspace_consent(
-                    runtime, reply.session_id or session, dict(reply.metadata), user
+                    runtime, session, dict(reply.metadata), user
                 )
                 if not handled:
                     if dict(reply.metadata).get("foreground_task"):
@@ -295,9 +298,9 @@ async def _chat(runtime, settings, *, message: str | None, session: str | None, 
                         handled = True
                     else:
                         await _handle_cli_approval_prompt(
-                            runtime, reply.session_id or session, dict(reply.metadata), user
+                            runtime, session, dict(reply.metadata), user
                         )
-                await _report_parked_tasks(runtime, reply.session_id or session)
+                await _report_parked_tasks(runtime, session)
                 _print_session_separator()
                 return
             await _repl(
@@ -338,6 +341,184 @@ async def _execute_language_command(requested: str | None = None) -> None:
     selected = requested or await _prompt_language_subcommand()
     if selected:
         _apply_language_request(selected)
+
+
+async def _provide_cli_analysis_task(runtime, workspace_id, *, message, session, principal):
+    """Explicit fixed resources; Workspace confirmation alone grants nothing."""
+    from Sprout.task.models import DelegationScope, TaskExecutionMode
+    from Sprout.task.paths import bound_scope_path, scope_path
+    from Sprout.workspace.authorized_content import ContentLimits, relative_label
+
+    if not principal.authenticated or principal.source != "cli":
+        raise PermissionError("cli_analysis_identity_unavailable")
+    workspace = await runtime.get_workspace(workspace_id) if workspace_id else None
+    if workspace is None:
+        raise PermissionError("cli_analysis_workspace_required")
+    if not sys.stdin.isatty():
+        raise PermissionError("cli_analysis_interactive_confirmation_required")
+    typer.echo(_L("本次只读分析工作区：", "Read-only analysis workspace: ")
+               + f"{workspace.id}  {workspace.root}")
+    typer.echo(_L(
+        "选择范围不替代 Policy/Scope 授权。", "Selection does not override Policy/Scope.",
+    ))
+    selection = _analysis_selection(message.content)
+    if selection and selection[0] == "directory":
+        return await _provide_cli_directory_task(
+            runtime, workspace, session, principal, message, label=selection[1])
+    try:
+        raw = selection[1] if selection else await questionary.text(_L(
+            "输入 Workspace 相对文件路径或 JSON 文件清单（空白取消）：",
+            "Enter a workspace-relative file or JSON file list (blank cancels):",
+        )).ask_async()
+        if not raw or not raw.strip():
+            return None
+        try:
+            if raw.lstrip().startswith("["):
+                selected = json.loads(raw)
+                if (type(selected) is not list or not selected
+                        or len(selected) > ContentLimits().max_files
+                        or any(type(path) is not str for path in selected)):
+                    raise ValueError("invalid_manifest")
+            else:
+                selected = [line.strip() for line in raw.splitlines() if line.strip()]
+                if len(selected) != 1:
+                    # Preserve the old plain-text format; multi-file input is
+                    # explicit JSON, never silently truncated to its first line.
+                    raise PermissionError("project_multi_file_analysis_unavailable")
+                if selected[0].casefold() in {"auto", "自动", "自动发现", "*", "**"}:
+                    raise PermissionError("project_auto_discovery_unavailable")
+            paths = tuple(relative_label(path.replace("\\", "/")) for path in selected)
+            if len({path.casefold() for path in paths}) != len(paths):
+                raise ValueError("duplicate_manifest_path")
+        except (ValueError, TypeError) as exc:
+            raise PermissionError("analysis_file_selection_invalid") from exc
+        root = scope_path(str(workspace.root))
+        for path in paths:
+            target = scope_path(bound_scope_path(path, str(workspace.root)))
+            if root is None or target is None or not root.contains(target):
+                raise PermissionError("analysis_file_selection_invalid")
+        typer.echo(_L("本次分析请求：", "Analysis request: ") + message.content)
+        typer.echo(_L("只读取所选文件：", "Selected files only: ") + "\n" + "\n".join(paths))
+        confirmed = await questionary.confirm(_L(
+            "确认请求分析以上文件？", "Confirm analysis of these files?",
+        ), default=False).ask_async()
+        if not confirmed:
+            return None
+    except (EOFError, KeyboardInterrupt):
+        return None
+    # Prompts can yield. Recheck the actual Session before creating the Task;
+    # --user and Message.user_id never become the authenticated actor.
+    owned = await runtime._sessions.require_owner(session.id, principal)
+    frozen = runtime._sessions.frozen_principal(owned)
+    if (frozen.user_id, frozen.source, frozen.authenticated) != (
+            principal.user_id, principal.source, principal.authenticated):
+        raise PermissionError("cli_analysis_identity_unavailable")
+    return await runtime.create_task(
+        workspace.id, message.content, actor=principal, source=principal.source,
+        execution_mode=TaskExecutionMode.READ_ONLY,
+        delegation_scope=DelegationScope(
+            allowed_actions=frozenset({"tool.invoke", "file.read"}),
+            allowed_paths=tuple(str(workspace.root / path) for path in paths),
+        ),
+        metadata={"session_id": owned.id, "required_paths": list(paths)},
+    )
+
+
+def _analysis_selection(content: str) -> tuple[str, str] | None:
+    """Select a request, never grant it. Ambiguous lists retain explicit selection."""
+    token = r"[A-Za-z0-9_./\\-]+"
+    files = re.findall(
+        rf"(?<![A-Za-z0-9_/\\])({token}\.[A-Za-z0-9_]+)(?![A-Za-z0-9_/\\])", content)
+    directories = re.findall(
+        rf"({token})\s*(?:子目录|目录|directory\b|folder\b)", content, re.IGNORECASE)
+    directories += re.findall(
+        rf"(?:子目录|目录|directory\b|folder\b)\s*[:：]?\s*[`\"']?({token})",
+        content, re.IGNORECASE)
+    if not files:
+        directories += re.findall(rf"(?<![A-Za-z0-9_/\\])({token}[/\\])", content)
+    paths = {(kind, path.replace("\\", "/")) for kind, values in (
+        ("file", files), ("directory", directories)) for path in values}
+    if len(paths) == 1:
+        return next(iter(paths))
+    if paths:
+        return None
+    if any(term in content.casefold() for term in (
+            "项目", "架构", "依赖", "project", "architecture", "dependencies")):
+        return "directory", "."
+    return None
+
+
+async def _provide_cli_directory_task(
+    runtime, workspace, session, principal, message, *, label=None,
+):
+    """Confirm an exact read-only scope through Runtime's existing approvals."""
+    from Sprout.runtime.analysis_consent import bind, context
+    from Sprout.task.models import TaskExecutionMode
+    from Sprout.workspace.authorized_content import relative_label
+
+    try:
+        raw = label if label is not None else await questionary.text(_L(
+            "本次自动分析目录（Workspace 相对路径，. 表示项目根；空白取消）：",
+            "Analysis directory (workspace-relative, . for root; blank cancels):",
+        )).ask_async()
+        if not raw or not raw.strip():
+            return None
+        label = raw.strip().replace("\\", "/")
+        try:
+            label = "." if label == "." else relative_label(label)
+        except (ValueError, TypeError) as exc:
+            raise PermissionError("analysis_directory_selection_invalid") from exc
+        target = workspace.root if label == "." else workspace.root / label
+        owned, scope, arguments, reusable = await context(
+            runtime, workspace, session, principal, target)
+        target = Path(arguments['path'])
+        typer.echo(_L("自动分析授权范围：", "Automatic analysis scope: ") + str(target))
+        if reusable is None and not await questionary.confirm(_L(
+                "授权列举此目录及子目录，并只读分析 Policy 允许的项目文件？",
+                "Authorize directory/subdirectory listing and analysis of policy-allowed files?"),
+                default=False).ask_async():
+            return None
+    except (EOFError, KeyboardInterrupt):
+        return None
+    except PermissionError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise PermissionError('analysis_directory_selection_invalid') from exc
+    # The terminal yielded: ownership, binding and Policy must still hold.
+    owned, scope, current_arguments, _ = await context(
+        runtime, workspace, session, principal, target)
+    if current_arguments != arguments:
+        raise PermissionError('cli_directory_selection_changed')
+    task = await runtime.create_task(
+        workspace.id, message.content, actor=principal, source=principal.source,
+        execution_mode=TaskExecutionMode.READ_ONLY, delegation_scope=scope,
+        metadata={"session_id": owned.id, "analysis_directory": label},
+    )
+    await bind(runtime, task, workspace, owned, principal, arguments)
+    return task
+
+
+def _cli_analysis_task_provider(runtime, workspace_id, live=None):
+    """Bind one turn's host and terminal, not mutable REPL loop variables."""
+    async def provide(**request):
+        # readline has completed; suspend Rich before questionary owns input.
+        if live is not None:
+            live.stop()
+        try:
+            return await _provide_cli_analysis_task(runtime, workspace_id, **request)
+        finally:
+            if live is not None:
+                live.start()
+    return provide
+
+
+async def _cli_turn_stream(runtime, message, **kwargs):
+    """Display a denied turn without granting, retrying or settling its effects."""
+    try:
+        async for chunk in runtime.handle_stream(message, **kwargs):
+            yield chunk
+    except PermissionError as exc:
+        yield StreamChunk(error=str(exc))
 
 
 async def _repl(
@@ -382,6 +563,18 @@ async def _repl(
         if _handle_natural_language_request(content):
             continue
         if content.startswith("/"):
+            if content == "/permissions":
+                from Sprout.cli.commands.security import session_permission_inventory
+
+                try:
+                    permissions = await session_permission_inventory(
+                        runtime, session_id=session,
+                        principal=current_cli_principal() if session else None)
+                except PermissionError as error:
+                    typer.echo(ui.warning(str(error)))
+                    continue
+                typer.echo(json.dumps(permissions, ensure_ascii=False, indent=2))
+                continue
             if content in {"/", "/help"}:
                 if content == "/help":
                     _show_slash_directory()
@@ -565,6 +758,11 @@ async def _repl(
         reply_metadata: dict = {}
         response_error: str | None = None
         console = Console(theme=_CLI_MARKDOWN_THEME)
+        try:
+            principal = current_cli_principal()
+        except ValueError:
+            typer.echo(ui.warning("cli_analysis_identity_unavailable"))
+            continue
         if console.is_terminal:
             with Live(
                 Spinner(
@@ -578,8 +776,10 @@ async def _repl(
                 refresh_per_second=12,
                 vertical_overflow="crop",
             ) as live:
-                async for chunk in runtime.handle_stream(
-                    stream_message, principal=current_cli_principal(), foreground=True
+                async for chunk in _cli_turn_stream(
+                    runtime, stream_message, principal=principal, foreground=True,
+                    analysis_task_provider=_cli_analysis_task_provider(runtime, workspace_id, live),
+                    code_task_provider=_cli_code_task_provider(runtime, workspace_id, live),
                 ):
                     if chunk.error is not None:
                         response_error = chunk.error
@@ -597,8 +797,10 @@ async def _repl(
                         reply_metadata = dict(chunk.outbound.metadata)
         else:
             typer.echo(ui.muted(_L("  正在生成…", "  Generating…")))
-            async for chunk in runtime.handle_stream(
-                stream_message, principal=current_cli_principal(), foreground=True
+            async for chunk in _cli_turn_stream(
+                runtime, stream_message, principal=principal, foreground=True,
+                analysis_task_provider=_cli_analysis_task_provider(runtime, workspace_id),
+                code_task_provider=_cli_code_task_provider(runtime, workspace_id),
             ):
                 if chunk.error is not None:
                     response_error = chunk.error
@@ -699,6 +901,28 @@ async def _approve_task_gates(runtime: Any, task: Any, user: str) -> None:
             typer.echo(ui.key_value("files", ", ".join(proposal.files_changed) or "-"))
             for diff in proposal.diffs:
                 render_diff(diff.path, diff.diff_text)
+            if proposal.id in runtime._local_apply_plans:
+                body = proposal.metadata["apply_plan"]
+                typer.echo(f"Plan SHA256: {proposal.metadata['apply_plan_sha256']}")
+                for item in body["files"]:
+                    typer.echo(f"{item['path']}: {item['before']} -> {item['after']}")
+                content = proposal.metadata.get("content_diff")
+                if content:
+                    typer.echo("Exact Workspace replacement (content snapshots; not Git output):")
+                    render_diff("workspace_replacement", content["text"])
+                plan_sha256 = proposal.metadata["apply_plan_sha256"]
+                if not await _confirm_exact_apply_plan(plan_sha256):
+                    typer.echo(ui.warning("Not confirmed; no Apply write."))
+                    return
+                current_proposal = await runtime.find_change_proposal(proposal.id)
+                if (current_proposal is None or
+                        current_proposal.metadata.get("apply_plan_sha256") != plan_sha256):
+                    typer.echo(ui.warning("Apply Plan changed; review it again before confirming."))
+                    return
+                await runtime.approve_change_proposal(proposal.id, decided_by="cli",
+                                                     principal=current_cli_principal())
+                typer.echo(ui.success("Exact Apply Plan approved; checking persisted result."))
+                continue
             has_failures = any(item.failed for item in proposal.test_results)
             if has_failures:
                 typer.echo(
@@ -736,6 +960,23 @@ async def _approve_task_gates(runtime: Any, task: Any, user: str) -> None:
             )
         )
         return
+
+
+async def _confirm_exact_apply_plan(plan_sha256: str) -> bool:
+    """Require fresh plan-specific text; buffered Enter/y cannot approve Apply."""
+    if (not isinstance(plan_sha256, str) or len(plan_sha256) != 64 or
+            any(char not in "0123456789abcdef" for char in plan_sha256)):
+        return False
+    expected = f"APPLY {plan_sha256[:8]}"
+    try:
+        answer = await questionary.text(
+            f"Approve this entire exact Apply Plan? Type {expected} to confirm:",
+            default="",
+            style=_select_style(),
+        ).ask_async()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return answer == expected
 
 
 async def _prompt_task_gate_choice(prompt: str) -> str | None:
@@ -975,6 +1216,35 @@ async def _handle_cli_workspace_consent(
     return True
 
 
+async def _prepare_cli_context(runtime: Any, session_id: str | None, user: str):
+    """Restore an owned session before consulting this process' current directory."""
+    principal = current_cli_principal()
+    if not principal.authenticated or principal.source != "cli":
+        raise PermissionError("cli_session_identity_unavailable")
+    if session_id:
+        session = await runtime._sessions.require_owner(session_id, principal)
+        if runtime._sessions.frozen_principal(session) != principal:
+            raise PermissionError("cli_session_identity_unavailable")
+        workspace_id = runtime.session_workspace_id(session)
+        if workspace_id:
+            workspace = await runtime.get_workspace(workspace_id)
+            if workspace is None or not workspace.root.is_dir():
+                raise PermissionError("cli_session_workspace_unavailable")
+            return session.id, workspace_id
+    workspace_id = await _confirm_cli_workspace(runtime)
+    session = await runtime._sessions.resolve(
+        Message("", channel="cli", user_id=user, session_id=session_id), principal=principal)
+    # Confirmation yielded to terminal input. Recheck ownership before binding.
+    session = await runtime._sessions.require_owner(session.id, principal)
+    if runtime._sessions.frozen_principal(session) != principal:
+        raise PermissionError("cli_session_identity_unavailable")
+    if workspace_id:
+        if await runtime.get_workspace(workspace_id) is None:
+            raise PermissionError("cli_session_workspace_unavailable")
+        await runtime._remember_session_workspace(session.id, workspace_id)
+    return session.id, workspace_id
+
+
 async def _confirm_cli_workspace(runtime: Any) -> str:
     """Confirm the CLI process' current directory once for its coding tasks."""
     if not sys.stdin.isatty():
@@ -1185,7 +1455,8 @@ def _approval_action_lines(record: Any, pending: object) -> list[str]:
 def _print_approval_record(record: Any, pending: object = ()) -> None:
     typer.echo("")
     typer.echo(ui.text(_approval_text("title"), bold=True))
-    scope = "similar_scope" if getattr(record, "approval_class", "") else "exact_scope"
+    scope = ("similar_scope" if getattr(record, "approval_class", "")
+             and getattr(record, "session_id", "") else "exact_scope")
     rows = _approval_detail_rows(record)
     rows.extend(
         (_approval_text("action"), line)
@@ -1195,7 +1466,17 @@ def _print_approval_record(record: Any, pending: object = ()) -> None:
         _approval_text("scope"),
         _approval_text(scope, command=_approval_command(record)),
     ))
-    rendered = [f"{label}  {value or '-'}" for label, value in rows]
+    from rich.ansi import AnsiDecoder
+
+    available = max(20, shutil.get_terminal_size(fallback=(80, 24)).columns - 4)
+    console = Console(width=available, color_system=None)
+    rendered = []
+    for label, value in rows:
+        if not value or value == "-":
+            continue
+        # Literal text, never Rich markup. Strip control sequences before measuring.
+        clean = " ".join(part.plain for part in AnsiDecoder().decode(f"{label}  {value}"))
+        rendered.extend(part.plain for part in Text(clean).wrap(console, available))
     width = max((cell_len(line) for line in rendered), default=0)
     typer.echo("+" + "-" * (width + 2) + "+")
     for line in rendered:
@@ -1226,7 +1507,7 @@ def _approval_detail_rows(record: Any) -> list[tuple[str, str]]:
 
 async def _prompt_approval_decision(record: Any) -> str:
     choices = [questionary.Choice(_approval_text("yes_once"), "approve_once")]
-    if getattr(record, "approval_class", ""):
+    if getattr(record, "approval_class", "") and getattr(record, "session_id", ""):
         choices.append(
             questionary.Choice(_approval_text("yes_similar"), "approve_similar")
         )
@@ -1278,9 +1559,9 @@ _APPROVAL_TEXT: dict[str, dict[str, str]] = {
         "pt": "Permitir esta operação: {tool}?",
     },
     "yes_once": {
-        "zh": "Yes，只为本轮对话",
+        "zh": "仅本次操作",
         "zh-Hant": "Yes，僅限本輪對話",
-        "en": "Yes, this turn only",
+        "en": "This operation only",
         "ja": "Yes、このターンのみ",
         "ko": "Yes, 이번 대화만",
         "ru": "Yes, только для этого хода",
@@ -1288,9 +1569,9 @@ _APPROVAL_TEXT: dict[str, dict[str, str]] = {
         "pt": "Yes, somente esta rodada",
     },
     "yes_similar": {
-        "zh": "Yes，整个此类都同意",
-        "zh-Hant": "Yes，同類全部同意",
-        "en": "Yes, allow this similar class",
+        "zh": "当前Session，相同命令与资源",
+        "zh-Hant": "目前Session，相同命令與資源",
+        "en": "This session, same operation and resources",
         "ja": "Yes、この同種の操作を許可",
         "ko": "Yes, 같은 유형 허용",
         "ru": "Yes, разрешить этот похожий класс",
@@ -1308,10 +1589,11 @@ _APPROVAL_TEXT: dict[str, dict[str, str]] = {
         "pt": "No, negar",
     },
     "similar_scope": {
-        "zh": "说明：{command} 同类授权仅适用于当前任务和会话，不是全局授权。",
+        "zh": ("说明：{command} 仅复用当前Session、相同主体的相同命令、参数与资源授权。"
+               "Task权限仍逐次核验。"),
         "zh-Hant": "說明：{command} 同類授權僅適用於目前任務和對話，不是全域授權。",
         "en": (
-            "Note: {command} class approval covers this task and session; "
+            "Note: {command}, same session, principal, exact arguments and resources; "
             "it is not a global grant."
         ),
         "ja": (
@@ -1975,6 +2257,7 @@ _SLASH_ROWS = [
     ("/remote", "远程操作", "Remote operations"),
     ("/evolution", "成长平面", "Evolution"),
     ("/approvals", "审批操作", "Approvals"),
+    ("/permissions", "当前工具权限与审批范围", "Effective tool gates and approval scope"),
     ("/audit", "审计验证", "Audit verification"),
     ("/serve", "启动 Web 控制台", "Start web console"),
     ("/web", "打开 Web 控制台", "Open web console"),

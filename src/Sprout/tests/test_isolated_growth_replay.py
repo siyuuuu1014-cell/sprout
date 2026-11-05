@@ -55,7 +55,10 @@ async def test_completed_source_replays_as_new_task_in_fixed_copy(tmp_path, monk
     await runtime.start()
     try:
         workspace = await runtime.open_workspace(repo)
-        task = await runtime.create_task(workspace.id, "Explain app.py", execution_mode="read_only")
+        from Sprout.tests.readonly_host_fixtures import native_analysis_subject
+
+        subject = await native_analysis_subject(runtime, workspace, ("app.py",))
+        task = subject["analysis_task"]
         assert (await runtime.execute(task)).status == "completed"
         original_nodes = await runtime.storage.metadata.list_execution_nodes(task.id)
         result = await ReplayRunner(runtime).run(
@@ -90,6 +93,19 @@ async def test_completed_source_replays_as_new_task_in_fixed_copy(tmp_path, monk
             settings=settings,
             output_dir=tmp_path / "experiments",
         )
+        from dataclasses import replace
+
+        for action in ("file.read", "tool.invoke"):
+            denied_source = await runtime.create_task(workspace.id, "Read app.py",
+                actor=task.actor, source=task.source, execution_mode="read_only",
+                metadata={"required_paths": ["app.py"]},
+                delegation_scope=replace(task.delegation_scope,
+                    denied_actions=frozenset({action})))
+            refused = await ReplayRunner(runtime).run(denied_source.id, **kwargs)
+            assert refused.status == "waiting_resource" and not refused.task_id
+            assert "outside Scope" in refused.error
+            assert not await runtime.storage.metadata.list_execution_nodes(denied_source.id)
+            assert (repo / "app.py").read_text() == "value = 1\n"
         rejected = await ReplayRunner(runtime).run(
             task.id,
             artifact_snapshot=ArtifactSnapshot(artifact.id, artifact.version, "wrong-hash"),
@@ -107,6 +123,11 @@ async def test_completed_source_replays_as_new_task_in_fixed_copy(tmp_path, monk
         try:
             replayed = await evidence.get_task(compared.task_id)
             assert replayed.metadata["replay_candidate_hash"] == snapshot.content_hash
+            assert replayed.metadata["session_id"] != task.metadata["session_id"]
+            assert replayed.delegation_scope.allowed_paths == (
+                str(Path(compared.evidence_dir) / "repo/app.py"),)
+            assert replayed.delegation_scope.allowed_actions == frozenset({
+                "file.read", "tool.invoke"})
         finally:
             evidence.close()
         from unittest.mock import AsyncMock

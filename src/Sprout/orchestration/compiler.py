@@ -182,7 +182,13 @@ class ExecutionGraphBuilder:
             id=approval_id,
             task_id=task.id,
             type=NodeType.APPROVAL,
-            dependencies=(previous_evaluation_id or "",),
+            # A successful earlier evaluation can skip conditional retries.
+            # Declare every possible producer; the consumer still requires
+            # exactly one live, completed-Guard Receipt from these sources.
+            dependencies=tuple(n.id for n in nodes if n.type is NodeType.EVALUATION),
+            budget=(NodeBudget(max_attempts=1, timeout_seconds=evaluation_timeout_seconds)
+                    if {"file.apply", "git.diff"}.issubset(task.delegation_scope.allowed_actions)
+                    else NodeBudget()),
         )
         apply_node = ExecutionNode(
             id=apply_id,

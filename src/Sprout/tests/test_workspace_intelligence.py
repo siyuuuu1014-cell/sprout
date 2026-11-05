@@ -12,6 +12,7 @@ from Sprout.storage.bundle import StorageBundle
 from Sprout.storage.local.memory.knowledge import MemoryKnowledgeStore
 from Sprout.storage.local.memory.vectors import MemoryVectorStore
 from Sprout.task.models import Task
+from Sprout.tests.readonly_host_fixtures import fixture_analysis
 from Sprout.tools.project_analyze_tool import (
     ProjectAnalyzeTool,
     _estimate_lines_from_rg_output,
@@ -21,6 +22,19 @@ from Sprout.workspace.cache import WorkspaceAnalysisCache
 from Sprout.workspace.intelligence import WorkspaceIntelligence
 from Sprout.workspace.models import ResourceKind, Workspace, WorkspaceKind
 from Sprout.workspace.scanner import WorkspaceScanner
+
+
+async def _analyze_selected(intelligence, workspace, task, *, previous=None):
+    """Explicit fixture inventory; not the retired disk-discovery API."""
+    return await fixture_analysis(intelligence, workspace, task, paths=(
+        "pyproject.toml", "src/package/__init__.py", "src/package/a.py", "src/package/b.py",
+        "package.json", "go.mod", "Cargo.toml", "web/frontend/src/components/Button.jsx",
+        "web/frontend/src/pages/Home.jsx", "src/routes/users.py", "src/models/user.py",
+        "README.md", "Dockerfile", "docker-compose.yml", "src/index.ts", "pom.xml",
+        "composer.json", "pubspec.yaml", "CMakeLists.txt",
+        "main.tf", "migrations/001_init.sql", "openapi.yaml",
+        "src/Sprout/storage/topology.py", "migrations/001.sql",
+        "src/main.go", "src/lib.rs"), previous=previous)
 
 
 class _FakeGraphStore:
@@ -60,13 +74,17 @@ def _project(tmp_path: Path) -> Path:
     (package / "__init__.py").write_text("", encoding="utf-8")
     (package / "a.py").write_text(
         "from package.b import Base, value\n"
-        "class Child(Base):\n"
+        "class LocalBase:\n"
         "    pass\n"
+        "class Child(LocalBase):\n"
+        "    pass\n"
+        "def local_value():\n"
+        "    return 1\n"
         "def run():\n"
-        "    return value()\n"
+        "    return local_value()\n"
         "def test_value():\n"
-        "    assert value() == 1\n"
-        "VALUE = value()\n",
+        "    assert run() == 1\n"
+        "VALUE = local_value()\n",
         encoding="utf-8",
     )
     (package / "b.py").write_text(
@@ -100,7 +118,7 @@ def test_workspace_intelligence_builds_graph_and_knowledge(tmp_path: Path) -> No
     )
 
     async def run() -> None:
-        analysis = await intelligence.analyze(workspace, task)
+        analysis = await _analyze_selected(intelligence, workspace, task)
 
         assert analysis.manifest.detected_languages == ("python",)
         assert analysis.read_plan.stage.value == "knowledge"
@@ -108,11 +126,13 @@ def test_workspace_intelligence_builds_graph_and_knowledge(tmp_path: Path) -> No
         assert analysis.graph.nodes
         assert any(node.kind == "class" for node in analysis.graph.nodes)
         assert any(node.kind == "function" for node in analysis.graph.nodes)
-        assert any(node.granularity == "project" for node in analysis.graph.nodes)
+        assert all(node.resource is None or node.resource.path in
+                   analysis.fingerprint.resource_hashes for node in analysis.graph.nodes)
         assert any(node.granularity == "symbol" for node in analysis.graph.nodes)
         assert any(node.granularity == "module" for node in analysis.graph.nodes)
         assert any(item.kind == "fact" for item in analysis.knowledge.items)
-        assert any(item.kind == "inference" for item in analysis.knowledge.items)
+        assert all(set(item.evidence_ids) <= set(analysis.fingerprint.resource_hashes)
+                   for item in analysis.knowledge.items)
         assert any(edge.relation == "defines" for edge in analysis.graph.edges)
         assert any(edge.relation == "imports" for edge in analysis.graph.edges)
         assert any(edge.relation == "inherits" for edge in analysis.graph.edges)
@@ -127,18 +147,30 @@ def test_workspace_intelligence_builds_graph_and_knowledge(tmp_path: Path) -> No
         assert analysis.query().symbols(kind="class")
         assert analysis.query().symbols(kind="test")
         assert analysis.query().subgraph("Child", max_depth=2).nodes
-        assert analysis.query().knowledge("src-layout", kind="inference")
+        assert analysis.query().knowledge("demo-project", kind="fact")
+        # Pure analysis never persists; exercise the explicit store component.
+        await intelligence._persist_knowledge(analysis.knowledge)
         assert await knowledge.count() > 0
         results = await knowledge.search("demo-project")
         assert any("Project name: demo-project" in item.content for item in results)
-        results = await knowledge.search("src-layout")
-        assert any("src-layout" in item.content for item in results)
-        vector_results = await intelligence.search_knowledge("src-layout")
+        results = await knowledge.search("demo-project")
+        assert any("demo-project" in item.content for item in results)
+        vector_results = await intelligence.search_knowledge("demo-project")
         assert vector_results
 
-        unchanged = await intelligence.analyze(workspace, task, previous=analysis)
-        assert unchanged.graph == analysis.graph
-        assert unchanged.fingerprint == analysis.fingerprint
+        unchanged = await _analyze_selected(intelligence, workspace, task, previous=analysis)
+        assert unchanged.graph.nodes == analysis.graph.nodes
+        # Fresh pure analyses issue fresh EvidenceRef IDs; compare every edge's
+        # structural identity and source locations rather than cache identity.
+        def edges(graph):
+            return tuple((e.id, e.source, e.target, e.relation, e.evidence,
+                          tuple(ref.display_id() for ref in e.evidence_refs), e.confidence)
+                         for e in graph.edges)
+        assert edges(unchanged.graph) == edges(analysis.graph)
+        assert unchanged.fingerprint.workspace_id == analysis.fingerprint.workspace_id
+        assert unchanged.fingerprint.revision == analysis.fingerprint.revision
+        assert unchanged.fingerprint.resource_hashes == analysis.fingerprint.resource_hashes
+        assert unchanged.changed_resources == ()
 
         changed_path = root / "src" / "package" / "b.py"
         changed_path.write_text(
@@ -148,8 +180,8 @@ def test_workspace_intelligence_builds_graph_and_knowledge(tmp_path: Path) -> No
             "    return 2\n",
             encoding="utf-8",
         )
-        refreshed = await intelligence.analyze(workspace, task, previous=analysis)
-        assert changed_path.resolve().as_posix() in refreshed.changed_resources
+        refreshed = await _analyze_selected(intelligence, workspace, task, previous=analysis)
+        assert changed_path.relative_to(root).as_posix() in refreshed.changed_resources
         node_ids = [node.id for node in refreshed.graph.nodes]
         assert len(node_ids) == len(set(node_ids))
 
@@ -158,7 +190,7 @@ def test_workspace_intelligence_builds_graph_and_knowledge(tmp_path: Path) -> No
             "[project]\nname='demo-project-renamed'\nversion='0.1.0'\n",
             encoding="utf-8",
         )
-        stale = await intelligence.analyze(workspace, task, previous=refreshed)
+        stale = await _analyze_selected(intelligence, workspace, task, previous=refreshed)
         assert any(
             item_id.startswith("workspace-1:knowledge:")
             for item_id in stale.stale_knowledge_ids
@@ -188,10 +220,14 @@ def test_workspace_query_tool_returns_symbols(tmp_path: Path) -> None:
     )
 
     async def run() -> None:
-        async def analyze(workspace_id: str):
-            return await intelligence.analyze(workspace, task)
+        from unittest.mock import AsyncMock
 
-        tool = WorkspaceQueryTool(analyze)
+        analysis = await _analyze_selected(intelligence, workspace, task)
+        callback = AsyncMock(side_effect=AssertionError("Unbound callback invoked"))
+        async def analyze(workspace_id: str):
+            return await _analyze_selected(intelligence, workspace, task)
+
+        tool = WorkspaceQueryTool(callback)
         result = await tool.invoke(
             {
                 "workspace_id": workspace.id,
@@ -199,8 +235,9 @@ def test_workspace_query_tool_returns_symbols(tmp_path: Path) -> None:
                 "kind": "class",
             }
         )
-        assert result.ok is True
-        assert result.data
+        assert not result.ok and result.error == "workspace_query_scope_unavailable"
+        callback.assert_not_called()
+        assert analysis.query().symbols(kind="class")
 
     asyncio.run(run())
 
@@ -249,8 +286,9 @@ def test_workspace_analysis_cache_round_trip(tmp_path) -> None:
     cache = WorkspaceAnalysisCache()
 
     async def run() -> None:
-        analysis = await WorkspaceIntelligence().analyze(
-            Workspace(id="workspace-1", root=_project(tmp_path)), Task(instruction="analyze"),
+        analysis = await _analyze_selected(WorkspaceIntelligence(),
+            Workspace(id="workspace-1", root=_project(tmp_path)),
+            Task(workspace_id="workspace-1", instruction="analyze"),
         )
         cache.put("workspace-1", analysis)
         version = snapshot_id(analysis)
@@ -280,13 +318,17 @@ def test_context_builder_injects_structured_workspace(tmp_path: Path) -> None:
     )
 
     async def run() -> None:
-        async def analyze(workspace_id: str):
-            return await intelligence.analyze(workspace, task)
+        from unittest.mock import AsyncMock
 
+        analysis = await _analyze_selected(intelligence, workspace, task)
+        async def analyze(workspace_id: str):
+            return await _analyze_selected(intelligence, workspace, task)
+
+        callback = AsyncMock(side_effect=AssertionError("Unbound context provider invoked"))
         storage = StorageBundle.in_memory()
         builder = ContextBuilder(
             storage,
-            workspace_analysis_provider=analyze,
+            workspace_analysis_provider=callback,
         )
         context = await builder.build(
             message=Message(
@@ -297,10 +339,13 @@ def test_context_builder_injects_structured_workspace(tmp_path: Path) -> None:
             tools={},
             skills={},
         )
-        assert context.workspace is not None
-        assert context.workspace.graph_nodes
-        assert context.workspace.graph_edges
-        assert context.metadata["workspace_context"]
+        assert context.workspace is None
+        assert "workspace_context" not in context.metadata
+        callback.assert_not_called()
+        # Synchronous projection is data formatting, not a read/publication grant.
+        projected = builder._isolated_context(Message("hello"), context.session, {}, {},
+                                             analysis=analysis)
+        assert projected.workspace.graph_nodes and projected.workspace.graph_edges
 
         targeted = await builder.build(
             message=Message(
@@ -311,6 +356,10 @@ def test_context_builder_injects_structured_workspace(tmp_path: Path) -> None:
             tools={},
             skills={},
         )
+        assert targeted.workspace is None
+        callback.assert_not_called()
+        targeted = builder._isolated_context(Message("Child"), targeted.session, {}, {},
+                                            analysis=analysis)
         assert any(
             "Child" in node.name
             for node in targeted.workspace.graph_nodes
@@ -376,7 +425,7 @@ def test_generic_workspace_knowledge(tmp_path: Path) -> None:
     )
 
     async def run() -> None:
-        analysis = await intelligence.analyze(workspace, task)
+        analysis = await _analyze_selected(intelligence, workspace, task)
         statements = [item.statement for item in analysis.knowledge.items]
         assert any("Node package: web-app" in item for item in statements)
         assert any("Go module: example.com/service" in item for item in statements)
@@ -449,7 +498,7 @@ def test_workspace_analysis_covers_project_surface_and_database_layers(
     )
 
     async def run() -> None:
-        analysis = await intelligence.analyze(workspace, task)
+        analysis = await _analyze_selected(intelligence, workspace, task)
         languages = set(analysis.manifest.detected_languages)
         assert {
             "node",
@@ -458,26 +507,24 @@ def test_workspace_analysis_covers_project_surface_and_database_layers(
             "rust",
             "java",
             "php",
-            "swift",
             "dart",
-            "elixir",
             "c-cpp",
             "terraform",
             "sql",
         } <= languages
         assert "docker" in analysis.manifest.framework_hints
         assert "docker-compose" in analysis.manifest.framework_hints
-        assert "project-database" in analysis.manifest.framework_hints
+        assert "project-database" not in analysis.manifest.framework_hints
         statements = [item.statement for item in analysis.knowledge.items]
-        assert any("Documentation files: README.md" in item for item in statements)
-        assert any("Docker assets: Dockerfile" in item for item in statements)
-        assert any("Compose assets: docker-compose.yml" in item for item in statements)
-        assert any("Environment files: .env.example" in item for item in statements)
-        assert any("DATABASE_URL" in item for item in statements)
+        assert any("Captured documentation assets: README.md" in item for item in statements)
+        assert any("Dockerfile" in item for item in statements)
+        assert any("docker-compose.yml" in item for item in statements)
+        assert ".env.example" not in analysis.fingerprint.resource_hashes
+        assert not any("DATABASE_URL" in item for item in statements)
         assert not any("postgres://example" in item for item in statements)
-        assert any("Project database assets:" in item for item in statements)
-        assert any("Interface contracts:" in item for item in statements)
-        assert any("Infrastructure assets:" in item for item in statements)
+        assert any("Captured project_database assets:" in item for item in statements)
+        assert any("Captured interface assets:" in item for item in statements)
+        assert "main.tf" in analysis.fingerprint.resource_hashes
         assert not any("Sprout database topology:" in item for item in statements)
 
     asyncio.run(run())
@@ -504,17 +551,18 @@ def test_workspace_analysis_marks_sprout_database_separately(tmp_path: Path) -> 
     )
 
     async def run() -> None:
-        analysis = await intelligence.analyze(workspace, task)
+        analysis = await _analyze_selected(intelligence, workspace, task)
         by_kind = {item.kind: item.statement for item in analysis.knowledge.items}
-        assert "sprout_database" in by_kind
-        assert "Sprout database topology:" in by_kind["sprout_database"]
+        # A filename alone cannot certify a runtime's database topology.
+        assert "sprout_database" not in by_kind
+        assert "src/Sprout/storage/topology.py" in analysis.fingerprint.resource_hashes
         assert "project_database" in by_kind
-        assert "Project database assets:" in by_kind["project_database"]
+        assert "Captured project_database assets:" in by_kind["project_database"]
 
     asyncio.run(run())
 
 
-def test_project_analyze_tool_returns_project_surface(tmp_path: Path) -> None:
+def test_project_analyze_tool_returns_project_surface(tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "tool-project"
     root.mkdir()
     (root / "README.md").write_text("# Tool Project\n", encoding="utf-8")
@@ -522,18 +570,46 @@ def test_project_analyze_tool_returns_project_surface(tmp_path: Path) -> None:
     (root / "openapi.json").write_text('{"openapi":"3.1.0"}', encoding="utf-8")
 
     async def run() -> None:
-        tool = ProjectAnalyzeTool(
-            intelligence=WorkspaceIntelligence(
-                knowledge_store=MemoryKnowledgeStore(),
-                vector_store=MemoryVectorStore(),
-            )
-        )
-        result = await tool.invoke({"path": root.as_posix()})
-        assert result.ok is True
-        assert result.data["languages"] == ["node"]
-        statements = [item["statement"] for item in result.data["knowledge"]]
-        assert any("Documentation files: README.md" in item for item in statements)
-        assert any("Interface contracts: openapi.json" in item for item in statements)
+        from Sprout.tests.conftest import build_runtime
+        from Sprout.tests.readonly_host_fixtures import native_analysis_subject
+
+        storage = StorageBundle.in_memory()
+        from Sprout.storage.local.sqlite.metadata import open_metadata_store
+
+        storage.metadata = open_metadata_store(str(tmp_path / "metadata.db"))
+        runtime, _ = build_runtime(storage=storage)
+        results = []
+        invoke = ProjectAnalyzeTool.invoke
+
+        async def observe(tool, arguments):
+            result = await invoke(tool, arguments)
+            results.append(result)
+            return result
+
+        monkeypatch.setattr(ProjectAnalyzeTool, "invoke", observe)
+        try:
+            workspace = await runtime.open_workspace(root)
+            subject = await native_analysis_subject(
+                runtime, workspace, ("README.md", "package.json", "openapi.json"))
+            await runtime.analyze_workspace(workspace.id, **subject)
+            assert len(results) == 1
+            result = results[0]
+            assert result.ok is True
+            assert result.data["languages"] == ["node"]
+            # Windows resource keys are case-folded by the existing path
+            # contract. Match that identity without weakening evidence scope.
+            statements = [item["statement"].casefold() for item in result.data["knowledge"]]
+            # Captured-view facts explicitly identify their bounded evidence;
+            # the retired disk analyzer's whole-project wording is not reused.
+            assert "captured documentation assets: readme.md" in statements
+            assert "captured interface assets: openapi.json" in statements
+            evidence = {item["statement"].casefold(): [p.casefold() for p in item["evidence_ids"]]
+                        for item in result.data["knowledge"]}
+            assert evidence["captured documentation assets: readme.md"] == ["readme.md"]
+            assert evidence["captured interface assets: openapi.json"] == ["openapi.json"]
+        finally:
+            await runtime.stop()
+            await storage.close()
 
     asyncio.run(run())
 
@@ -590,11 +666,17 @@ def test_workspace_intelligence_ingests_skills(tmp_path: Path) -> None:
     )
 
     async def run() -> None:
-        analysis = await intelligence.analyze(workspace, task)
-        assert any(node.kind == "skill" for node in analysis.graph.nodes)
-        assert any(node.kind == "tool" for node in analysis.graph.nodes)
-        assert any(edge.relation == "requires" for edge in analysis.graph.edges)
-        assert any(item.kind == "skill" for item in analysis.knowledge.items)
+        analysis = await _analyze_selected(intelligence, workspace, task)
+        from Sprout.workspace.skills import SkillWorkspaceAnalyzer
+
+        assert not any(node.kind == "skill" for node in analysis.graph.nodes)
+        # Skill discovery is its own explicit host component, not a side effect
+        # of a restricted project content view.
+        skills = SkillWorkspaceAnalyzer().analyze(workspace.id, skills_dir)
+        assert any(node.kind == "skill" for node in skills.nodes)
+        assert any(node.kind == "tool" for node in skills.nodes)
+        assert any(edge.relation == "requires" for edge in skills.edges)
+        assert any(item.kind == "skill" for item in skills.knowledge_items)
 
     asyncio.run(run())
 
@@ -620,7 +702,9 @@ def test_workspace_intelligence_persists_graph(tmp_path: Path) -> None:
     )
 
     async def run() -> None:
-        await intelligence.analyze(workspace, task)
+        analysis = await _analyze_selected(intelligence, workspace, task)
+        # Persistence is tested explicitly, not as an unscoped analyzer effect.
+        await intelligence._persist_graph(analysis.graph)
         assert graph_store.nodes
         assert graph_store.relations
 
@@ -662,7 +746,7 @@ def test_generic_source_symbols_in_graph(tmp_path: Path) -> None:
     )
 
     async def run() -> None:
-        analysis = await intelligence.analyze(workspace, task)
+        analysis = await _analyze_selected(intelligence, workspace, task)
         names = {node.qualified_name for node in analysis.graph.nodes}
         kinds = {node.kind for node in analysis.graph.nodes}
         assert "class" in kinds
@@ -695,7 +779,7 @@ def test_analysis_serialization_round_trip(tmp_path: Path) -> None:
     )
 
     async def run() -> None:
-        analysis = await intelligence.analyze(workspace, task)
+        analysis = await _analyze_selected(intelligence, workspace, task)
         restored = from_jsonable(to_jsonable(analysis), WorkspaceAnalysis)
         assert restored.workspace.id == analysis.workspace.id
         assert restored.workspace.root == analysis.workspace.root
@@ -739,7 +823,7 @@ def test_analysis_cache_hot_lane_round_trip(tmp_path: Path) -> None:
     )
 
     async def run() -> None:
-        analysis = await intelligence.analyze(workspace, task)
+        analysis = await _analyze_selected(intelligence, workspace, task)
         cache = WorkspaceAnalysisCache(cache_store=MemoryCacheStore())
         await cache.persist("workspace-1", analysis)
         restored = await cache.get("workspace-1", expected_snapshot_id=snapshot_id(analysis))

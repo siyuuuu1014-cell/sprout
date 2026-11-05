@@ -16,7 +16,7 @@ class WorkspaceQueryTool:
 
     def __init__(
         self,
-        analyze: Callable[[str], Awaitable[WorkspaceAnalysis]],
+        analyze: Callable[[str], Awaitable[WorkspaceAnalysis]] | None = None,
     ) -> None:
         self._analyze = analyze
         self.spec = ToolSpec(
@@ -79,6 +79,19 @@ class WorkspaceQueryTool:
         )
 
     async def invoke(self, arguments: Mapping[str, Any]) -> ToolResult:
+        from Sprout.tools.context_keys import _current_project_analysis_call
+
+        frame = _current_project_analysis_call()
+        if frame is None or frame.tool is not self or frame.node_scope is None:
+            return ToolResult.denied("workspace_query_scope_unavailable")
+        try:
+            return await frame.node_scope.runtime._invoke_project_tool(self, arguments)
+        except (PermissionError, ValueError):
+            return ToolResult.denied("workspace_query_scope_unavailable")
+
+    @staticmethod
+    def _project(analysis: WorkspaceAnalysis, arguments: Mapping[str, Any]) -> ToolResult:
+        """Pure projection only. The caller must authorize publication separately."""
         workspace_id = arguments.get("workspace_id")
         operation = arguments.get("operation")
         if not isinstance(workspace_id, str) or not workspace_id:
@@ -86,16 +99,16 @@ class WorkspaceQueryTool:
         if not isinstance(operation, str):
             return ToolResult.failure("Argument 'operation' is required")
 
-        try:
-            analysis = await self._analyze(workspace_id)
-        except Exception as exc:
-            return ToolResult.failure(f"Workspace query failed: {exc}")
+        if workspace_id != analysis.workspace.id:
+            raise PermissionError("workspace_query_workspace_mismatch")
 
-        query = analysis.query()
+        from Sprout.workspace.query import WorkspaceQuery
+
+        query = WorkspaceQuery(analysis, captured=True)
         if operation == "neighbors":
             result = query.neighbors(
                 str(arguments.get("name", "")),
-                relation=self._optional_str(arguments, "relation"),
+                relation=WorkspaceQueryTool._optional_str(arguments, "relation"),
             )
             payload = {
                 "nodes": [_node_dict(node) for node in result.nodes],
@@ -105,7 +118,7 @@ class WorkspaceQueryTool:
             payload = [
                 _node_dict(node)
                 for node in query.symbols(
-                    kind=self._optional_str(arguments, "kind"),
+                    kind=WorkspaceQueryTool._optional_str(arguments, "kind"),
                     query=str(arguments.get("query", "")),
                 )
             ]
@@ -118,7 +131,7 @@ class WorkspaceQueryTool:
             result = query.subgraph(
                 str(arguments.get("name", "")),
                 max_depth=max_depth,
-                relation=self._optional_str(arguments, "relation"),
+                relation=WorkspaceQueryTool._optional_str(arguments, "relation"),
             )
             payload = {
                 "nodes": [_node_dict(node) for node in result.nodes],
@@ -137,7 +150,7 @@ class WorkspaceQueryTool:
                 _knowledge_dict(item)
                 for item in query.knowledge(
                     str(arguments.get("query", "")),
-                    kind=self._optional_str(arguments, "kind"),
+                    kind=WorkspaceQueryTool._optional_str(arguments, "kind"),
                 )
             ]
         else:

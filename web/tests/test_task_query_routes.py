@@ -7,6 +7,9 @@ from starlette.applications import Starlette
 from starlette.testclient import TestClient
 
 from Sprout.gateway.identity import Principal
+from Sprout.rootstock.backends.memory_store import MemorySessionStore
+from Sprout.session.manager import SessionManager
+from Sprout.storage.local.sqlite.metadata import open_metadata_store
 from Sprout.task.models import Task, TaskStatus
 from web.webapi.auth import WebAuth, WebAuthMiddleware
 from web.webapi.routes.project import create_project_routes
@@ -14,12 +17,15 @@ from web.webapi.routes.rpc import create_rpc_routes
 
 
 def fixture():
+    metadata = open_metadata_store(":memory:")
     task = Task(actor=Principal(user_id="web-user", display_name="web-user",
                                 authenticated=True, source="web"))
     record = {"id": "submission", "task_id": task.id, "run_id": "run",
               "host": "unused", "namespace": "default", "task_queue": "queue",
               "accepted": True, "state": "resolved", "result": {"status": "completed"}}
     runtime = SimpleNamespace(
+        _sessions=SessionManager(MemorySessionStore()),
+        _metadata_or_raise=lambda: metadata,
         get_task=AsyncMock(return_value=task),
         get_task_execution_report=AsyncMock(return_value={"nodes": []}),
         get_verification_report=AsyncMock(return_value={"verified": False}),
@@ -47,7 +53,20 @@ def test_http_and_rpc_share_reports_and_only_observe():
         rpc_created = client.post("/api/rpc", headers=headers, json={
             "id": 0, "method": "task.create", "params": {
                 "workspace_id": "workspace", "instruction": "demo", "user_id": "forged"}})
-        assert "result" in rpc_created.json()
+        assert rpc_created.json()["error"]["code"] == "FORBIDDEN"
+        assert "host scope" in rpc_created.json()["error"]["message"]
+        # HTTP JSON cannot grant Scope; the embedding host can supply it via
+        # the existing RPC API, with the same authenticated subject.
+        import asyncio
+
+        from Sprout.gateway.rpc_gateway import RPCGateway
+        from Sprout.task.models import DelegationScope
+
+        bound = asyncio.run(RPCGateway(runtime).handle({
+            "id": 0, "method": "task.create", "params": {
+                "workspace_id": "workspace", "instruction": "demo"}},
+            principal=task.actor, delegation_scope=DelegationScope()))
+        assert "result" in bound
         assert runtime.create_task_planned.call_args.kwargs["actor"] == task.actor
         report = client.get(f"/api/project/tasks/{task.id}/report", headers=headers)
         rpc = client.post("/api/rpc", headers=headers, json={

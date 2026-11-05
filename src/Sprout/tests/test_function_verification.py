@@ -73,6 +73,45 @@ async def test_expected_not_sent_and_completed_cached(tmp_path):
         store.close()
 
 
+@pytest.mark.parametrize("change", ["protocol", "task", "signature", "id", "container",
+                                  "running_task"])
+async def test_function_v3_claim_does_not_bypass_record_binding(tmp_path, change):
+    from copy import deepcopy
+    from hashlib import sha256
+    from uuid import NAMESPACE_URL, uuid5
+
+    store, request, runtime, inspection, _ = await prepare_run(tmp_path)
+    runtime.run_task_process.side_effect = [
+        inspection, ProcessResult(("docker",), exit_code=0, stdout="4")]
+    try:
+        result = await FunctionVerificationRun(store).execute(
+            runtime, task_id=request.task_id, original=request.source_root,
+            exported=request.input_root, image=request.image,
+            case=AcceptanceCase("first", "app:run", (), {}, 4), oracle_paths=("tests",))
+        saved = await store.get_verification_execution(result["execution_id"])
+        record = deepcopy({k: v for k, v in saved.items() if k not in {"state", "result"}})
+        record["contract"]["case"]["id"] = "second"
+        identity = str(uuid5(NAMESPACE_URL, request.task_id + ":function-acceptance:second"))
+        record["id"] = identity
+        record["signature"] = sha256(json.dumps(
+            record["contract"], sort_keys=True, default=str).encode()).hexdigest()
+        if change == "running_task":
+            from Sprout.task.models import TaskStatus
+
+            await store.update_task_status(request.task_id, TaskStatus.RUNNING)
+        elif change == "task":
+            record["contract"]["request"]["task_id"] = "foreign-task"
+            record["signature"] = sha256(json.dumps(
+                record["contract"], sort_keys=True, default=str).encode()).hexdigest()
+        else:
+            record[{"protocol": "protocol", "signature": "signature", "id": "id",
+                    "container": "container_name"}[change]] = "mismatched"
+        assert not await store.claim_verification_execution(record)
+        assert await store.get_verification_execution(identity) is None
+    finally:
+        store.close()
+
+
 async def test_unknown_result_not_reexecuted(tmp_path):
     store, request, runtime, inspection, _ = await prepare_run(tmp_path)
     runtime.run_task_process.side_effect = [inspection, ProcessResult(("docker",), error="timeout")]

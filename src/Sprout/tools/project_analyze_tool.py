@@ -3,18 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import shutil
 from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any
 
-from Sprout.task.models import Task
 from Sprout.tools.result import ToolResult
 from Sprout.tools.spec import ToolSpec
 from Sprout.workspace.intelligence import WorkspaceAnalysis, WorkspaceIntelligence
-from Sprout.workspace.models import Workspace
-from Sprout.workspace.scanner import WorkspaceScanner
 
 
 class ProjectAnalyzeTool:
@@ -55,74 +51,17 @@ class ProjectAnalyzeTool:
         )
 
     async def invoke(self, arguments: Mapping[str, Any]) -> ToolResult:
-        path_arg = arguments.get("path")
-        if not isinstance(path_arg, str) or not path_arg:
-            return ToolResult.failure("Argument 'path' must be a non-empty string")
-        root = Path(path_arg).expanduser().resolve()
-        if not root.is_dir():
-            return ToolResult.failure(f"Workspace path does not exist: {root}")
-
-        instruction = arguments.get("instruction")
-        if not isinstance(instruction, str) or not instruction:
-            instruction = "analyze project"
-
-        workspace = Workspace(
-            id=root.name or "workspace",
-            root=root,
-            kind=WorkspaceScanner.workspace_kind(root),
-        )
-        task = Task(
-            id="project-analyze-tool",
-            workspace_id=workspace.id,
-            instruction=instruction,
-            source="tool",
-        )
-
-        if self._analyze is not None:
-            analysis = await self._analyze(root, instruction)
-        else:
-            analysis = await (self._intelligence or WorkspaceIntelligence()).analyze(
-                workspace, task,
-            )
-        workspace = analysis.workspace
-        manifest = analysis.manifest
-        read_plan = analysis.read_plan
-        graph = analysis.graph
-        knowledge = analysis.knowledge
-        payload: dict[str, Any] = {
-            "workspace_id": workspace.id,
-            "root": root.as_posix(),
-            "languages": list(manifest.detected_languages),
-            "framework_hints": list(manifest.framework_hints),
-            "entry_points": list(manifest.entry_points),
-            "test_commands": list(manifest.test_commands),
-            "build_commands": list(manifest.build_commands),
-            "read_plan_resources": len(read_plan.resources),
-            "graph": {
-                "nodes": len(graph.nodes),
-                "edges": len(graph.edges),
-                "node_kinds": sorted({node.kind for node in graph.nodes}),
-                "relations": sorted({edge.relation for edge in graph.edges}),
-            },
-            "knowledge": [
-                {
-                    "kind": item.kind,
-                    "statement": item.statement,
-                    "confidence": item.confidence,
-                    "evidence_ids": list(item.evidence_ids),
-                    "details": dict(item.details),
-                }
-                for item in knowledge.items
-            ],
-        }
-
         if arguments.get("include_system_tools") is True:
-            payload["system_tools"] = await _system_tool_probe(root)
+            return ToolResult.denied("native_project_probe_unavailable")
+        from Sprout.tools.context_keys import _current_project_analysis_call
 
-        return ToolResult.success(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            data=payload,
-        )
+        frame = _current_project_analysis_call()
+        if frame is None or frame.tool is not self or frame.node_scope is None:
+            return ToolResult.denied("project_analysis_scope_unavailable")
+        try:
+            return await frame.node_scope.runtime._invoke_project_tool(self, arguments)
+        except (PermissionError, ValueError):
+            return ToolResult.denied("project_analysis_scope_unavailable")
 
 
 async def _system_tool_probe(root: Path) -> dict[str, Any]:

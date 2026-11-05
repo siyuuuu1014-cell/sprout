@@ -1,36 +1,43 @@
-"""End-to-end coverage for the task path: requirement -> workspace commit.
+"""Task entry, explicit process approvals and current controlled delivery.
 
-Every defect found while building this path was found by driving a real model
-by hand, and the suite stayed green through all of them — including a task that
-reported ``completed`` with an untouched repository. Unit tests could not catch
-those, because each one exercised a stage in isolation and every stage was
-individually correct.
-
-These tests drive the real pipeline with a scripted model (see
-``fake_model.FakeModel``): the graph, the agent loop, the sandbox, the
-verification gate, approval, and apply all run for real, while the model's
-inputs and outputs stay fixed.
+Windows replacement delivery uses real Runtime/Guard/Receipt/G1/SQLite and
+filesystem components with a controlled model. POSIX claims refusal only.
+Retired delete/rename and old approval keys must never restore auto-commit.
 """
 
 from __future__ import annotations
 
 import asyncio
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
 
-from scripts.ci_support.diagnostics import git_state, runtime_failure
 from Sprout.cli.app import app
 from Sprout.config.loader import default_settings
 from Sprout.gateway.project_gateway import ProjectGateway
-from Sprout.orchestration.models import NodeStatus, NodeType
 from Sprout.runtime.factory import create_runtime
 from Sprout.tests.fake_model import FakeModel
+from Sprout.tests.test_r04_e_apply_native import current_delivery as current_delivery
 
 REQUIREMENT = "给 user 模块加一个导出 CSV 的函数"
-VALID_EXPORT = "def export_users(users):\n    return 'id\\n1\\n' if users else ''\n"
+
+
+async def _create_host_task(gateway, workspace, instruction):
+    """Explicit first-party fixture resources; never derive grants from model edits."""
+    from Sprout.cli.commands.project import _eval_scope_for_workspace
+    from Sprout.gateway.local_identity import current_cli_principal
+
+    principal = current_cli_principal()
+    scope = _eval_scope_for_workspace(workspace, principal)
+    paths = ("src/user.py", "src/export.py", "obsolete.py", "renamed.py")
+    scope = replace(scope, allowed_paths=scope.allowed_paths + tuple(
+        str(workspace.root / path) for path in paths))
+    return await gateway.create_task(workspace.id, instruction, principal=principal,
+                                     delegation_scope=scope,
+                                     preparation_paths=("src/user.py", "pyproject.toml"))
 
 
 def _repo(tmp_path: Path, *, gitignore: bool = True) -> Path:
@@ -135,136 +142,82 @@ def _commit_count(repo: Path) -> int:
 @pytest.mark.parametrize("decision", ["approve", "reject", "cancel"])
 @pytest.mark.parametrize("mutation", ["delete", "rename"])
 def test_delete_approval_survives_restart_and_controls_commit(tmp_path, decision, mutation):
-    from Sprout.llm.messages import LLMResponse, ToolCall
+    """Legacy deletion approvals persist, but cannot authorize R04 Apply.
 
-    class DeletingModel(FakeModel):
-        deleted = False
-
-        async def chat(self, messages, *, tools=()):
-            response = await super().chat(messages, tools=tools)
-            if not response.tool_calls and not self.deleted and any(
-                tool.name == "sandbox_apply_patch" for tool in tools
-            ):
-                self.deleted = True
-                return LLMResponse(content=None, tool_calls=(ToolCall(
-                    id="delete-file", name="sandbox_apply_patch", arguments={
-                        "patch": (
-                            "--- a/obsolete.py\n+++ /dev/null\n@@ -1 +0,0 @@\n-value = 1\n"
-                            if mutation == "delete" else "diff --git a/obsolete.py b/renamed.py\n"
-                            "similarity index 100%\nrename from obsolete.py\nrename to renamed.py\n"
-                        ),
-                    },
-                ),), finish_reason="tool_use", model=self.name)
-            return response
+    This is rejection coverage for a retired delivery operation, not a claim
+    that deletion/rename delivery succeeds. Supported replacement delivery is
+    exercised by test_r04_e_apply_native with a real Runtime Receipt and Plan.
+    """
+    from Sprout.execution.models import ChangeProposal, DiffResult
 
     repo = _repo(tmp_path)
     obsolete = repo / "obsolete.py"
     obsolete.write_text("value = 1\n", encoding="utf-8")
-    subprocess.run(["git", "add", "obsolete.py"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "add", "--", "obsolete.py"], cwd=repo,
+                   check=True, capture_output=True)
     subprocess.run(["git", "commit", "-qm", "add obsolete"], cwd=repo,
                    check=True, capture_output=True)
     before = _commit_count(repo)
-    diagnostic_before = git_state(repo)
-    model = DeletingModel(edits={"src/export.py": VALID_EXPORT})
+    original = obsolete.read_bytes()
+    patch = ("--- a/obsolete.py\n+++ /dev/null\n@@ -1 +0,0 @@\n-value = 1\n"
+             if mutation == "delete" else
+             "diff --git a/obsolete.py b/renamed.py\nsimilarity index 100%\n"
+             "rename from obsolete.py\nrename to renamed.py\n")
 
     async def run():
-        runtime = _runtime(tmp_path, model)
+        runtime = _runtime(tmp_path, FakeModel())
         workspace = await runtime.open_workspace(repo)
-        gateway = ProjectGateway(runtime, transport="cli", default_user="operator")
-        task = await gateway.create_task(workspace.id, REQUIREMENT)
-        await runtime.execute(task)
-        deletion = None
-        for _ in range(8):
-            pending = [item for item in await runtime._approvals.pending()
-                       if item.task_id == task.id]
-            deletion = next((item for item in pending if item.tool == "file_delete"), None)
-            if deletion:
-                break
-            assert pending, "Task did not reach its deletion approval"
-            for item in pending:
-                await runtime.decide_approval(item.id, True, decided_by="operator")
-        assert deletion is not None
-        assert obsolete.exists() and _commit_count(repo) == before
+        gateway = ProjectGateway(runtime, transport="cli", default_user="display")
+        task = await _create_host_task(gateway, workspace, REQUIREMENT)
+        # Deliberately untrusted legacy proposal: even a real persisted human
+        # decision on this old key cannot replace approval of a live Plan.
+        proposal = ChangeProposal(task_id=task.id,
+            files_changed=(("obsolete.py",) if mutation == "delete" else
+                           ("obsolete.py", "renamed.py")),
+            diffs=(DiffResult(path="obsolete.py", diff_text=patch),))
+        await runtime.storage.metadata.save_change_proposal(proposal)
+        approval = await runtime._approvals.request("file_delete",
+            {"path": "obsolete.py", "mutation": mutation}, task_id=task.id,
+            session_id=task.metadata["session_id"], requested_by=task.actor.user_id,
+            source=task.source, resource_scope=workspace.id)
         await runtime.stop()
-        restarted = _runtime(tmp_path, model)
+        restarted = _runtime(tmp_path, FakeModel())
         try:
             restored = await restarted.get_task(task.id)
-            assert restored.status.value == "waiting_approval"
+            assert restored.actor == task.actor
+            record = await restarted._approvals.store.get_approval(approval.id)
+            assert record.status.value == "pending"
             if decision == "cancel":
-                final = await restarted.cancel_task(task.id)
-            elif decision == "reject":
-                await restarted.decide_approval(deletion.id, False, decided_by="operator")
-                final = await restarted.get_task(task.id)
+                cancelled = await restarted.cancel_task(task.id)
+                assert cancelled.status.value == "cancelled"
             else:
-                await restarted.decide_approval(deletion.id, True, decided_by="operator")
-                final = await _drive(restarted, await restarted.get_task(task.id))
-                if final.status.value != "completed":
-                    await runtime_failure(restarted, task.id, repo, diagnostic_before,
-                                          "e2e_" + mutation + "_approve")
-            return final
+                await restarted._approvals.decide(approval.id, decision == "approve",
+                    decided_by="offline-fixture-human", channel="cli")
+            persisted = await restarted._approvals.store.get_approval(approval.id)
+            expected = {"approve": "approved", "reject": "rejected"}
+            if decision != "cancel":
+                assert persisted.status.value == expected[decision]
+            assert persisted.used_at is None
+            result = await restarted._apply_broker.apply(proposal, workspace,
+                scope=restored.delegation_scope, principal=restored.actor)
+            assert not result.applied
+            assert result.reason == "internal_apply_execution_unavailable"
+            stored = await restarted.storage.metadata.get_change_proposal(proposal.id)
+            assert stored.status.value == "pending"
+            assert not restarted._local_apply_plans
+            assert not restarted._local_acceptance_receipts
+            assert (await restarted._approvals.store.get_approval(approval.id)).used_at is None
         finally:
             await restarted.stop()
 
-    final = asyncio.run(run())
-    if decision == "approve":
-        assert final.status.value == "completed"
-        assert not obsolete.exists() and _commit_count(repo) > before
-        if mutation == "rename":
-            assert (repo / "renamed.py").read_text(encoding="utf-8") == "value = 1\n"
-    else:
-        assert final.status.value == ("waiting_approval" if decision == "reject" else "cancelled")
-        assert obsolete.exists() and _commit_count(repo) == before
-        assert not (repo / "renamed.py").exists()
+    asyncio.run(run())
+    assert obsolete.read_bytes() == original
+    assert not (repo / "renamed.py").exists()
+    assert _commit_count(repo) == before
+    assert not subprocess.run(["git", "status", "--porcelain"], cwd=repo,
+                              check=True, capture_output=True).stdout
 
 
-async def _drive(runtime, task, *, max_rounds: int = 6):
-    """Run a task to a settled state, playing the human at each gate.
-
-    Approval is granted the way an operator would — through the real
-    ``decide`` path — so the wait/resume machinery is exercised rather than
-    bypassed. A task that parks keeps needing decisions until it settles.
-    """
-    from Sprout.task.models import TaskStatus
-
-    settled = {
-        TaskStatus.COMPLETED,
-        TaskStatus.FAILED,
-        TaskStatus.CANCELLED,
-    }
-    await runtime.execute(task)
-    rounds = 0
-    # The persisted task is the only reliable gate: ``execute`` returns the
-    # status as of when it was called, which goes stale the moment a decision
-    # is granted and work resumes.
-    #
-    # Granting a proposal already resumes the task internally
-    # (``_resume_task_after_approval``), so that path must not also be resumed
-    # here — doing so re-enters an already-settled task.
-    while rounds < max_rounds:
-        current = await runtime.get_task(task.id)
-        if current is None or current.status in settled:
-            break
-        rounds += 1
-        granted = False
-        for record in await runtime._approvals.pending():
-            if record.task_id == task.id:
-                await runtime._approvals.decide(
-                    record.id, approved=True, decided_by="test"
-                )
-                granted = True
-        proposal_approved = False
-        for proposal in await runtime.storage.metadata.list_change_proposals(task.id):
-            if proposal.status.value == "pending":
-                await runtime.approve_change_proposal(proposal.id, decided_by="test")
-                granted = proposal_approved = True
-        if not granted:
-            break
-        if not proposal_approved:
-            # Verification was granted but the graph is still parked.
-            await runtime.resume_task(await runtime.get_task(task.id))
-    final = await runtime.get_task(task.id)
-    assert final is not None
-    return final
 
 
 def test_requirement_reaches_the_agent_as_a_planned_task(tmp_path: Path) -> None:
@@ -281,7 +234,7 @@ def test_requirement_reaches_the_agent_as_a_planned_task(tmp_path: Path) -> None
         runtime = _runtime(tmp_path, model)
         workspace = await runtime.open_workspace(repo)
         gateway = ProjectGateway(runtime, transport="cli", default_user="t")
-        task = await gateway.create_task(workspace.id, REQUIREMENT)
+        task = await _create_host_task(gateway, workspace, REQUIREMENT)
         await runtime.stop()
         return dict(task.metadata)
 
@@ -292,156 +245,80 @@ def test_requirement_reaches_the_agent_as_a_planned_task(tmp_path: Path) -> None
 
 
 @pytest.mark.parametrize("correct", [True, False])
-def test_requirement_output_controls_whether_the_change_lands(tmp_path: Path, correct) -> None:
-    """The whole path, ending in a real commit on the real repository.
-
-    Regression: a refused apply returned a normal payload, so the task
-    finished as ``completed`` while the workspace was untouched.
-    """
-    repo = _repo(tmp_path)
-    before = _commit_count(repo)
-    diagnostic_before = git_state(repo)
-    model = FakeModel(
-        edits={"src/export.py": VALID_EXPORT if correct else
-               "def export_users(users):\n    return ''\n"}
-    )
-
-    async def run():
-        runtime = _runtime(tmp_path, model)
-        workspace = await runtime.open_workspace(repo)
-        gateway = ProjectGateway(runtime, transport="cli", default_user="t")
-        task = await gateway.create_task(workspace.id, REQUIREMENT)
-        final = await _drive(runtime, task)
-        if correct and final.status.value != "completed":
-            await runtime_failure(runtime, task.id, repo, diagnostic_before,
-                                  "e2e_requirement_true")
-        await runtime.stop()
-        return final
-
-    final = __import__("asyncio").run(run())
-
-    if not correct:
-        assert final.status.value == "failed"
-        assert _commit_count(repo) == before
+def test_requirement_output_controls_whether_the_change_lands(current_delivery, correct):
+    """Real Windows replacement delivery; POSIX is explicitly refusal-only."""
+    if current_delivery["platform"] == "posix":
+        assert current_delivery["positive_apply"] == "NOT_SUPPORTED"
         return
-    assert final.status.value == "completed", "the happy path should settle green"
-    # The whole point: "completed" has to mean the change is in the workspace.
-    assert _commit_count(repo) > before, (
-        "task reported success but the workspace has no new commit"
-    )
+    evidence = current_delivery[correct]
+    assert evidence["bytes"] == evidence["expected"]
+    if correct:
+        assert evidence["verification"]["verified"]
+        assert evidence["transaction"]["phase"] == "COMPLETED"
+        grants = [a for a in evidence["approval"] if a["tool"] == "file.apply"]
+        assert len(grants) == 1 and grants[0]["status"] == "consumed"
+    else:
+        assert not evidence["verification"]["verified"]
+        assert not evidence["proposals"] and evidence["transaction"] is None
 
 
-def test_a_failing_verification_does_not_land(tmp_path: Path) -> None:
-    """A real failure blocks the change; risk is raised for the approver.
-
-    Regression: the gate keyed on ``not passed``, which is also true for a
-    command that never ran, so it could not tell "failed" from "unverified".
-    """
-    repo = _repo(tmp_path)
-    # An invariant that already fails and that the agent has no reason to touch.
-    (repo / "tests" / "test_invariant.py").write_text(
-        "def test_invariant():\n    assert 1 == 2\n", encoding="utf-8"
-    )
-    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-qm", "failing invariant"],
-        cwd=repo,
-        check=True,
-        capture_output=True,
-    )
-    baseline = _commit_count(repo)
-
-    model = FakeModel(edits={"src/export.py": "def export_users():\n    return ''\n"})
-
-    async def run():
-        runtime = _runtime(tmp_path, model)
-        workspace = await runtime.open_workspace(repo)
-        gateway = ProjectGateway(runtime, transport="cli", default_user="t")
-        task = await gateway.create_task(workspace.id, REQUIREMENT)
-        final = await _drive(runtime, task)
-        nodes = await runtime.storage.metadata.list_execution_nodes(task.id)
-        proposals = await runtime.storage.metadata.list_change_proposals(task.id)
-        await runtime.stop()
-        return final, nodes, proposals
-
-    final, nodes, proposals = __import__("asyncio").run(run())
-
-    statuses = {
-        n.metadata["output"].get("status")
-        for n in nodes
-        if n.type is NodeType.EVALUATION
-        and isinstance(n.metadata.get("output"), dict)
-        and n.metadata["output"].get("status")
-    }
-    # The failure must be seen and named, not conflated with "never ran".
-    assert "failed" in statuses, f"the failing test was not reported: {statuses}"
-    assert "not_verified" not in statuses, "a granted command is not 'unverified'"
-    # And the change must not land on a red verdict.
-    assert _commit_count(repo) == baseline, "a failing verification landed a commit"
-    assert final.status.value == "failed"
-    assert proposals and proposals[0].risk == "high"
+def test_a_failing_verification_does_not_land(current_delivery):
+    """A real failed frozen check cannot mint a Receipt or executable Plan."""
+    if current_delivery["platform"] == "posix":
+        assert current_delivery["positive_apply"] == "NOT_SUPPORTED"
+        return
+    evidence = current_delivery[False]
+    evaluations = [n for n in evidence["nodes"] if n["type"] == "evaluation"]
+    assert evaluations and evaluations[0]["metadata"]["output"]["status"] == "failed"
+    results = evaluations[0]["metadata"]["output"]["test_results"]
+    assert any(r["executed"] and not r["passed"] for r in results)
+    assert not evidence["verification"]["verified"]
+    assert not evidence["proposals"] and evidence["transaction"] is None
+    assert evidence["bytes"] == evidence["expected"]
 
 
 @pytest.mark.asyncio
 async def test_a_withheld_command_parks_the_task(tmp_path: Path) -> None:
-    """A parked verification command waits for a human, then runs.
+    """A withheld ordinary process creates a real pending record, not a red test.
 
-    Regression: the process broker refused every non-ALLOW verdict without
-    asking, so verification executed nothing while still reporting a verdict.
+    EVALUATION's same-coroutine approval wait is covered separately by the
+    Windows native approval-wait suite; this checks the public Task process API.
     """
-    repo = _repo(tmp_path)
-    model = FakeModel(edits={"src/export.py": "def export_users():\n    return ''\n"})
-
-    runtime = _runtime(tmp_path, model)
-    workspace = await runtime.open_workspace(repo)
-    gateway = ProjectGateway(runtime, transport="cli", default_user="t")
-    task = await gateway.create_task(workspace.id, REQUIREMENT)
-
-    first = await runtime.execute(task)
-
-    assert first.status.value == "waiting_approval"
-    pending = [r for r in await runtime._approvals.pending() if r.task_id == task.id]
-    assert pending, "a withheld command must ask for approval, not refuse silently"
-
-    await runtime.stop()
-
-
-def test_a_proposal_offers_only_the_agents_edits(tmp_path: Path) -> None:
-    """The change proposal must not list caches the verification step wrote.
-
-    Regression: verification runs inside the sandbox and leaves ``__pycache__``
-    behind, which the raw git status view reported as part of the change set. On
-    a repository with no ``.gitignore`` — the common case — the approver was
-    shown a proposal whose files were mostly bytecode, and applying it would
-    have committed them.
-    """
-    repo = _repo(tmp_path, gitignore=False)
-    diagnostic_before = git_state(repo)
-    model = FakeModel(edits={"src/export.py": VALID_EXPORT})
-
-    async def run():
-        runtime = _runtime(tmp_path, model)
-        workspace = await runtime.open_workspace(repo)
-        gateway = ProjectGateway(runtime, transport="cli", default_user="t")
-        task = await gateway.create_task(workspace.id, REQUIREMENT)
-        final = await _drive(runtime, task)
-        proposals = await runtime.storage.metadata.list_change_proposals(task.id)
-        if final.status.value != "completed":
-            await runtime_failure(runtime, task.id, repo, diagnostic_before, "e2e_proposal")
+    runtime, task, command = await _ordinary_process_task(tmp_path)
+    try:
+        before = _commit_count(tmp_path / "repo")
+        result = await runtime.run_task_process(task.id, command)
+        assert result.needs_approval and not result.allowed and not result.started
+        record = await runtime._approvals.store.get_approval(result.approval_id)
+        assert record.status.value == "pending"
+        assert record.task_id == task.id
+        # This legacy ordinary-process API is Task-scoped, not the frozen
+        # EVALUATION Session permit. It must not invent a Session grant.
+        assert record.session_id == ""
+        await runtime._sessions.require_owner(task.metadata["session_id"], task.actor)
+        assert record.requested_by == task.actor.user_id and record.used_at is None
+        assert not (tmp_path / "repo" / "process-ran.txt").exists()
+        report = await runtime.get_verification_report(task.id)
+        assert not report["verified"] and not report["checks"]
+        assert not await runtime.list_change_proposals(task.id)
+        assert _commit_count(tmp_path / "repo") == before
+    finally:
         await runtime.stop()
-        return final, proposals
 
-    final, proposals = asyncio.run(run())
 
-    assert final.status.value == "completed", "the happy path should settle green"
-    assert proposals, "a verified change must produce a proposal"
-    files = proposals[0].files_changed
-    assert "src/export.py" in files, f"the agent's edit is missing: {files}"
-    caches = [
-        path for path in files if "__pycache__" in path or path.endswith(".pyc")
-    ]
-    assert not caches, f"bytecode caches reached the proposal: {caches}"
-    assert "__pycache__" not in "".join(d.diff_text for d in proposals[0].diffs)
+def test_a_proposal_offers_only_the_agents_edits(current_delivery):
+    """G1 and the executable Plan name only the actual replacement, no caches."""
+    if current_delivery["platform"] == "posix":
+        assert current_delivery["positive_apply"] == "NOT_SUPPORTED"
+        return
+    evidence = current_delivery[True]
+    proposal, = evidence["proposals"]
+    assert proposal["files_changed"] == ("src/app.py",)
+    assert proposal["metadata"]["git_diff"]["status"] == "available"
+    assert len(proposal["metadata"]["git_diff"]["commands"]) == 5
+    assert all("__pycache__" not in d["diff_text"] and ".pyc" not in d["diff_text"]
+               for d in proposal["diffs"])
+    assert evidence["transaction"]["phase"] == "COMPLETED"
 
 
 def _cli_config(tmp_path: Path) -> Path:
@@ -469,67 +346,52 @@ def _cli_config(tmp_path: Path) -> Path:
 def test_approving_a_withheld_command_wakes_the_parked_task(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``sprout approvals approve`` must continue the task it unblocked.
+    """A real CLI decision permits the held ordinary Task process to execute.
 
-    Regression: ``--resume`` defaulted to *off*, so the decision was recorded
-    through a bare ``ApprovalManager`` and the task stayed in
-    ``waiting_approval`` with its verification never run. Because
-    ``ApprovalManager.decide`` refuses a record that is no longer PENDING, the
-    grant could not be re-decided either: the operator had answered the prompt
-    and had no way left to act on their own answer. The web path never had this
-    problem — it always goes through ``Runtime.decide_approval``, which resumes.
+    Do not resume an exited EVALUATION or reconstruct its private authority.
+    The live Runtime owns the request, SQLite decision and actual subprocess.
     """
-    repo = _repo(tmp_path)
-    model = FakeModel(edits={"src/export.py": VALID_EXPORT})
-    config = _cli_config(tmp_path)
-    live: dict = {}
+    runtime, task, command = asyncio.run(_ordinary_process_task(tmp_path))
+    try:
+        pending = asyncio.run(runtime.run_task_process(task.id, command))
+        assert pending.needs_approval and not pending.started
+        assert not (tmp_path / "repo" / "process-ran.txt").exists()
+        monkeypatch.setattr("Sprout.runtime.factory.create_runtime", lambda *_a, **_kw: runtime)
+        result = CliRunner().invoke(app, ["approvals", "approve", pending.approval_id,
+            "--config", str(_cli_config(tmp_path))])
+        assert result.exit_code == 0, result.output
+        assert "approved" in result.output
 
-    async def park() -> tuple[str, str]:
-        runtime = _runtime(tmp_path, model)
-        live["runtime"] = runtime
-        workspace = await runtime.open_workspace(repo)
-        gateway = ProjectGateway(runtime, transport="cli", default_user="t")
-        task = await gateway.create_task(workspace.id, REQUIREMENT)
-        first = await runtime.execute(task)
-        assert first.status.value == "waiting_approval"
-        pending = [
-            record
-            for record in await runtime._approvals.pending()
-            if record.task_id == task.id
-        ]
-        assert pending, "a withheld command must ask for approval"
-        # The CLI decision under test grants the bound Acceptance launcher.
-        # Ordinary manifest verification remains a separate, unchanged grant;
-        # explicitly approve that prerequisite without resuming the task.
-        ordinary = await runtime.authorize_task_process(task.id, ("pytest", "-q"))
-        assert ordinary.needs_approval
-        await runtime._approvals.decide(
-            ordinary.approval_id, True, decided_by="t", channel="cli")
-        return task.id, pending[0].id
+        async def inspect():
+            record = await runtime._approvals.store.get_approval(pending.approval_id)
+            assert record.status.value == "approved"
+            outcome = await runtime.run_task_process(task.id, command)
+            assert outcome.allowed and outcome.started and outcome.exit_code == 0
+            assert "held process executed" in outcome.stdout
+            assert int(outcome.stdout.split()[-1]) > 0
+            assert (tmp_path / "repo" / "process-ran.txt").read_text() == "once"
+            assert not await runtime.list_change_proposals(task.id)
+            assert not await runtime.storage.metadata.list_execution_nodes(task.id)
+        asyncio.run(inspect())
+    finally:
+        asyncio.run(runtime.stop())
 
-    task_id, approval_id = asyncio.run(park())
 
-    # What the operator's CLI sees: the live runtime, standing in for the one
-    # ``create_runtime`` would have assembled from this config.
-    monkeypatch.setattr(
-        "Sprout.runtime.factory.create_runtime",
-        lambda *_args, **_kwargs: live["runtime"],
-    )
-    decided = CliRunner().invoke(
-        app, ["approvals", "approve", approval_id, "--config", str(config)]
-    )
-    assert decided.exit_code == 0, decided.output
-    assert "approved" in decided.output
+async def _ordinary_process_task(tmp_path):
+    import sys
 
-    async def inspect() -> list:
-        runtime = live["runtime"]
-        return await runtime.storage.metadata.list_execution_nodes(task_id)
+    from Sprout.task.models import DelegationScope
 
-    nodes = asyncio.run(inspect())
-
-    evaluation = [node for node in nodes if node.type is NodeType.EVALUATION]
-    assert evaluation, "the compiled graph must have an evaluation node"
-    assert any(node.status is NodeStatus.COMPLETED for node in evaluation), (
-        "the grant was approved but the withheld verification never ran: the "
-        "task is still parked behind a decision that was already granted"
-    )
+    root = _repo(tmp_path)
+    runtime = _runtime(tmp_path, FakeModel())
+    workspace = await runtime.open_workspace(root)
+    task = await _create_host_task(ProjectGateway(runtime, transport="cli", default_user="display"),
+                                   workspace, REQUIREMENT)
+    # Host-selected process cwd only; this fixture grants no file read/write.
+    task = replace(task, delegation_scope=DelegationScope(allowed_paths=(str(root),),
+        allowed_actions=frozenset({"process.run"})))
+    await runtime.storage.metadata.save_task(task)
+    command = (sys.executable, "-I", "-c",
+        "import os; from pathlib import Path; p=Path('process-ran.txt'); "
+        "assert not p.exists(); p.write_text('once'); print('held process executed', os.getpid())")
+    return runtime, task, command

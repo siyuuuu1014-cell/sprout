@@ -87,8 +87,37 @@ async def _analyzed(tmp_path: Path) -> tuple[ProjectGateway, str]:
     (workspace_root / "service.py").write_text(SERVICE_PY, encoding="utf-8")
     (workspace_root / "app.py").write_text(APP_PY, encoding="utf-8")
     opened = await gateway.open_workspace(str(workspace_root))
-    await gateway.analyze_workspace(opened.id)
+    await gateway.analyze_workspace(opened.id, **await _subject(gateway, opened.id))
     return gateway, opened.id
+
+
+async def _subject(gateway: ProjectGateway, workspace_id: str) -> dict:
+    """A fresh authenticated, finite read-only Task for each actual query.
+
+    A completed analysis is data, not reusable execution authority.  The same
+    real CLI identity/session can create another explicitly scoped query Task.
+    """
+    from Sprout.gateway.local_identity import current_cli_principal
+    from Sprout.message.models import Message
+    from Sprout.task.models import DelegationScope
+
+    runtime = gateway._runtime
+    principal = current_cli_principal()
+    session = await runtime._sessions.resolve(
+        Message(content="query selected project files", channel=principal.source),
+        principal=principal,
+    )
+    workspace = await runtime.get_workspace(workspace_id)
+    paths = ("service.py", "app.py")
+    task = await runtime.create_task(
+        workspace_id, "query selected project files", actor=principal,
+        source=principal.source, execution_mode="read_only",
+        delegation_scope=DelegationScope(
+            allowed_paths=tuple(str(workspace.root / path) for path in paths),
+            allowed_actions=frozenset({"tool.invoke", "file.read"}),
+        ), metadata={"required_paths": list(paths), "session_id": session.id},
+    )
+    return {"principal": principal, "analysis_task": task}
 
 
 # -- the query surface -------------------------------------------------------------
@@ -97,7 +126,8 @@ async def _analyzed(tmp_path: Path) -> tuple[ProjectGateway, str]:
 async def test_symbols_lists_classes_and_functions(tmp_path: Path) -> None:
     gateway, workspace_id = await _analyzed(tmp_path)
 
-    nodes = await gateway.query_workspace_symbols(workspace_id)
+    nodes = await gateway.query_workspace_symbols(
+        workspace_id, **await _subject(gateway, workspace_id))
 
     kinds = {node.kind for node in nodes}
     assert {"class", "function"} <= kinds
@@ -108,10 +138,12 @@ async def test_symbols_lists_classes_and_functions(tmp_path: Path) -> None:
 async def test_symbols_filter_by_kind_and_query(tmp_path: Path) -> None:
     gateway, workspace_id = await _analyzed(tmp_path)
 
-    classes = await gateway.query_workspace_symbols(workspace_id, kind="class")
+    classes = await gateway.query_workspace_symbols(
+        workspace_id, kind="class", **await _subject(gateway, workspace_id))
     assert classes and all(node.kind == "class" for node in classes)
 
-    filtered = await gateway.query_workspace_symbols(workspace_id, query="RateLimiter")
+    filtered = await gateway.query_workspace_symbols(
+        workspace_id, query="RateLimiter", **await _subject(gateway, workspace_id))
     assert filtered
     assert all(
         "ratelimiter" in (node.qualified_name or node.name).casefold() for node in filtered
@@ -126,7 +158,8 @@ async def test_dependencies_walks_out_of_a_file(tmp_path: Path, spelling: str) -
     if spelling == "absolute":
         path = (tmp_path / "demo" / "app.py").as_posix()
 
-    result = await gateway.query_workspace_dependencies(workspace_id, path)
+    result = await gateway.query_workspace_dependencies(
+        workspace_id, path, **await _subject(gateway, workspace_id))
 
     assert result.edges, "app.py imports service.py, so it must have an outgoing edge"
     assert any(edge.relation == "imports" for edge in result.edges)
@@ -138,7 +171,7 @@ async def test_dependencies_walks_back_to_the_importer(tmp_path: Path) -> None:
     gateway, workspace_id = await _analyzed(tmp_path)
 
     result = await gateway.query_workspace_dependencies(
-        workspace_id, "service.py", direction="in"
+        workspace_id, "service.py", direction="in", **await _subject(gateway, workspace_id)
     )
 
     assert result.edges
@@ -151,7 +184,8 @@ async def test_dependencies_returns_nothing_for_an_unknown_path(tmp_path: Path) 
     """A near miss must not be fuzzy-matched onto a real file."""
     gateway, workspace_id = await _analyzed(tmp_path)
 
-    result = await gateway.query_workspace_dependencies(workspace_id, "missing.py")
+    result = await gateway.query_workspace_dependencies(
+        workspace_id, "missing.py", **await _subject(gateway, workspace_id))
 
     assert result.nodes == () and result.edges == ()
 
@@ -159,7 +193,8 @@ async def test_dependencies_returns_nothing_for_an_unknown_path(tmp_path: Path) 
 async def test_subgraph_returns_the_neighbourhood(tmp_path: Path) -> None:
     gateway, workspace_id = await _analyzed(tmp_path)
 
-    result = await gateway.query_workspace_subgraph(workspace_id, "RateLimiter", max_depth=2)
+    result = await gateway.query_workspace_subgraph(
+        workspace_id, "RateLimiter", max_depth=2, **await _subject(gateway, workspace_id))
 
     assert result.nodes and result.edges
     assert any("RateLimiter" in (node.qualified_name or node.name) for node in result.nodes)
@@ -169,7 +204,8 @@ async def test_subgraph_accepts_a_file_path_as_the_seed(tmp_path: Path) -> None:
     """File nodes are named by absolute path; a relative seed must still work."""
     gateway, workspace_id = await _analyzed(tmp_path)
 
-    result = await gateway.query_workspace_subgraph(workspace_id, "service.py")
+    result = await gateway.query_workspace_subgraph(
+        workspace_id, "service.py", **await _subject(gateway, workspace_id))
 
     assert result.nodes and result.edges
     assert any(
@@ -181,7 +217,8 @@ async def test_subgraph_accepts_a_file_path_as_the_seed(tmp_path: Path) -> None:
 async def test_missing_node_yields_an_empty_subgraph(tmp_path: Path) -> None:
     gateway, workspace_id = await _analyzed(tmp_path)
 
-    result = await gateway.query_workspace_subgraph(workspace_id, "NoSuchSymbol")
+    result = await gateway.query_workspace_subgraph(
+        workspace_id, "NoSuchSymbol", **await _subject(gateway, workspace_id))
 
     assert result.nodes == () and result.edges == ()
 

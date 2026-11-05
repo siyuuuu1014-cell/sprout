@@ -73,16 +73,56 @@ def test_feishu_message_event_creates_task(tmp_path: Path) -> None:
     runtime = _runtime_for_test(tmp_path)
 
     async def run() -> None:
+        from Sprout.task.models import DelegationScope
+
         workspace = await runtime.open_workspace(tmp_path)
         gateway = FeishuGateway(
             runtime,
             verification_token="token-1",
             default_workspace_id=workspace.id,
+            delegation_scope=DelegationScope(
+                allowed_paths=(str(tmp_path / "src/main.py"),),
+                allowed_actions=frozenset({"tool.invoke", "file.read"}),
+            ),
         )
         response = await gateway.handle_event(
             _message_body("token-1", workspace_id=workspace.id)
         )
-        assert isinstance(response, object)
+        assert response.status == "completed"
+        task = await runtime.get_task(response.task_id)
+        assert task.actor.authenticated and task.actor.source == "feishu"
+        session = await runtime._sessions.require_owner(task.metadata["session_id"], task.actor)
+        assert session.user_id == "ou_123"
+        await runtime.stop()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("problem", ["no_host_scope", "wrong_workspace"])
+def test_verified_event_cannot_select_ungranted_workspace(tmp_path, problem):
+    from Sprout.task.models import DelegationScope
+
+    runtime = _runtime_for_test(tmp_path)
+
+    async def run():
+        workspace = await runtime.open_workspace(tmp_path)
+        gateway = FeishuGateway(runtime, verification_token="token-1",
+            default_workspace_id=workspace.id,
+            delegation_scope=None if problem == "no_host_scope" else DelegationScope(
+                allowed_paths=(str(tmp_path / "src/main.py"),),
+                allowed_actions=frozenset({"file.read", "tool.invoke"})))
+        body = _message_body("token-1", workspace_id=(
+            "another-workspace" if problem == "wrong_workspace" else workspace.id))
+        body["metadata"] = {"scope": {"allowed_paths": ["/"]}, "authenticated": True}
+        before = (tmp_path / "src/main.py").read_bytes()
+        try:
+            with pytest.raises(PermissionError, match="feishu_workspace_authority_required"):
+                await gateway.handle_event(body)
+            assert not await runtime.storage.metadata.list_tasks()
+            assert not await runtime.pending_approvals()
+            assert (tmp_path / "src/main.py").read_bytes() == before
+        finally:
+            await runtime.stop()
 
     asyncio.run(run())
 
@@ -190,10 +230,13 @@ def _runtime_for_test(root: Path):
     (root / "src").mkdir(exist_ok=True)
     (root / "src" / "main.py").write_text("def main(): pass\n", encoding="utf-8")
     settings = default_settings()
+    settings.model.provider = "echo"
+    settings.model.model = "echo-1"
     settings.storage.operational = "memory://"
     settings.storage.knowledge = "memory://"
     settings.storage.observations.enabled = False
     settings.storage.metadata = f"sqlite:///{root / 'metadata.db'}"
+    settings.storage.session = settings.storage.metadata
     settings.storage.trajectory_dir = str(root / "trajectory")
     settings.storage.blobs_dir = str(root / "blobs")
     # Keep the audit stream in tmp_path too: the default points at the real

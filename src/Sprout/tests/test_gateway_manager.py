@@ -27,6 +27,7 @@ def test_gateway_manager_routes_transport(tmp_path: Path) -> None:
     settings.storage.knowledge = "memory://"
     settings.storage.observations.enabled = False
     settings.storage.metadata = f"sqlite:///{tmp_path / 'metadata.db'}"
+    settings.storage.session = settings.storage.metadata
     settings.storage.trajectory_dir = str(tmp_path / "trajectory")
     settings.storage.blobs_dir = str(tmp_path / "blobs")
     # Keep the audit stream in tmp_path too: the default points at the real
@@ -34,6 +35,9 @@ def test_gateway_manager_routes_transport(tmp_path: Path) -> None:
     settings.security.audit.path = str(tmp_path / "security.jsonl")
 
     async def run() -> None:
+        from Sprout.gateway.local_identity import current_cli_principal
+        from Sprout.task.models import DelegationScope
+
         runtime = create_runtime(settings)
         workspace = await runtime.open_workspace(tmp_path)
         manager = GatewayManager(runtime)
@@ -42,6 +46,11 @@ def test_gateway_manager_routes_transport(tmp_path: Path) -> None:
             "explain this project",
             execution_mode="read_only",
             workspace_id=workspace.id,
+            principal=current_cli_principal(),
+            delegation_scope=DelegationScope(
+                allowed_paths=(str(tmp_path / "src/main.py"),),
+                allowed_actions=frozenset({"tool.invoke", "file.read"}),
+            ),
         )
         assert response.status in {"waiting_approval", "completed"}
         assert response.task_id

@@ -207,20 +207,8 @@ class AgentLoop:
                 completion_tokens=usage.completion_tokens + response.usage.completion_tokens,
                 total_tokens=usage.total_tokens + response.usage.total_tokens,
             )
-            try:
-                get_agent_step_store().record(
-                    session_id=context.session.id,
-                    step=steps,
-                    content=response.content,
-                    tool_calls=response.tool_calls,
-                    prompt_tokens=response.usage.prompt_tokens,
-                    completion_tokens=response.usage.completion_tokens,
-                    total_tokens=response.usage.total_tokens,
-                )
-            except sqlite3.Error as exc:
-                # Step telemetry is derived data. A locked or read-only
-                # telemetry database must not take down the active turn.
-                logger.warning("agent step telemetry unavailable: %s", exc)
+            self._record_step(context.session.id, steps, response.content,
+                              response.tool_calls, response.usage)
             if budget_tokens and usage.total_tokens >= budget_tokens:
                 break
             if not response.tool_calls:
@@ -296,11 +284,15 @@ class AgentLoop:
             },
         )
 
-    async def stream(self, message: Message, context: AgentContext):
+    async def stream(
+        self, message: Message, context: AgentContext, *, include_result: bool = False,
+    ):
         """Run the same tool loop while yielding text chunks.
 
         Providers that expose ``stream_events`` stream both content and tool
         calls. Providers without it fall back to the non-streaming loop.
+        Runtime can opt in to the existing AgentResult terminal; default text
+        consumers keep their original token sequence and approval terminals.
         """
         messages: list[LLMMessage] = []
         response_language = _response_language(message)
@@ -358,9 +350,16 @@ class AgentLoop:
                 response = await invoke_model(self.model, messages, tools=specs)
                 steps += 1
                 model_calls += 1
+                self._record_step(context.session.id, steps, response.content,
+                                  response.tool_calls, response.usage)
                 if not response.tool_calls:
                     if response.text:
                         yield response.text
+                    if include_result and response.finish_reason in {None, "stop", "end_turn"}:
+                        yield AgentResult(content="", metadata={
+                            "steps": steps, "model_calls": model_calls,
+                            "tool_calls": tool_calls, "plan": self._last_plan,
+                        })
                     return
                 messages.append(LLMMessage.assistant(response.content, response.tool_calls))
                 (
@@ -399,7 +398,13 @@ class AgentLoop:
 
             content_parts: list[str] = []
             final_tool_calls = ()
+            finish_reason = None
+            step_usage = Usage()
             async for event in stream_events(messages, tools=specs):
+                if event.usage is not None:
+                    step_usage = event.usage
+                if event.finish_reason is not None:
+                    finish_reason = event.finish_reason
                 if event.content:
                     content_parts.append(event.content)
                     yield event.content
@@ -407,7 +412,14 @@ class AgentLoop:
                     final_tool_calls = event.tool_calls
             steps += 1
             model_calls += 1
+            self._record_step(context.session.id, steps, "".join(content_parts),
+                              final_tool_calls, step_usage)
             if not final_tool_calls:
+                if include_result and finish_reason in {None, "stop", "end_turn"}:
+                    yield AgentResult(content="", metadata={
+                        "steps": steps, "model_calls": model_calls,
+                        "tool_calls": tool_calls, "plan": self._last_plan,
+                    })
                 return
             messages.append(LLMMessage.assistant("".join(content_parts), final_tool_calls))
             tool_messages, tool_calls, approval_ids, tool_summary = await self._execute_tool_calls(
@@ -439,6 +451,18 @@ class AgentLoop:
                 return
 
         return
+
+    @staticmethod
+    def _record_step(session_id, step, content, tool_calls, usage):
+        try:
+            get_agent_step_store().record(
+                session_id=session_id, step=step, content=content, tool_calls=tool_calls,
+                prompt_tokens=usage.prompt_tokens, completion_tokens=usage.completion_tokens,
+                total_tokens=usage.total_tokens,
+            )
+        except sqlite3.Error as exc:
+            # Derived telemetry failure cannot change the execution result.
+            logger.warning("agent step telemetry unavailable: %s", exc)
 
     async def _execute_tool_calls(
         self,

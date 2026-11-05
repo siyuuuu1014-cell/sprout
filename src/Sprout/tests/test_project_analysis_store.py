@@ -15,6 +15,20 @@ from Sprout.workspace.models import Workspace
 from Sprout.workspace.serialization import to_jsonable
 
 
+async def _fixture_analysis(intelligence, workspace, task):
+    """Finite fixture bytes for storage tests, not Runtime read authority."""
+    from Sprout.workspace.authorized_content import AuthorizedContentView, AuthorizedEntry
+    from Sprout.workspace.classifier import classify
+
+    entries = tuple(AuthorizedEntry.synthetic(
+        name, (workspace.root / name).read_bytes(), classify(name))
+        for name in ("app.py", "other.py", "pyproject.toml")
+        if (workspace.root / name).is_file())
+    view = AuthorizedContentView(workspace.id, entries)
+    return await intelligence.analyze_view(
+        workspace, replace(task, workspace_id=workspace.id), view)
+
+
 def _concurrent_project_writer(root, payload, barrier, results):
     from Sprout.storage.local.sqlite.driver import SqliteDatabase
     from Sprout.workspace.serialization import from_jsonable
@@ -56,7 +70,7 @@ def test_concurrent_processes_publish_one_complete_snapshot(tmp_path):
         root.mkdir()
         (root / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
         workspace = Workspace(id="concurrent", root=root)
-        return await WorkspaceIntelligence().analyze(
+        return await _fixture_analysis(WorkspaceIntelligence(),
             workspace, Task(workspace_id=workspace.id, instruction="analyze"),
         )
 
@@ -103,7 +117,8 @@ def test_stale_analysis_cannot_replace_a_newer_published_snapshot(tmp_path, back
         root.mkdir()
         (root / "app.py").write_text("value = 1\n", encoding="utf-8")
         workspace = Workspace(id="project", root=root)
-        first = await WorkspaceIntelligence().analyze(workspace, Task(instruction="analyze"))
+        first = await _fixture_analysis(
+            WorkspaceIntelligence(), workspace, Task(instruction="analyze"))
         fact = first.knowledge.items[0]
         newer = replace(first, knowledge=replace(first.knowledge, items=(
             replace(fact, statement="New project fact"), *first.knowledge.items[1:],
@@ -135,7 +150,7 @@ def test_project_snapshot_roundtrip_and_current_graph(tmp_path):
         workspace = Workspace(id="project-1", root=root)
         task = Task(workspace_id=workspace.id, instruction="understand project")
         intelligence = WorkspaceIntelligence()
-        analysis = await intelligence.analyze(workspace, task)
+        analysis = await _fixture_analysis(intelligence, workspace, task)
         store = SqliteProjectAnalysisStore(tmp_path / "projects")
         version = await store.save_analysis(analysis, expected_snapshot_id=None)
         assert await store.save_analysis(analysis, expected_snapshot_id=version) == version
@@ -147,7 +162,7 @@ def test_project_snapshot_roundtrip_and_current_graph(tmp_path):
         source.unlink()
         replacement = root / "other.py"
         replacement.write_text("def other():\n    return 2\n", encoding="utf-8")
-        changed = await intelligence.analyze(workspace, task, previous=loaded)
+        changed = await _fixture_analysis(intelligence, workspace, task)
         assert await reopened.save_analysis(changed, expected_snapshot_id=version) != version
         current = await reopened.load_analysis(workspace.id)
         assert all(node.resource is None or not node.resource.path.endswith("app.py")
@@ -168,11 +183,11 @@ def test_failed_partition_keeps_published_snapshot_and_retry_recovers(tmp_path, 
         workspace = Workspace(id="project", root=root)
         task = Task(workspace_id=workspace.id, instruction="analyze")
         intelligence = WorkspaceIntelligence()
-        first = await intelligence.analyze(workspace, task)
+        first = await _fixture_analysis(intelligence, workspace, task)
         store = SqliteProjectAnalysisStore(tmp_path / "projects")
         await store.save_analysis(first, expected_snapshot_id=None)
         source.write_text("def run():\n    return 2\n", encoding="utf-8")
-        changed = await intelligence.analyze(workspace, task, previous=first)
+        changed = await _fixture_analysis(intelligence, workspace, task)
         failing = store._databases(workspace.id)["architecture"]
         execute_batch = SqliteDatabase.execute_batch
 

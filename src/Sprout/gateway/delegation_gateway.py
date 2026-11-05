@@ -23,12 +23,18 @@ class DelegationGateway:
         caller_id: str,
         scope: DelegationScope,
         execution_mode: str = "code",
+        principal: Principal | None = None,
     ) -> GatewayResponse:
+        # caller_id remains a display/compatibility argument, not authentication.
+        if not isinstance(principal, Principal) or principal.authenticated is not True:
+            raise PermissionError("An authenticated delegation host identity is required")
+        if not isinstance(scope, DelegationScope):
+            raise PermissionError("An explicit host scope is required")
         return await self._gateway.execute(
             GatewayRequest(
                 transport="delegation",
                 instruction=instruction,
-                caller=Principal(user_id=caller_id),
+                caller=principal,
                 workspace_id=workspace_id,
                 execution_mode=execution_mode,
                 delegation_scope=scope,

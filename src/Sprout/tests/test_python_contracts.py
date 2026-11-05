@@ -5,6 +5,7 @@ import sqlite3
 
 from Sprout.storage.local.sqlite.projects import SqliteProjectAnalysisStore
 from Sprout.task.models import Task
+from Sprout.tests.readonly_host_fixtures import fixture_analysis
 from Sprout.tools.project_analyze_tool import ProjectAnalyzeTool
 from Sprout.workspace.intelligence import WorkspaceIntelligence
 from Sprout.workspace.models import Workspace
@@ -131,7 +132,7 @@ table = Table("users", metadata, Column("id", Integer, primary_key=True))
         workspace = Workspace(id="project", root=root)
         task = Task(workspace_id=workspace.id, instruction="analyze")
         intelligence = WorkspaceIntelligence()
-        first = await intelligence.analyze(workspace, task)
+        first = await fixture_analysis(intelligence, workspace, task, paths=("app.py",))
         store = SqliteProjectAnalysisStore(tmp_path / "projects")
         try:
             version = await store.save_analysis(first, expected_snapshot_id=None)
@@ -156,7 +157,8 @@ table = Table("users", metadata, Column("id", Integer, primary_key=True))
                       if item.kind in {"interface_endpoint", "database_table"}]
             assert actual == expected
             (root / "app.py").unlink()
-            removed = await intelligence.analyze(workspace, task, previous=restored)
+            removed = await fixture_analysis(
+                intelligence, workspace, task, paths=("app.py",), previous=restored)
             assert not any(item.kind in {"interface_endpoint", "database_table"}
                            for item in removed.knowledge.items)
             assert all(item.id in removed.stale_knowledge_ids for item in expected)
@@ -190,7 +192,16 @@ app = FastAPI()
 @app.get("/items")
 def items(id: int): pass
 ''')
-    result = await ProjectAnalyzeTool().invoke({"path": str(tmp_path)})
+    from Sprout.tests.owned_analysis_fixture import owned_analysis
+
+    assert not (await ProjectAnalyzeTool().invoke({"path": str(tmp_path)})).ok
+
+    async def operation(tool, call, approvals, workspace):
+        (workspace.root / "service.py").write_bytes((tmp_path / "app.py").read_bytes())
+        return await call({"path": str(workspace.root / "service.py")})
+
+    result = await owned_analysis(tmp_path, operation)
+    assert result.ok, result.error
     endpoint = next(item for item in result.data["knowledge"]
                     if item["kind"] == "interface_endpoint")
     assert endpoint["details"]["declared_path"] == "/items"

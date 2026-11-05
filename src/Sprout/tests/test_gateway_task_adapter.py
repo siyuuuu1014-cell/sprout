@@ -12,14 +12,16 @@ def test_gateway_request_becomes_task() -> None:
     request = GatewayRequest(
         transport="mcp",
         instruction="scan auth flow",
-        caller=Principal(user_id="external-agent"),
+        caller=Principal(user_id="external-agent", source="mcp-host"),
         workspace_id="ws-1",
         delegation_scope=DelegationScope(allowed_actions=frozenset({"file.read"})),
     )
 
     task = TaskAdapter().to_task(request)
 
-    assert task.source == "mcp"
+    assert task.source == request.caller.source == "mcp-host"
+    assert request.transport == "mcp"
+    assert task.actor is request.caller and task.actor.authenticated is False
     assert task.workspace_id == "ws-1"
     assert task.actor.user_id == "external-agent"
     assert task.delegation_scope.permits("file.read")

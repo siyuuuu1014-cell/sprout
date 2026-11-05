@@ -94,7 +94,8 @@ def build_verification_report(
     codes = []
     known = {
         "passed", "check_failed", "not_executed", "approval_required", "policy_denied",
-        "runner_error", "timeout", "skipped", "missing_results", "baseline_invalid",
+        "runner_error", "timeout", "skipped", "missing_results", "baseline_invalid", "UNKNOWN",
+        "unverified",
     }
     for result in results:
         record = records_by_name.get(result.name, {})

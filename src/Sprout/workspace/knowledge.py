@@ -32,6 +32,68 @@ class ProjectKnowledge:
 
 
 class ProjectKnowledgeBuilder:
+    def build_view(self, workspace, manifest, view):
+        """Facts cite only captured resources; no existence inference on host."""
+        from pathlib import PurePosixPath
+
+        view.check(workspace.id)
+        items = []
+        categories = {}
+        for entry in view.entries:
+            view.check()
+            path = PurePosixPath(entry.relative_path)
+            name = path.name.casefold()
+            statement = ""
+            if name == "pyproject.toml":
+                project = tomllib.loads(entry.text()).get("project", {})
+                if isinstance(project, dict) and project.get("name"):
+                    statement = f"Project name: {project['name']}"
+                if isinstance(project, dict) and project.get("description"):
+                    items.append(self._item(workspace, len(items),
+                                            f"Project description: {project['description']}",
+                                            [entry.relative_path]))
+            elif name == "package.json":
+                package = json.loads(entry.text())
+                if isinstance(package, dict) and package.get("name"):
+                    statement = f"Node package: {package['name']}"
+                if isinstance(package, dict):
+                    for field, label in (("scripts", "Node scripts"),
+                                         ("dependencies", "Node dependencies")):
+                        value = package.get(field)
+                        if isinstance(value, dict) and value:
+                            items.append(self._item(workspace, len(items),
+                                                    label + ": " + ", ".join(sorted(value)),
+                                                    [entry.relative_path]))
+            elif name == "cargo.toml":
+                package = tomllib.loads(entry.text()).get("package", {})
+                if isinstance(package, dict) and package.get("name"):
+                    statement = f"Rust crate: {package['name']}"
+            elif name == "go.mod":
+                match = re.search(r"(?m)^module\s+(.+)$", entry.text())
+                if match:
+                    statement = f"Go module: {match.group(1).strip()}"
+            if statement:
+                items.append(self._item(workspace, len(items), statement, [entry.relative_path]))
+            category = ("documentation" if name in _DOCUMENTATION_NAMES else
+                        "dependency" if name in _PACKAGE_MANIFEST_NAMES else
+                        "interface" if name in _INTERFACE_NAMES else
+                        "project_database" if name in _DATABASE_NAMES or path.suffix == ".sql"
+                        else "runtime" if name.startswith("dockerfile") or name in _COMPOSE_NAMES
+                        else "")
+            if category:
+                categories.setdefault(category, []).append(entry.relative_path)
+        for category, paths in sorted(categories.items()):
+            statement = f"Captured {category} assets: {', '.join(sorted(paths))}"
+            items.append(self._item(workspace, len(items), statement, paths, kind=category))
+        if manifest.detected_languages:
+            items.append(self._item(
+                workspace, len(items),
+                "Detected languages: " + ", ".join(manifest.detected_languages),
+                [entry.relative_path for entry in view.entries],
+            ))
+        view.check()
+        return ProjectKnowledge(workspace.id, tuple(items))
+
     def build(self, workspace: Workspace, manifest: WorkspaceManifest) -> ProjectKnowledge:
         items: list[ProjectKnowledgeItem] = []
         evidence: list[str] = []

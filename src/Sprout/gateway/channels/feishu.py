@@ -68,11 +68,13 @@ class FeishuGateway:
         default_workspace_id: str = "",
         encrypt_key: str | None = None,
         max_clock_skew_seconds: float = DEFAULT_MAX_CLOCK_SKEW_SECONDS,
+        delegation_scope: DelegationScope | None = None,
     ) -> None:
         self._runtime = runtime
         self._gateway = RuntimeGateway(runtime, transport="feishu")
         self._verification_token = verification_token
         self._default_workspace_id = default_workspace_id
+        self._delegation_scope = delegation_scope
         self._encrypt_key = encrypt_key or ""
         self.max_clock_skew_seconds = max_clock_skew_seconds
 
@@ -188,17 +190,19 @@ class FeishuGateway:
         sender_id = self._extract_sender_id(sender)
         text = self._extract_text(message)
         workspace_id = body.get("workspace_id") or self._default_workspace_id
+        if (not sender_id or not self._default_workspace_id
+                or workspace_id != self._default_workspace_id
+                or self._delegation_scope is None):
+            raise PermissionError("feishu_workspace_authority_required")
 
         response = await self._gateway.execute(
             GatewayRequest(
                 transport="feishu",
                 execution_mode="read_only",
                 instruction=text,
-                caller=Principal(user_id=sender_id, source="feishu"),
+                caller=Principal(user_id=sender_id, source="feishu", authenticated=True),
                 workspace_id=workspace_id,
-                delegation_scope=DelegationScope(
-                    allowed_actions=frozenset({"file.read"}),
-                ),
+                delegation_scope=self._delegation_scope,
             )
         )
         return response

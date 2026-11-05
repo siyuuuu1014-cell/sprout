@@ -61,44 +61,71 @@ class SqlContractAnalyzer:
                 if path.stat().st_size > 1_000_000:
                     raise ValueError("SQL source size limit exceeded")
                 source = path.read_text(encoding="utf-8-sig")
-                tokens = _tokens(source)
-                statements, start, depth = [], 0, 0
-                for index, token in enumerate(tokens):
-                    if token[3] == "symbol":
-                        depth += (token[0] == "(") - (token[0] == ")")
-                        if depth < 0:
-                            raise ValueError("Unbalanced SQL parentheses")
-                        if token[0] == ";" and depth == 0:
-                            statements.append(tokens[start:index])
-                            start = index + 1
-                if depth:
-                    raise ValueError("Unbalanced SQL parentheses")
-                statements.append(tokens[start:])
-                for statement in statements:
-                    if not statement:
-                        continue
-                    first = statement[0]
-                    line = source.count("\n", 0, first[1]) + 1
-                    head = " ".join(t[0] for t in statement)
-                    match = _CREATE.match(head)
-                    if match is None:
-                        if first[3] == "word" and first[0].upper() in {"CREATE", "ALTER", "DROP"}:
-                            items.append(self._warning(
-                                workspace, path, line, "Unsupported SQL DDL declaration",
-                            ))
-                        continue
-                    try:
-                        details = self._table(source, statement, match)
-                        items.append(source_fact(
-                            workspace, path, line, "database_table",
-                            f"Declared SQL table: {details['table']}", details,
-                        ))
-                    except (ValueError, IndexError) as exc:
-                        items.append(self._warning(
-                            workspace, path, line, str(exc) or "Incomplete SQL declaration",
-                        ))
+                items.extend(self._source_items(workspace, path, source))
             except (OSError, UnicodeError, ValueError) as exc:
                 items.append(self._warning(workspace, path, 0, str(exc)))
+        return tuple(items)
+
+    def _source_items(self, workspace, path, source):
+        items = []
+        tokens = _tokens(source)
+        statements, start, depth = [], 0, 0
+        for index, token in enumerate(tokens):
+            if token[3] == "symbol":
+                depth += (token[0] == "(") - (token[0] == ")")
+                if depth < 0:
+                    raise ValueError("Unbalanced SQL parentheses")
+                if token[0] == ";" and depth == 0:
+                    statements.append(tokens[start:index])
+                    start = index + 1
+        if depth:
+            raise ValueError("Unbalanced SQL parentheses")
+        statements.append(tokens[start:])
+        for statement in statements:
+            if not statement:
+                continue
+            first = statement[0]
+            line = source.count("\n", 0, first[1]) + 1
+            head = " ".join(t[0] for t in statement)
+            match = _CREATE.match(head)
+            if match is None:
+                if first[3] == "word" and first[0].upper() in {"CREATE", "ALTER", "DROP"}:
+                    items.append(self._warning(
+                        workspace, path, line, "Unsupported SQL DDL declaration",
+                    ))
+                continue
+            try:
+                details = self._table(source, statement, match)
+                items.append(source_fact(
+                    workspace, path, line, "database_table",
+                    f"Declared SQL table: {details['table']}", details,
+                ))
+            except (ValueError, IndexError) as exc:
+                items.append(self._warning(
+                    workspace, path, line, str(exc) or "Incomplete SQL declaration",
+                ))
+        return items
+
+    def analyze_view(self, workspace, view):
+        from pathlib import PurePosixPath
+
+        from Sprout.workspace.authorized_content import _EvidenceLabel, evidence_workspace
+
+        view.check(workspace.id)
+        logical, items = evidence_workspace(view), []
+        for entry in view.entries:
+            view.check()
+            if (entry.kind != ResourceKind.SOURCE
+                    or PurePosixPath(entry.relative_path).suffix != ".sql"):
+                continue
+            if len(entry.data) > 1_000_000:
+                raise ValueError("view_sql_contract_budget")
+            path = _EvidenceLabel(entry.relative_path)
+            try:
+                items.extend(self._source_items(logical, path, entry.text("utf-8-sig")))
+            except (UnicodeError, ValueError) as exc:
+                items.append(self._warning(logical, path, 0, str(exc)))
+        view.check()
         return tuple(items)
 
     @staticmethod

@@ -28,8 +28,10 @@ class WorkspaceQuery:
     returning nothing for a file that plainly exists.
     """
 
-    def __init__(self, analysis: WorkspaceAnalysis) -> None:
+    def __init__(self, analysis: WorkspaceAnalysis, *, captured: bool = False) -> None:
         self._analysis = analysis
+        # Pure matching mode only, NOT an assertion of file authorization.
+        self._captured = captured
 
     def _resource_key(self, path: str) -> str:
         """Canonical comparison key for a resource path.
@@ -38,6 +40,12 @@ class WorkspaceQuery:
         then normalised for the host platform, so a Windows caller does not
         have to match the on-disk letter case by hand.
         """
+        if self._captured:
+            from Sprout.task.paths import bound_scope_path
+
+            # Reuse lexical normalization, never resolve/stat a host path.
+            key = bound_scope_path(path, str(self._analysis.workspace.root))
+            return os.path.normcase(key) if key is not None else "\0"
         candidate = Path(path)
         if not candidate.is_absolute():
             candidate = self._analysis.workspace.root / candidate

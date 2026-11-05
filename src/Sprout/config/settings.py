@@ -230,6 +230,33 @@ class MCPClientSettings:
     args: tuple[str, ...] = ()
     env: dict[str, str] = field(default_factory=dict)
     principal: MCPPrincipalSettings = field(default_factory=MCPPrincipalSettings)
+    risk_version: int = 1
+    tool_risks: tuple[dict[str, str], ...] = ()
+
+    def __post_init__(self) -> None:
+        # The existing loader constructs this class for each client table.
+        # A descriptor digest checks consistency; only this local declaration
+        # supplies risk authority. Remote annotations are never consulted.
+        import re
+
+        if type(self.risk_version) is not int or self.risk_version != 1:
+            raise ValueError("Unsupported MCP risk declaration version")
+        if not isinstance(self.tool_risks, (tuple, list)):
+            raise ValueError("MCP tool_risks must be a list of declarations")
+        seen = set()
+        normalized = []
+        for entry in self.tool_risks:
+            if (not isinstance(entry, dict)
+                    or set(entry) != {"operation", "risk", "descriptor_sha256"}
+                    or not all(isinstance(value, str) for value in entry.values())
+                    or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", entry["operation"])
+                    or entry["risk"] not in {"low", "medium", "high", "critical"}
+                    or not re.fullmatch(r"[0-9a-f]{64}", entry["descriptor_sha256"])
+                    or entry["operation"] in seen):
+                raise ValueError("Invalid or ambiguous MCP risk declaration")
+            seen.add(entry["operation"])
+            normalized.append(dict(entry))
+        self.tool_risks = tuple(normalized)
 
 
 @dataclass(slots=True)

@@ -65,7 +65,15 @@ async def _parked_task(gateway: ProjectGateway, tmp_path: Path, status: TaskStat
     (root / ".git").mkdir(exist_ok=True)
     (root / "README.md").write_text("# demo\n", encoding="utf-8")
     workspace = await gateway.open_workspace(str(root))
-    task = await gateway.create_task(workspace.id, "修复一个不存在的问题")
+    from Sprout.gateway.local_identity import current_cli_principal
+
+    principal = current_cli_principal()
+    session = await gateway._runtime.create_session(principal.user_id)
+    # Cancellation needs a real owned stored task, not project discovery or a
+    # model planner against the deliberately non-executable .git marker above.
+    task = await gateway._runtime.create_task(
+        workspace.id, "修复一个不存在的问题", actor=principal, source=principal.source,
+        metadata={"session_id": session.id})
     await gateway._runtime.storage.metadata.update_task_status(task.id, status)
     return await gateway._runtime.get_task(task.id)
 

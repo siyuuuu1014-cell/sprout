@@ -54,97 +54,130 @@ class PythonContractAnalyzer:
                 items.append(self._warning(workspace, path, 0, "Source could not be parsed"))
                 continue
             trees[path.resolve()] = tree
-            bindings: dict[str, str] = {}
-            receivers: dict[str, tuple[str, str | None]] = {}
-            orm_bases: set[str] = set()
-            for node in tree.body:
-                if isinstance(node, ast.Import):
-                    for alias in node.names:
-                        receivers.pop(alias.asname or alias.name.split(".")[0], None)
-                        orm_bases.discard(alias.asname or alias.name.split(".")[0])
-                        bindings[alias.asname or alias.name.split(".")[0]] = (
-                            alias.name if alias.asname else alias.name.split(".")[0]
-                        )
-                elif isinstance(node, ast.ImportFrom):
-                    for alias in node.names:
-                        if alias.name == "*":
-                            bindings.clear()
-                            receivers.clear()
-                            orm_bases.clear()
-                            continue
-                        receivers.pop(alias.asname or alias.name, None)
-                        orm_bases.discard(alias.asname or alias.name)
-                        bindings.pop(alias.asname or alias.name, None)
-                        if node.module and not node.level:
-                            bindings[alias.asname or alias.name] = f"{node.module}.{alias.name}"
-                elif isinstance(node, ast.Assign | ast.AnnAssign):
-                    value = node.value
-                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-                    constructor = ""
-                    if isinstance(value, ast.Call):
-                        constructor = _resolve(value.func, bindings)
-                        if constructor == "sqlalchemy.Table":
-                            items.append(self._table(workspace, path, value, bindings))
-                        if constructor in BASE_FACTORIES and (value.args or value.keywords):
-                            items.append(self._warning(
-                                workspace, path, node.lineno, "Customized declarative base skipped",
-                            ))
-                        for target in targets:
-                            if isinstance(target, ast.Name) and constructor in {
-                                "fastapi.FastAPI", "fastapi.APIRouter",
-                            }:
-                                prefix = _keyword(value, "prefix")
-                                receivers[target.id] = (
-                                    constructor,
-                                    "" if prefix is None and not _expanded(value)
-                                    else _string(prefix),
-                                )
-                    for target in targets:
-                        for name in _assigned_names(target):
-                            bindings.pop(name, None)
-                            orm_bases.discard(name)
-                            if (
-                                isinstance(target, ast.Name) and constructor in BASE_FACTORIES
-                                and not value.args and not value.keywords
-                            ):
-                                orm_bases.add(name)
-                            if not (isinstance(value, ast.Call) and _resolve(value.func, bindings)
-                                    in {"fastapi.FastAPI", "fastapi.APIRouter"}):
-                                receivers.pop(name, None)
-                elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
-                    items.extend(self._routes(workspace, path, node, receivers))
-                    bindings.pop(node.name, None)
-                    receivers.pop(node.name, None)
-                    orm_bases.discard(node.name)
-                elif isinstance(node, ast.ClassDef):
-                    model = declarative_model(node, bindings, orm_bases)
-                    if model.details is not None:
-                        details = model.details
-                        items.append(self._fact(
-                            workspace, path, node.lineno, "database_table",
-                            f"Declared SQLAlchemy model: {node.name} -> {details['table']}",
-                            details,
-                        ))
-                    if model.warning:
-                        items.append(self._warning(workspace, path, node.lineno, model.warning))
-                    orm_bases.discard(node.name)
-                    if model.is_base:
-                        orm_bases.add(node.name)
-                    bindings.pop(node.name, None)
-                    receivers.pop(node.name, None)
-                else:
-                    # Branches, augmented assignment and deletion may replace
-                    # a receiver. Do not guess the environment after them.
-                    for name in _bound_names(node):
-                        if name is None:
-                            bindings.clear()
-                            receivers.clear()
-                            orm_bases.clear()
-                        else:
-                            bindings.pop(name, None)
-                            receivers.pop(name, None)
-                            orm_bases.discard(name)
+            items.extend(self._declarations(workspace, path, tree))
         items.extend(PythonRouteComposer().compose(workspace, trees, items))
+        return PythonContractAnalysis(tuple(items))
+
+    def _declarations(self, workspace, path, tree):
+        """Shared AST-only declaration extraction; no file operations."""
+        items = []
+        bindings: dict[str, str] = {}
+        receivers: dict[str, tuple[str, str | None]] = {}
+        orm_bases: set[str] = set()
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    receivers.pop(alias.asname or alias.name.split(".")[0], None)
+                    orm_bases.discard(alias.asname or alias.name.split(".")[0])
+                    bindings[alias.asname or alias.name.split(".")[0]] = (
+                        alias.name if alias.asname else alias.name.split(".")[0]
+                    )
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if alias.name == "*":
+                        bindings.clear()
+                        receivers.clear()
+                        orm_bases.clear()
+                        continue
+                    receivers.pop(alias.asname or alias.name, None)
+                    orm_bases.discard(alias.asname or alias.name)
+                    bindings.pop(alias.asname or alias.name, None)
+                    if node.module and not node.level:
+                        bindings[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+            elif isinstance(node, ast.Assign | ast.AnnAssign):
+                value = node.value
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                constructor = ""
+                if isinstance(value, ast.Call):
+                    constructor = _resolve(value.func, bindings)
+                    if constructor == "sqlalchemy.Table":
+                        items.append(self._table(workspace, path, value, bindings))
+                    if constructor in BASE_FACTORIES and (value.args or value.keywords):
+                        items.append(self._warning(
+                            workspace, path, node.lineno, "Customized declarative base skipped",
+                        ))
+                    for target in targets:
+                        if isinstance(target, ast.Name) and constructor in {
+                            "fastapi.FastAPI", "fastapi.APIRouter",
+                        }:
+                            prefix = _keyword(value, "prefix")
+                            receivers[target.id] = (
+                                constructor,
+                                "" if prefix is None and not _expanded(value)
+                                else _string(prefix),
+                            )
+                for target in targets:
+                    for name in _assigned_names(target):
+                        bindings.pop(name, None)
+                        orm_bases.discard(name)
+                        if (
+                            isinstance(target, ast.Name) and constructor in BASE_FACTORIES
+                            and not value.args and not value.keywords
+                        ):
+                            orm_bases.add(name)
+                        if not (isinstance(value, ast.Call) and _resolve(value.func, bindings)
+                                in {"fastapi.FastAPI", "fastapi.APIRouter"}):
+                            receivers.pop(name, None)
+            elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                items.extend(self._routes(workspace, path, node, receivers))
+                bindings.pop(node.name, None)
+                receivers.pop(node.name, None)
+                orm_bases.discard(node.name)
+            elif isinstance(node, ast.ClassDef):
+                model = declarative_model(node, bindings, orm_bases)
+                if model.details is not None:
+                    details = model.details
+                    items.append(self._fact(
+                        workspace, path, node.lineno, "database_table",
+                        f"Declared SQLAlchemy model: {node.name} -> {details['table']}",
+                        details,
+                    ))
+                if model.warning:
+                    items.append(self._warning(workspace, path, node.lineno, model.warning))
+                orm_bases.discard(node.name)
+                if model.is_base:
+                    orm_bases.add(node.name)
+                bindings.pop(node.name, None)
+                receivers.pop(node.name, None)
+            else:
+                # Branches, augmented assignment and deletion may replace
+                # a receiver. Do not guess the environment after them.
+                for name in _bound_names(node):
+                    if name is None:
+                        bindings.clear()
+                        receivers.clear()
+                        orm_bases.clear()
+                    else:
+                        bindings.pop(name, None)
+                        receivers.pop(name, None)
+                        orm_bases.discard(name)
+        return items
+
+    def analyze_view(self, workspace, view):
+        from pathlib import PurePosixPath
+
+        from Sprout.workspace.authorized_content import _EvidenceLabel, evidence_workspace
+
+        view.check(workspace.id)
+        logical = evidence_workspace(view)
+        trees, items = {}, []
+        for entry in view.entries:
+            view.check()
+            if (entry.kind != ResourceKind.SOURCE
+                    or PurePosixPath(entry.relative_path).suffix != ".py"):
+                continue
+            if len(entry.data) > self.max_source_bytes:
+                raise ValueError("view_python_contract_budget")
+            path = _EvidenceLabel(entry.relative_path)
+            try:
+                tree = ast.parse(entry.data, filename=entry.relative_path)
+            except (SyntaxError, ValueError, UnicodeError):
+                items.append(self._warning(logical, path, 0, "Captured source could not be parsed"))
+                continue
+            trees[path] = tree
+            items.extend(self._declarations(logical, path, tree))
+        items.extend(PythonRouteComposer().compose(logical, trees, items))
+        view.check()
         return PythonContractAnalysis(tuple(items))
 
     def _routes(self, workspace, path, function, receivers):

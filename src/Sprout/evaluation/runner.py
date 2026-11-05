@@ -13,13 +13,18 @@ import sys
 import tempfile
 import time
 from collections import Counter
-from dataclasses import asdict, replace
+from collections.abc import Callable
+from dataclasses import asdict
 from hashlib import sha256
 from pathlib import Path
 
 from Sprout.evaluation.fixtures import ANALYSIS_FILES, CASES, EvalCase
 from Sprout.evaluation.model import ScriptedModel
 from Sprout.execution.git_env import git_args, git_env
+from Sprout.gateway.identity import Principal
+from Sprout.task.models import DelegationScope
+from Sprout.task.paths import scope_path
+from Sprout.workspace.models import Workspace
 
 # The oracle lives outside the model's workspace and ignores pytest/conftest.
 # It is independent expected-output evidence, not an OS security sandbox.
@@ -206,10 +211,28 @@ def _require(condition, message):
         raise AssertionError(message)
 
 
-async def _analysis(runtime, workspace, case, directory):
+async def _analysis(runtime, workspace, case, directory, *, principal=None):
+    from dataclasses import replace
+
     from Sprout.workspace.serialization import to_jsonable
 
-    first = await runtime.analyze_workspace(workspace.id)
+    async def fresh(host):
+        _eval_subject(principal)
+        actor = principal
+        # First-party fixed fixture manifest; not model/case metadata authority.
+        paths = tuple(ANALYSIS_FILES) + ("pyproject.toml",)
+        task = await host.create_task(
+            workspace.id, "analyze fixed evaluation resources", actor=actor,
+            source=actor.source, execution_mode="read_only",
+            delegation_scope=DelegationScope(
+                allowed_paths=tuple(str(workspace.root / p) for p in paths),
+                allowed_actions=frozenset({"tool.invoke", "file.read"}),
+            ), metadata={"required_paths": list(paths)},
+        )
+        return await host.analyze_workspace(
+            workspace.id, principal=actor, analysis_task=task)
+
+    first = await fresh(runtime)
     _json(directory / "analysis.json", to_jsonable(first))
     if case.id == "A01":
         _require(
@@ -246,29 +269,99 @@ async def _analysis(runtime, workspace, case, directory):
     await runtime.stop()
     restarted = _runtime(directory, ScriptedModel(case))
     try:
-        restored = await restarted.analyze_workspace(workspace.id)
+        restored = await fresh(restarted)
+        def graph_evidence(graph):
+            # Fresh capture creates fresh EvidenceRef UUIDs. Compare the entire
+            # semantic graph/evidence, not the incidental per-capture UUID.
+            return replace(graph, edges=tuple(replace(edge, evidence_refs=tuple(
+                replace(ref, id="") for ref in edge.evidence_refs)) for edge in graph.edges))
+
         _require(
-            first.graph == restored.graph and first.knowledge == restored.knowledge,
-            "persisted analysis differs after restart",
+            graph_evidence(first.graph) == graph_evidence(restored.graph)
+            and first.knowledge == restored.knowledge,
+            "fresh authorized analysis differs after restart",
         )
     finally:
         await restarted.stop()
     return {"analysis_verified": True, "task_status": None, "verification": None}
 
 
-async def _coding(runtime, workspace, case, directory, model):
+def _eval_subject(principal):
+    if (not isinstance(principal, Principal) or principal.authenticated is not True
+            or not principal.user_id or not principal.source):
+        raise PermissionError("eval_subject_unavailable")
+
+
+async def _eval_scope(runtime, workspace, principal, scope):
+    """Validate host inputs using existing R03 binding, never case/model data."""
+    _eval_subject(principal)
+    authoritative = await runtime.get_workspace(workspace.id)
+    if (authoritative is None or authoritative.root != workspace.root
+            or authoritative.id != workspace.id):
+        raise PermissionError("eval_workspace_unavailable")
+    if (not isinstance(scope, DelegationScope) or not scope.allowed_paths
+            or not scope.allowed_actions or scope.is_expired()):
+        raise PermissionError("eval_scope_unavailable")
+    try:
+        bound = scope.bind_paths(str(authoritative.root))
+        root = scope_path(str(authoritative.root))
+        paths = tuple(scope_path(path) for path in bound.allowed_paths)
+        if (root is None or any(path is None or not root.contains(path) or path == root
+                                for path in paths)):
+            raise ValueError("Nonempty workspace resource selection required")
+        if any(not bound.permits(action, path.text())
+               for path in paths for action in ("file.read", "tool.invoke")):
+            raise ValueError("Host scope does not permit CODE input access")
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise PermissionError("eval_scope_unavailable") from exc
+    return bound
+
+
+async def _eval_task_binding(runtime, task, workspace, principal, scope):
+    scope = await _eval_scope(runtime, workspace, principal, scope)
+    current = await runtime.get_task(task.id)
+    if (current is None or current.id != task.id or current.workspace_id != workspace.id
+            or current.actor != principal
+            or current.source != principal.source or current.delegation_scope != scope):
+        raise PermissionError("eval_task_binding_changed")
+    return current
+
+
+def _eval_preparation_inputs(workspace, principal, case):
+    """First-party fixture input contract; never inferred by walking a Scope.
+
+    Selection does not grant authority: Runtime still checks every member.
+    Future app/helper files and generated test/example directories are outputs.
+    """
+    _eval_subject(principal)
+    if not any(case is known for known in CASES) or case.mode in {"analysis", "security"}:
+        raise PermissionError("eval_preparation_inputs_unavailable")
+    paths = ("pyproject.toml", "pytest.ini", "conftest.py",
+             "src/__init__.py", "tests/test_regression.py")
+    return (*paths, "src/app.py") if case.id == "C01" else paths
+
+
+async def _coding(runtime, workspace, case, directory, model, *,
+                  principal=None, delegation_scope=None, preparation_paths=None):
+    scope = await _eval_scope(runtime, workspace, principal, delegation_scope)
+    paths = (_eval_preparation_inputs(workspace, principal, case)
+             if preparation_paths is None else preparation_paths)
     repo = workspace.root
     baseline = await asyncio.to_thread(_oracle, directory, repo, case)
     _json(directory / "baseline.json", baseline)
     _require(baseline["exit_code"] == 1, "baseline must fail before the fixture implementation")
-    task = await runtime.create_task_planned(workspace.id, case.instruction, source="cli")
+    task = await runtime.create_task_planned(
+        workspace.id, case.instruction, actor=principal, source=principal.source,
+        delegation_scope=scope, preparation_paths=paths)
+    task = await _eval_task_binding(runtime, task, workspace, principal, scope)
     await runtime.execute(task)
-    if case.mode == "restart":
-        waiting = await runtime.get_task(task.id)
-        _require(waiting.status.value == "waiting_approval", "restart fixture never waited")
-        await runtime.stop()
-        runtime = _runtime(directory, model)
     try:
+        if case.mode == "restart":
+            waiting = await runtime.get_task(task.id)
+            _require(waiting.status.value == "waiting_approval", "restart fixture never waited")
+            await runtime.stop()
+            runtime = _runtime(directory, model)
+        await _eval_task_binding(runtime, task, workspace, principal, scope)
         current = await _drive(runtime, task.id, stop_at_proposal=case.mode == "force")
         if case.mode == "force":
             proposals = await runtime.list_change_proposals(task.id)
@@ -349,17 +442,36 @@ async def _coding(runtime, workspace, case, directory, model):
             "applied_revision": after["revision"],
         }
     finally:
-        await runtime.stop()
+        # A refused legacy gate is evidence too. Previously the exception from
+        # _drive discarded the actual Task/Guard records from the eval report.
+        try:
+            current = await runtime.get_task(task.id)
+            _json(directory / "task.json", asdict(current))
+            _json(directory / "nodes.json", [asdict(n) for n in
+                await runtime.storage.metadata.list_execution_nodes(task.id)])
+            _json(directory / "proposals.json", [asdict(p) for p in
+                await runtime.list_change_proposals(task.id)])
+            _json(directory / "verification.json", await runtime.get_verification_report(task.id))
+        finally:
+            await runtime.stop()
 
 
-async def _security(runtime, workspace, case, directory):
+async def _security(runtime, workspace, case, directory, *, principal=None):
     from Sprout.execution.file_broker import FileBroker
     from Sprout.execution.models import SandboxRef
+    from Sprout.message.models import Message
     from Sprout.security.access import AccessDecision, PolicyDecision
 
+    _eval_subject(principal)
+    session = await runtime._sessions.resolve(
+        Message(content=case.instruction, channel=principal.source), principal=principal)
     before = _git(workspace.root, "rev-parse", "HEAD")
-    task = await runtime.create_task_planned(
-        workspace.id, case.instruction, source="cli", execution_mode="read_only"
+    task = await runtime.create_task(
+        workspace.id, case.instruction, actor=principal, source=principal.source,
+        execution_mode="read_only",
+        delegation_scope=DelegationScope(allowed_paths=(str(workspace.root / "app.py"),),
+            allowed_actions=frozenset({"file.read", "tool.invoke"})),
+        metadata={"session_id": session.id, "required_paths": ["app.py"]},
     )
     await runtime.execute(task)
     _require((workspace.root / "app.py").read_text() == "value = 1\n", "read-only source changed")
@@ -374,60 +486,28 @@ async def _security(runtime, workspace, case, directory):
         SandboxRef(id="fixture", kind="fixture", root=workspace.root), "app.py"
     )
     _require(not denied.wrote and (workspace.root / "app.py").exists(), "denied deletion executed")
-    from Sprout.evaluation.fixtures import GOOD, NORMAL
-
-    delete_case = replace(
-        case,
-        mode="delete",
-        initial={"obsolete.py": "value = 1\n"},
-        edits={"app.py": GOOD},
-        acceptance=NORMAL,
-        instruction="Implement src.app.clamp and remove src/obsolete.py.",
-    )
-    delete_directory = directory / "delete-flow"
-    repo = await asyncio.to_thread(_repo, delete_directory, delete_case)
-    delete_runtime = _runtime(delete_directory, ScriptedModel(delete_case))
-    try:
-        opened = await delete_runtime.open_workspace(repo)
-        delete_task = await delete_runtime.create_task_planned(
-            opened.id, delete_case.instruction, source="cli"
-        )
-        await delete_runtime.execute(delete_task)
-        deletion = None
-        for _ in range(20):
-            pending = [
-                item
-                for item in await delete_runtime.pending_approvals()
-                if item.task_id == delete_task.id
-            ]
-            deletion = next((item for item in pending if item.tool == "file_delete"), None)
-            if deletion is not None:
-                break
-            _require(bool(pending), "deletion approval was never reached")
-            await delete_runtime.decide_approval(
-                pending[0].id, True, decided_by="eval-fixture-operator"
-            )
-        _require(deletion is not None, "deletion fixture exceeded approval rounds")
-        await delete_runtime.decide_approval(deletion.id, False, decided_by="eval-fixture-operator")
-        parked = await delete_runtime.get_task(delete_task.id)
-        _require(
-            parked.status.value == "waiting_approval", "denied deletion did not remain waiting"
-        )
-        _require((repo / "src/obsolete.py").exists(), "rejected deletion changed the project")
-        _json(delete_directory / "denied-task.json", asdict(parked))
-        await delete_runtime.cancel_task(delete_task.id)
-    finally:
-        await delete_runtime.stop()
+    # Deletion delivery is no longer a supported Apply operation. Do not
+    # resurrect an auto-commit task merely to test the FileBroker's DENY.
+    _require(not await runtime.pending_approvals(), "read-only injection created an approval")
+    _json(directory / "task.json", asdict(await runtime.get_task(task.id)))
+    _json(directory / "nodes.json", [asdict(n) for n in
+        await runtime.storage.metadata.list_execution_nodes(task.id)])
+    _json(directory / "denied-delete.json", asdict(denied))
     return {
         "task_id": task.id,
         "task_status": (await runtime.get_task(task.id)).status.value,
         "verification": None,
         "security_violations": 0,
-        "scope": "read-only injection; denied deletion stays waiting until explicit cancellation",
+        "scope": "owned read-only Task injection; FileBroker DENY has zero deletion effects",
     }
 
 
-async def run_suite(output: Path | None = None, *, case_ids: tuple[str, ...] = ()) -> dict:
+async def run_suite(
+    output: Path | None = None, *, case_ids: tuple[str, ...] = (),
+    principal: Principal | None = None,
+    scope_provider: Callable[[Workspace, Principal], DelegationScope] | None = None,
+    preparation_provider: Callable | None = None,
+) -> dict:
     """Create a new evidence directory; never evaluate caller-supplied project code."""
     selected = [case for case in CASES if not case_ids or case.id in case_ids]
     unknown = set(case_ids) - {case.id for case in CASES}
@@ -437,6 +517,11 @@ async def run_suite(output: Path | None = None, *, case_ids: tuple[str, ...] = (
         raise ValueError(
             "Offline eval requires TEMPORAL_HOST to be unset; no remote workflow is submitted"
         )
+    if any(case.mode != "security" for case in selected):
+        _eval_subject(principal)
+    if any(case.mode not in {"analysis", "security"} for case in selected):
+        if not callable(scope_provider):
+            raise PermissionError("eval_scope_unavailable")
     if importlib.util.find_spec("pytest") is None:
         raise ValueError(
             "Offline eval needs the dev pytest dependency; "
@@ -466,17 +551,35 @@ async def run_suite(output: Path | None = None, *, case_ids: tuple[str, ...] = (
             "cost_usd": 0.0,
         }
         try:
-            repo = await asyncio.to_thread(_repo, directory, case)
             model = ScriptedModel(case)
             runtime = _runtime(directory, model)
-            workspace = await runtime.open_workspace(repo)
+            scope = None
+            if case.mode not in {"analysis", "security"}:
+                # Register the actual empty fixture root, obtain host authority,
+                # then allow fixture setup. Invalid bindings never reach Git.
+                repo = directory / "repo"
+                repo.mkdir()
+                workspace = await runtime.open_workspace(repo)
+                scope = await _eval_scope(runtime, workspace, principal,
+                                          scope_provider(workspace, principal))
+                prepared = await asyncio.to_thread(_repo, directory, case)
+                if prepared.resolve() != workspace.root.resolve():
+                    raise PermissionError("eval_workspace_unavailable")
+                workspace = await runtime.open_workspace(repo, workspace_id=workspace.id)
+            else:
+                repo = await asyncio.to_thread(_repo, directory, case)
+                workspace = await runtime.open_workspace(repo)
             result["failure_stage"] = case.mode
             if case.mode == "analysis":
-                evidence = await _analysis(runtime, workspace, case, directory)
+                evidence = await _analysis(
+                    runtime, workspace, case, directory, principal=principal)
             elif case.mode == "security":
-                evidence = await _security(runtime, workspace, case, directory)
+                evidence = await _security(runtime, workspace, case, directory, principal=principal)
             else:
-                evidence = await _coding(runtime, workspace, case, directory, model)
+                evidence = await _coding(runtime, workspace, case, directory, model,
+                    principal=principal, delegation_scope=scope,
+                    preparation_paths=(preparation_provider or _eval_preparation_inputs)(
+                        workspace, principal, case))
             result.update(evidence, scenario_passed=True, failure_stage=None)
         except Exception as exc:
             result.update(error=f"{type(exc).__name__}: {exc}")

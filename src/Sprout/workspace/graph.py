@@ -49,6 +49,167 @@ class WorkspaceGraph:
 class WorkspaceGraphBuilder:
     max_source_bytes: int = 100_000
 
+    def build_view(self, workspace, view):
+        """Build a graph exclusively from captured labels and bytes."""
+        from pathlib import PurePosixPath
+
+        view.check(workspace.id)
+        files = {ref.path: WorkspaceNode(
+            id=self._node_id(workspace.id, ref.path), resource=ref, kind=ref.kind.value,
+            name=ref.path,
+        ) for ref in view.resources()}
+        nodes, edges, trees = list(files.values()), [], {}
+        frontend = {}
+        modules = {}
+        for path, node in files.items():
+            label = PurePosixPath(path)
+            if label.suffix == ".py":
+                parts = list(label.with_suffix("").parts)
+                if parts[-1] == "__init__":
+                    parts.pop()
+                for variant in (parts, parts[1:] if parts and parts[0] == "src" else parts):
+                    modules.setdefault(".".join(variant), set()).add(path)
+            parent = label.parent.as_posix()
+            parents = {item.name for item in nodes if item.kind == "module"}
+            if parent != "." and parent not in parents:
+                nodes.append(WorkspaceNode(id=f"{workspace.id}:module:{parent}", kind="module",
+                                           name=parent, granularity="module"))
+            if parent != ".":
+                edges.append(WorkspaceEdge(
+                    id=f"{workspace.id}:module:{parent}->{node.id}",
+                    source=f"{workspace.id}:module:{parent}", target=node.id, relation="contains",
+                ))
+            directories = label.parts[:-1]
+            category = next((kind for name, kind in {
+                "components": "component", "pages": "page", "routes": "route",
+                "hooks": "hook", "stores": "store",
+            }.items() if name in directories), "")
+            if category and label.suffix in {".js", ".jsx", ".ts", ".tsx"}:
+                qualified = label.with_suffix("").as_posix()
+                item = WorkspaceNode(id=f"{workspace.id}:frontend:{qualified}",
+                                     resource=node.resource, kind=category, name=qualified,
+                                     qualified_name=qualified, granularity="symbol")
+                nodes.append(item)
+                frontend.setdefault(qualified, []).append(item)
+                edges.append(self._defines_edge(node, item))
+            asset = next((kind for name, kind in {
+                "api": "api_route", "endpoints": "api_route", "routes": "api_route",
+                "models": "data_asset", "schema": "data_asset", "migrations": "data_asset",
+                "config": "config_asset", "settings": "config_asset",
+            }.items() if name in directories), "")
+            if asset:
+                item = WorkspaceNode(id=f"{workspace.id}:runtime:{path}", resource=node.resource,
+                                     kind=asset, name=path, granularity="runtime_asset")
+                nodes.append(item)
+                edges.append(self._defines_edge(node, item))
+        for entry in view.entries:
+            view.check()
+            path, data = entry.relative_path, entry.data
+            node = files[path]
+            label = PurePosixPath(path)
+            if label.suffix not in {".py", *_GENERIC_SYMBOL_SUFFIXES}:
+                continue
+            if len(data) > self.max_source_bytes:
+                raise ValueError("view_graph_source_budget")
+            symbols = []
+            if label.suffix == ".py":
+                try:
+                    tree = ast.parse(data, filename=path)
+                except (SyntaxError, ValueError, UnicodeError):
+                    continue  # Contract analyzer emits a captured-source warning.
+                trees[path] = tree
+                for item in tree.body:
+                    if isinstance(item, ast.ClassDef):
+                        symbols.append((item.name, "class", item.lineno))
+                        symbols.extend((f"{item.name}.{member.name}", "method", member.lineno)
+                                       for member in item.body
+                                       if isinstance(
+                                           member, ast.FunctionDef | ast.AsyncFunctionDef))
+                    elif isinstance(item, ast.FunctionDef | ast.AsyncFunctionDef):
+                        symbols.append((item.name, "test" if item.name.startswith("test_")
+                                        else "function", item.lineno))
+            else:
+                for number, line in enumerate(entry.text().splitlines(), 1):
+                    for pattern, kind in _generic_patterns(label.suffix):
+                        match = pattern.search(line)
+                        if match:
+                            symbols.append((match.group(1), kind, number))
+            for name, kind, line in symbols:
+                symbol = self._symbol_node(workspace, node, name, line, kind)
+                nodes.append(symbol)
+                edges.append(self._defines_edge(node, symbol))
+        for candidates in frontend.values():
+            for source in candidates:
+                entry = view.get(source.resource.path)
+                imports = re.findall(r"\b(?:from|import)\s+[\"']([^\"']+)[\"']", entry.text())
+                for name in imports:
+                    if name.startswith("@/"):
+                        parts, tail = ["src"], name[2:]
+                    elif name.startswith("."):
+                        parts = list(PurePosixPath(entry.relative_path).parent.parts)
+                        tail = name
+                    else:
+                        continue
+                    # Resolve references lexically within the captured graph,
+                    # not a second filesystem/Scope path resolver.
+                    for part in tail.split("/"):
+                        if part == "..":
+                            if not parts:
+                                break
+                            parts.pop()
+                        elif part not in {"", "."}:
+                            parts.append(part)
+                    else:
+                        target_name = PurePosixPath(*parts)
+                        if target_name.suffix in {".js", ".jsx", ".ts", ".tsx"}:
+                            target_name = target_name.with_suffix("")
+                        targets = frontend.get(target_name.as_posix(), [])
+                        if len(targets) == 1 and targets[0].id != source.id:
+                            target = targets[0]
+                            edges.append(WorkspaceEdge(
+                                id=self._edge_id(source.id, target.id, "component_uses"),
+                                source=source.id, target=target.id, relation="component_uses",
+                                evidence=(entry.relative_path, target.resource.path),
+                            ))
+        for path, tree in trees.items():
+            view.check()
+            source = files[path]
+            label = PurePosixPath(path)
+            package = list(label.with_suffix("").parts)
+            if label.name != "__init__.py":
+                package.pop()
+            for item in ast.walk(tree):
+                imports = []
+                if isinstance(item, ast.Import):
+                    imports = [alias.name for alias in item.names]
+                elif isinstance(item, ast.ImportFrom):
+                    if item.level:
+                        if item.level > len(package):
+                            continue
+                        prefix = package[:len(package) - item.level + 1]
+                        module = ".".join([*prefix, *([item.module] if item.module else [])])
+                    else:
+                        module = item.module or ""
+                    imports = [module, *(module + "." + alias.name for alias in item.names)]
+                for module in imports:
+                    candidates = modules.get(module, set())
+                    if len(candidates) == 1:
+                        target = files[next(iter(candidates))]
+                        if source.id != target.id:
+                            edges.append(WorkspaceEdge(
+                                id=self._edge_id(source.id, target.id, "imports"),
+                                source=source.id, target=target.id, relation="imports",
+                                evidence=(path, target.resource.path),
+                            ))
+            # Resolve local symbols only; don't infer a hidden module's exports.
+            local = {node.qualified_name: node for node in nodes
+                     if node.resource is not None and node.resource.path == path
+                     and node.qualified_name}
+            self._collect_symbol_relations(tree.body, source, local, edges)
+        view.check()
+        return WorkspaceGraph(workspace.id, tuple(nodes),
+                              tuple({edge.id: edge for edge in edges}.values()))
+
     def build(self, workspace: Workspace, plan: ReadPlan) -> WorkspaceGraph:
         file_nodes = tuple(
             WorkspaceNode(

@@ -14,6 +14,20 @@ from scripts.ci_support.pytest_gates import gates_for
 pytest_plugins = ["pytester"]
 
 
+def test_pytest_scratch_is_unique_and_location_is_preserved(tmp_path):
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    a = ci_baseline.pytest_scratch(first)
+    b = ci_baseline.pytest_scratch(second)
+    assert a != b
+    assert json.loads((first / "pytest-scratch.json").read_text())["path"] == str(a)
+    assert json.loads((second / "pytest-scratch.json").read_text())["retained"] is True
+    if os.name == "nt":
+        assert a.is_dir() and b.is_dir()
+        assert not a.is_relative_to(first) and not b.is_relative_to(second)
+
+
 @pytest.mark.parametrize("directory", ["scripts", "src/Sprout/tests/fixtures", ".github/workflows"])
 def test_snapshot_excludes_untracked_sensitive_files_without_deleting_them(
     tmp_path, monkeypatch, directory

@@ -9,6 +9,7 @@ from Sprout.runtime.factory import create_runtime
 from Sprout.runtime.locks import WorkspaceLockManager
 from Sprout.runtime.queue import TaskQueue
 from Sprout.task.models import Task
+from Sprout.tests.readonly_host_fixtures import authorized_read_host as authorized_read_host
 
 
 def test_task_queue_is_fifo() -> None:
@@ -47,7 +48,7 @@ def test_workspace_lock_manager_serializes_same_workspace() -> None:
     asyncio.run(run())
 
 
-def test_runtime_worker_processes_queued_tasks(tmp_path) -> None:
+def test_runtime_worker_processes_queued_tasks(tmp_path, authorized_read_host) -> None:
     (tmp_path / "pyproject.toml").write_text(
         "[project]\nname='demo'\nversion='0.1.0'\n",
         encoding="utf-8",
@@ -56,6 +57,8 @@ def test_runtime_worker_processes_queued_tasks(tmp_path) -> None:
     (tmp_path / "src" / "main.py").write_text("def main(): pass\n", encoding="utf-8")
 
     settings = default_settings()
+    settings.model.provider = "echo"
+    settings.model.model = "echo-1"
     settings.storage.operational = "memory://"
     settings.storage.knowledge = "memory://"
     settings.storage.observations.enabled = False
@@ -66,8 +69,10 @@ def test_runtime_worker_processes_queued_tasks(tmp_path) -> None:
     async def run() -> None:
         runtime = create_runtime(settings, task_queue=TaskQueue())
         workspace = await runtime.open_workspace(tmp_path)
+        principal, scope = authorized_read_host(tmp_path / "src/main.py", source="queue-host")
         task = await runtime.create_task(
             workspace.id, "explain this project", execution_mode="read_only",
+            actor=principal, source=principal.source, delegation_scope=scope,
         )
         runtime.start_worker()
         await runtime.submit_task(task)

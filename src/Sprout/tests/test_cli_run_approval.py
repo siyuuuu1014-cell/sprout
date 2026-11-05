@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
 
 from Sprout.execution.process_broker import ProcessBroker
 from Sprout.security.layer import SecurityLayer
@@ -11,6 +15,16 @@ from Sprout.storage.local.memory import MemoryOperationalStore
 from Sprout.tools.executor import ToolExecutor
 from Sprout.tools.registry import ToolRegistry
 from Sprout.tools.system_tools import CliRunTool
+
+
+@pytest.fixture(autouse=True)
+def simulated_child(monkeypatch):
+    """Keep real policy/approval/broker decisions; fake only final process I/O."""
+    async def spawn(*command, **kwargs):
+        assert command == (sys.executable, "-c", "print(1)")
+        return SimpleNamespace(returncode=0, communicate=AsyncMock(return_value=(b"1\n", b"")))
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", spawn)
 
 
 def _layer() -> SecurityLayer:

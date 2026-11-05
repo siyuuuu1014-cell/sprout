@@ -221,6 +221,30 @@ class ReplayRunner:
                 creator=creator_record(creator),
                 coding=coding,
             )
+            from Sprout.message.models import Message
+            from Sprout.task.models import DelegationScope
+            from Sprout.workspace.authorized_content import relative_label
+
+            session = await isolated._sessions.resolve(
+                Message(content=task.instruction, channel=creator.source), principal=creator)
+            metadata["session_id"] = session.id
+            replay_scope = None
+            if task.execution_mode == "read_only":
+                paths = metadata.get("required_paths")
+                if not isinstance(paths, (list, tuple)) or not paths or len(paths) > 64:
+                    return waiting("Read-only replay requires explicit source file selection")
+                paths = tuple(relative_label(path) for path in paths)
+                source_scope = task.delegation_scope.bind_paths(str(workspace.root))
+                if source_scope.is_expired() or any(
+                    not source_scope.permits(action, str(workspace.root / path))
+                    for path in paths for action in ("file.read", "tool.invoke")
+                ):
+                    return waiting("Read-only replay source selection is outside Scope")
+                replay_scope = DelegationScope(
+                    allowed_paths=tuple(str(repo / path) for path in paths),
+                    allowed_actions=frozenset({"file.read", "tool.invoke"}),
+                    expires_at=source_scope.expires_at,
+                )
             fresh = await isolated.create_task(
                 replay_workspace.id,
                 task.instruction,
@@ -229,6 +253,7 @@ class ReplayRunner:
                 budget=task.budget,
                 metadata=metadata,
                 execution_mode=task.execution_mode,
+                **({"delegation_scope": replay_scope} if replay_scope is not None else {}),
             )
             if task.execution_mode == "code":
                 from Sprout.execution.docker_verification import (

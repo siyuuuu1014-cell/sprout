@@ -17,7 +17,9 @@ from Sprout.workspace.models import ResourceRef
 class ActionType(StrEnum):
     TOOL_INVOKE = "tool.invoke"
     FILE_READ = "file.read"
+    DIRECTORY_LIST = "directory.list"
     FILE_WRITE = "file.write"
+    FILE_APPLY = "file.apply"
     FILE_DELETE = "file.delete"
     PROCESS_RUN = "process.run"
     NETWORK_GET = "network.get"

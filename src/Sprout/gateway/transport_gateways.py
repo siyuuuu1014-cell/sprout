@@ -7,6 +7,7 @@ from Sprout.gateway.runtime_gateway import RuntimeGateway
 from Sprout.gateway.task_adapter import GatewayRequest, GatewayResponse
 from Sprout.message.models import Message
 from Sprout.runtime.runtime import Runtime
+from Sprout.task.models import DelegationScope
 
 
 class CLIGateway:
@@ -20,8 +21,20 @@ class CLIGateway:
         workspace_id: str = "",
         user_id: str = "cli-user",
         execution_mode: str = "code",
+        principal: Principal | None = None,
+        delegation_scope: DelegationScope | None = None,
     ) -> GatewayResponse:
+        from Sprout.gateway.local_identity import current_cli_principal
         from Sprout.gateway.temporal_bridge import submit_gateway_workflow
+
+        principal = principal if principal is not None else current_cli_principal()
+
+        if workspace_id:
+            if principal is None or principal.authenticated is not True or not principal.source:
+                raise PermissionError("gateway_authenticated_subject_required")
+            if (delegation_scope is None or not delegation_scope.allowed_paths
+                    or delegation_scope.is_expired()):
+                raise PermissionError("gateway_resource_scope_required")
 
         await submit_gateway_workflow(
             {
@@ -37,7 +50,9 @@ class CLIGateway:
                 transport="cli",
                 execution_mode=execution_mode,
                 instruction=instruction,
-                caller=Principal(user_id=user_id),
+                caller=principal if principal is not None else Principal(user_id=user_id),
+                delegation_scope=(delegation_scope if delegation_scope is not None
+                                  else DelegationScope()),
                 workspace_id=workspace_id,
             )
         )
@@ -69,8 +84,17 @@ class WebGateway:
         workspace_id: str = "",
         user_id: str = "web-user",
         execution_mode: str = "code",
+        principal: Principal | None = None,
+        delegation_scope: DelegationScope | None = None,
     ) -> GatewayResponse:
         from Sprout.gateway.temporal_bridge import submit_gateway_workflow
+
+        if workspace_id:
+            if principal is None or principal.authenticated is not True or not principal.source:
+                raise PermissionError("gateway_authenticated_subject_required")
+            if (delegation_scope is None or not delegation_scope.allowed_paths
+                    or delegation_scope.is_expired()):
+                raise PermissionError("gateway_resource_scope_required")
 
         await submit_gateway_workflow(
             {
@@ -86,7 +110,9 @@ class WebGateway:
                 transport="web",
                 execution_mode=execution_mode,
                 instruction=instruction,
-                caller=Principal(user_id=user_id),
+                caller=principal if principal is not None else Principal(user_id=user_id),
+                delegation_scope=(delegation_scope if delegation_scope is not None
+                                  else DelegationScope()),
                 workspace_id=workspace_id,
             )
         )
@@ -112,8 +138,17 @@ class MCPGateway:
         workspace_id: str = "",
         user_id: str = "mcp-client",
         execution_mode: str = "code",
+        principal: Principal | None = None,
+        delegation_scope: DelegationScope | None = None,
     ) -> GatewayResponse:
         from Sprout.gateway.temporal_bridge import submit_gateway_workflow
+
+        if workspace_id:
+            if principal is None or principal.authenticated is not True or not principal.source:
+                raise PermissionError("gateway_authenticated_subject_required")
+            if (delegation_scope is None or not delegation_scope.allowed_paths
+                    or delegation_scope.is_expired()):
+                raise PermissionError("gateway_resource_scope_required")
 
         await submit_gateway_workflow(
             {
@@ -129,7 +164,9 @@ class MCPGateway:
                 transport="mcp",
                 execution_mode=execution_mode,
                 instruction=instruction,
-                caller=Principal(user_id=user_id),
+                caller=principal if principal is not None else Principal(user_id=user_id),
+                delegation_scope=(delegation_scope if delegation_scope is not None
+                                  else DelegationScope()),
                 workspace_id=workspace_id,
             )
         )

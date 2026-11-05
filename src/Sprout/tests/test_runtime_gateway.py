@@ -9,9 +9,10 @@ from Sprout.config.loader import default_settings
 from Sprout.gateway.runtime_gateway import RuntimeGateway
 from Sprout.gateway.task_adapter import GatewayRequest
 from Sprout.runtime.factory import create_runtime
+from Sprout.tests.readonly_host_fixtures import authorized_read_host as authorized_read_host
 
 
-def test_runtime_gateway_executes_task(tmp_path: Path) -> None:
+def test_runtime_gateway_executes_task(tmp_path: Path, authorized_read_host) -> None:
     (tmp_path / "pyproject.toml").write_text(
         "[project]\nname='demo'\nversion='0.1.0'\n",
         encoding="utf-8",
@@ -28,6 +29,7 @@ def test_runtime_gateway_executes_task(tmp_path: Path) -> None:
     settings.storage.knowledge = "memory://"
     settings.storage.observations.enabled = False
     settings.storage.metadata = f"sqlite:///{tmp_path / 'metadata.db'}"
+    settings.storage.session = settings.storage.metadata
     settings.storage.trajectory_dir = str(tmp_path / "trajectory")
     settings.storage.blobs_dir = str(tmp_path / "blobs")
     # Keep the audit stream in tmp_path too: the default points at the real
@@ -38,12 +40,15 @@ def test_runtime_gateway_executes_task(tmp_path: Path) -> None:
         runtime = create_runtime(settings)
         workspace = await runtime.open_workspace(tmp_path)
         gateway = RuntimeGateway(runtime, transport="mcp")
+        principal, scope = authorized_read_host(tmp_path / "src/main.py", source="mcp-host")
         response = await gateway.execute(
             GatewayRequest(
                 transport="mcp",
                 instruction="explain this project",
                 execution_mode="read_only",
                 workspace_id=workspace.id,
+                caller=principal,
+                delegation_scope=scope,
             )
         )
         assert response.status in {"waiting_approval", "completed"}

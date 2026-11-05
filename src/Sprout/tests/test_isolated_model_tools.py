@@ -16,13 +16,13 @@ from Sprout.execution.sandbox_tool import (
     SandboxReadTool,
     SandboxSearchTool,
 )
-from Sprout.orchestration.models import ExecutionNode, NodeType
 from Sprout.runtime.nodes import NodeExecutor
 from Sprout.security.engine import PolicyEngine
 from Sprout.skills.models import Skill
 from Sprout.task.models import Task
 from Sprout.tests.test_coding_profile import plan
-from Sprout.workspace.models import Workspace
+from Sprout.tests.test_r04_b2_capture import captured as captured
+from Sprout.tests.test_r04_pa2_b1_binding import rig as rig
 
 
 def fixture(tmp_path):
@@ -89,48 +89,58 @@ def test_public_acceptance_keeps_inputs_but_withholds_expected_output():
 
 @pytest.mark.parametrize("commands", [False, True])
 @pytest.mark.parametrize("restricted", [False, True])
-async def test_agent_prompt_and_context_hide_oracles(tmp_path, commands, restricted):
-    sandbox, task, _ = fixture(tmp_path)
-    nodes = [ExecutionNode(type=NodeType.SANDBOX, metadata={"output": {
-        "id": sandbox.id, "kind": sandbox.kind, "root": str(sandbox.root)}}),
-        ExecutionNode(type=NodeType.READ, metadata={"output": [
-            {"path": str(tmp_path / "app.py"), "content": "code", "decision": "allow"},
-            {"path": str(tmp_path / "tests/oracle.py"), "content": "hidden-oracle-answer",
-             "decision": "allow"}]}),
-        ExecutionNode(type=NodeType.TEST_DESIGN, metadata={"output": {"acceptance_spec": {
-            "cases": [{"id": "ok", "target": "app:run", "args": [1],
-                       "expected_output": "hidden-oracle-answer"}]}}})]
-    captured = {}
+async def test_agent_prompt_and_context_hide_oracles(tmp_path, commands, restricted, rig, captured):
+    import json
+    from dataclasses import replace
 
-    def context_factory(**kwargs):
-        captured["context"] = kwargs
-        return SimpleNamespace(**kwargs)
+    from Sprout.agent.base import ModelAgent
+    from Sprout.llm.messages import LLMResponse
+    from Sprout.tests.readonly_host_fixtures import prompt_from_owned_read
+    from Sprout.tools.context_keys import _current_project_node
 
-    async def run(message, context):
-        captured["message"] = message.content
-        return SimpleNamespace(content="done", metadata={})
+    sandbox, original, _ = fixture(tmp_path)
+    rig.task = replace(rig.task, metadata={**rig.task.metadata,
+                                        "replay_plan": original.metadata["replay_plan"]})
+    await rig.storage.metadata.save_task(rig.task)
+    observed = {}
 
-    executor = object.__new__(NodeExecutor)
-    executor._isolated_coding_required = True
-    executor._coding_commands = SimpleNamespace(execute=AsyncMock()) if commands else None
-    executor._metadata = SimpleNamespace(list_execution_nodes=AsyncMock(return_value=nodes))
-    executor._file_broker = FileBroker(PolicyEngine())
-    executor._contexts = SimpleNamespace(build_node_context=context_factory)
-    executor._router = SimpleNamespace(route=lambda message: SimpleNamespace(run=run))
-    executor._skills = SimpleNamespace(list=lambda: {
-        "procedure": Skill(name="procedure", version="1", instructions="Read evidence.",
-                           trust="trusted", origin=str(tmp_path)),
-        "untrusted": Skill(name="untrusted", version="1", instructions="Not approved.")})
-    await executor._agent(ExecutionNode(task_id=task.id, metadata={
-        "tool_names": ["isolated_coding_command"]} if restricted else {}),
-                          Workspace(id="workspace", root=tmp_path), task)
-    assert "hidden-oracle-answer" not in captured["message"]
-    assert "hidden-oracle-answer" not in str(captured["context"]["metadata"]["resources"])
-    assert ("isolated_coding_command" in captured["context"]["tools"]) is commands
-    assert ("skill_view" in captured["context"]["tools"]) is not restricted
-    assert list(captured["context"]["skills"]) == ([] if restricted else ["procedure"])
+    class Model:
+        async def chat(self, messages, **kwargs):
+            observed["message"] = str(messages)
+            return LLMResponse(content="done")
+
+    async def check(executor, resources, planned):
+        executor._isolated_coding_required = True
+        executor._coding_commands = SimpleNamespace(execute=AsyncMock()) if commands else None
+        build = executor._contexts.build_node_context
+
+        def context_factory(**kwargs):
+            observed["context"] = kwargs
+            return build(**kwargs)
+
+        executor._contexts = SimpleNamespace(build_node_context=context_factory)
+        executor._router = SimpleNamespace(route=lambda message: ModelAgent(Model()))
+        executor._skills = SimpleNamespace(list=lambda: {
+            "procedure": Skill(name="procedure", version="1", instructions="Read evidence.",
+                               trust="trusted", origin=str(tmp_path)),
+            "untrusted": Skill(name="untrusted", version="1", instructions="Not approved.")})
+        scope = _current_project_node()
+        result = await executor._agent(scope.node, rig.workspace, rig.task)
+        assert result["content"] == "done"
+
+    spec = {"cases": [{"id": "ok", "target": "app:run", "args": [1],
+                       "expected_output": "hidden-oracle-answer"}]}
+    await prompt_from_owned_read(rig, check, sandbox=sandbox,
+        plan_text=json.dumps(public_acceptance(spec)), agent_metadata={
+            "tool_names": ["isolated_coding_command"]} if restricted else {})
+    assert captured.opens and all(path == "src/main.py" for path in captured.opens)
+    assert "hidden-oracle-answer" not in observed["message"]
+    assert "hidden-oracle-answer" not in str(observed["context"]["metadata"]["resources"])
+    assert ("isolated_coding_command" in observed["context"]["tools"]) is commands
+    assert ("skill_view" in observed["context"]["tools"]) is not restricted
+    assert list(observed["context"]["skills"]) == ([] if restricted else ["procedure"])
     if not restricted:
-        assert captured["context"]["skills"]["procedure"].origin == ""
-        tool = captured["context"]["tools"]["skill_view"]
+        assert observed["context"]["skills"]["procedure"].origin == ""
+        tool = observed["context"]["tools"]["skill_view"]
         assert (await tool.invoke({"name": "procedure"})).ok
         assert not (await tool.invoke({"name": "procedure", "path": "app.py"})).ok

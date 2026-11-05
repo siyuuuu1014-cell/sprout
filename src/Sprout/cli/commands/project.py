@@ -11,6 +11,7 @@ import typer
 from Sprout.cli import ui
 from Sprout.cli.commands.task_lifecycle import app as task_lifecycle_app
 from Sprout.cli.diff import render_diff
+from Sprout.gateway.local_identity import current_cli_principal
 
 app = typer.Typer(help="Project Agent Runtime operations.", no_args_is_help=True)
 app.add_typer(task_lifecycle_app, name="task")
@@ -27,6 +28,42 @@ def _gateway(config: str | None):
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+async def _analysis_context(gateway, workspace_id):
+    """Explicit CLI selection, no filesystem discovery or implicit root grant."""
+    from Sprout.task.models import DelegationScope
+    from Sprout.workspace.authorized_content import ContentLimits, relative_label
+
+    principal = current_cli_principal()
+    if principal.authenticated is not True:
+        raise PermissionError("cli_analysis_identity_unavailable")
+    runtime = gateway._runtime
+    workspace = await runtime.get_workspace(workspace_id)
+    if workspace is None:
+        raise LookupError("analysis_workspace_unavailable")
+    typer.echo(f"Read-only workspace: {workspace.id}  {workspace.root}")
+    raw = typer.prompt("Workspace-relative file or explicit JSON file list", default="")
+    selected = json.loads(raw) if raw.lstrip().startswith("[") else [raw]
+    if (type(selected) is not list or not selected
+            or len(selected) > ContentLimits().max_files
+            or any(type(path) is not str for path in selected)):
+        raise PermissionError("analysis_file_selection_invalid")
+    paths = tuple(relative_label(path.replace("\\", "/")) for path in selected)
+    if len({path.casefold() for path in paths}) != len(paths):
+        raise PermissionError("project_capture_duplicate_path")
+    typer.echo("Selected files only:\n" + "\n".join(paths))
+    if not typer.confirm("Confirm this finite read-only analysis?", default=False):
+        raise PermissionError("project_analysis_cancelled")
+    task = await runtime.create_task(
+        workspace.id, "understand selected project", actor=principal,
+        source=principal.source, execution_mode="read_only",
+        delegation_scope=DelegationScope(
+            allowed_paths=tuple(str(workspace.root / path) for path in paths),
+            allowed_actions=frozenset({"tool.invoke", "file.read"}),
+        ), metadata={"required_paths": list(paths)},
+    )
+    return {"principal": principal, "analysis_task": task}
 
 
 @app.command("eval")
@@ -48,7 +85,10 @@ def evaluate(
     from Sprout.evaluation.runner import run_suite
 
     try:
-        report = _run(run_suite(Path(output) if output else None, case_ids=tuple(case or ())))
+        report = _run(run_suite(
+            Path(output) if output else None, case_ids=tuple(case or ()),
+            principal=current_cli_principal(), scope_provider=_eval_scope_for_workspace,
+            preparation_provider=_eval_inputs_for_workspace))
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from None
     if as_json:
@@ -59,6 +99,34 @@ def evaluate(
         typer.echo(ui.key_value("evidence", report["evidence_dir"]))
     if report["scenario_passed"] != report["total"]:
         raise typer.Exit(code=1)
+
+
+def _eval_inputs_for_workspace(workspace, principal, case):
+    """Explicit first-party input selection, separate from output permissions."""
+    from Sprout.evaluation.runner import _eval_preparation_inputs
+
+    return _eval_preparation_inputs(workspace, principal, case)
+
+
+def _eval_scope_for_workspace(workspace, principal):
+    """CLI host policy for fixed CODE fixtures, independent of model/case paths.
+
+    tests/examples are bounded generated-verification output directories. This
+    grants no action by itself; existing Policy and resource checks still apply.
+    """
+    from Sprout.security.access import ActionType
+    from Sprout.task.models import DelegationScope
+
+    paths = ("src/app.py", "src/helper.py", "src/__init__.py", "pyproject.toml",
+             "pytest.ini", "conftest.py", ".gitignore", "tests", "examples")
+    return DelegationScope(
+        allowed_paths=tuple(str(workspace.root / path) for path in paths),
+        allowed_actions=frozenset(action.value for action in (
+            ActionType.TOOL_INVOKE, ActionType.FILE_READ, ActionType.FILE_WRITE,
+            ActionType.FILE_DELETE, ActionType.PROCESS_RUN, ActionType.GIT_STATUS,
+            ActionType.GIT_DIFF, ActionType.GIT_ADD, ActionType.GIT_COMMIT)),
+        issued_by=principal.source + ":" + principal.user_id,
+    )
 
 
 async def _resolve_proposal(gateway, prefix: str):
@@ -96,7 +164,8 @@ def analyze(
     gateway = _gateway(config)
 
     async def run() -> None:
-        analysis = await gateway.analyze_workspace(workspace_id)
+        analysis = await gateway.analyze_workspace(
+            workspace_id, **await _analysis_context(gateway, workspace_id))
         payload = {
             "workspace_id": analysis.workspace.id,
             "languages": list(analysis.manifest.detected_languages),
@@ -155,6 +224,7 @@ def graph(
             workspace_id,
             name=name,
             relation=relation,
+            **await _analysis_context(gateway, workspace_id),
         )
         if as_json:
             payload = {
@@ -270,7 +340,9 @@ def symbols(
     gateway = _gateway(config)
 
     async def run() -> None:
-        nodes = await gateway.query_workspace_symbols(workspace_id, kind=kind, query=query)
+        nodes = await gateway.query_workspace_symbols(
+            workspace_id, kind=kind, query=query,
+            **await _analysis_context(gateway, workspace_id))
         if as_json:
             typer.echo(
                 json.dumps([_node_payload(node) for node in nodes], indent=2, ensure_ascii=False)
@@ -306,7 +378,9 @@ def dependencies(
     gateway = _gateway(config)
 
     async def run() -> None:
-        result = await gateway.query_workspace_dependencies(workspace_id, path, direction=direction)
+        result = await gateway.query_workspace_dependencies(
+            workspace_id, path, direction=direction,
+            **await _analysis_context(gateway, workspace_id))
         if as_json:
             payload = {
                 "path": path,
@@ -350,7 +424,8 @@ def subgraph(
 
     async def run() -> None:
         result = await gateway.query_workspace_subgraph(
-            workspace_id, name, max_depth=depth, relation=relation
+            workspace_id, name, max_depth=depth, relation=relation,
+            **await _analysis_context(gateway, workspace_id),
         )
         if as_json:
             payload = {
@@ -398,6 +473,7 @@ def knowledge(
             workspace_id,
             query=query,
             kind=kind,
+            **await _analysis_context(gateway, workspace_id),
         )
         if as_json:
             typer.echo(
@@ -440,7 +516,7 @@ def readplan(
     gateway = _gateway(config)
 
     async def run() -> None:
-        plan = await gateway.plan_task(task_id)
+        plan = await gateway.plan_task(task_id, principal=current_cli_principal())
         if as_json:
             payload = {
                 "id": plan.id,
@@ -472,12 +548,65 @@ def task_create(
     instruction: Annotated[str, typer.Argument(help="Task instruction.")],
     mode: Annotated[str, typer.Option("--mode", help="code or read_only.")] = "code",
     config: Annotated[str | None, typer.Option("--config", help="Path to sprout.toml.")] = None,
+    read_path: Annotated[list[str] | None, typer.Option(
+        "--read-path", help="Known Workspace-relative input file; repeat for each file.")] = None,
+    write_path: Annotated[list[str] | None, typer.Option(
+        "--write-path", help="Workspace-relative write target; policy still applies.")] = None,
+    allow_pytest: Annotated[bool, typer.Option(
+        "--allow-pytest", help="Request process.run; no approval bypass.")] = False,
+    allow_apply: Annotated[bool, typer.Option(
+        "--allow-apply", help="Request exact-plan Apply; receipt and approval required.")] = False,
+    acceptance_spec: Annotated[str | None, typer.Option("--acceptance-spec")] = None,
+    acceptance_test: Annotated[str | None, typer.Option("--acceptance-test")] = None,
+    acceptance_demo: Annotated[str | None, typer.Option("--acceptance-demo")] = None,
 ) -> None:
     """Create a project task."""
+    from Sprout.task.models import DelegationScope
+    from Sprout.workspace.authorized_content import relative_label
+
+    try:
+        inputs = tuple(dict.fromkeys(relative_label(p) for p in (read_path or ())))
+        writes = tuple(dict.fromkeys(relative_label(p) for p in (write_path or ())))
+    except ValueError as exc:
+        raise typer.BadParameter("Use explicit Workspace-relative file paths") from exc
+    if (writes or allow_pytest) and not inputs:
+        raise typer.BadParameter("--write-path/--allow-pytest require --read-path")
+    frozen = None
+    if any(value is not None for value in (acceptance_spec, acceptance_test, acceptance_demo)):
+        if any(value is None for value in (acceptance_spec, acceptance_test, acceptance_demo)):
+            raise typer.BadParameter("Provide frozen spec, test and Demo together")
+        from pathlib import Path
+
+        from Sprout.strategy.acceptance import AcceptanceSpec
+
+        test, demo = relative_label(acceptance_test), relative_label(acceptance_demo)
+        if mode != "code" or test not in inputs or demo not in inputs:
+            raise typer.BadParameter("Frozen test and Demo must be explicit CODE read inputs")
+        frozen = {"spec": AcceptanceSpec.from_payload(json.loads(
+            Path(acceptance_spec).read_text(encoding="utf-8"))).to_payload(),
+            "test_path": test, "demo_path": demo}
+    if allow_apply and (not writes or frozen is None):
+        raise typer.BadParameter("--allow-apply requires --write-path and frozen acceptance inputs")
+    principal = current_cli_principal()
+    actions = {"tool.invoke", "file.read"}
+    if writes:
+        actions.add("file.write")
+    if allow_pytest:
+        actions.add("process.run")
+    if allow_apply:
+        actions.update({"file.apply", "git.diff"})
+    scope = (DelegationScope(allowed_paths=tuple(dict.fromkeys((*inputs, *writes))),
+        allowed_actions=frozenset(actions), issued_by=principal.source+":"+principal.user_id)
+        if inputs else None)
     gateway = _gateway(config)
 
     async def run() -> None:
-        task = await gateway.create_task(workspace_id, instruction, execution_mode=mode)
+        task = await gateway.create_task(
+            workspace_id, instruction, execution_mode=mode, principal=principal,
+            delegation_scope=scope,
+            **({"preparation_paths": inputs} if inputs else {}),
+            **({"host_acceptance": frozen} if frozen is not None else {}),
+        )
         typer.echo(task.id)
 
     _run(run())
@@ -503,13 +632,69 @@ def task_confirm_mode(
 def task_run(
     task_id: Annotated[str, typer.Argument(help="Task id.")],
     config: Annotated[str | None, typer.Option("--config", help="Path to sprout.toml.")] = None,
+    review_apply: Annotated[bool, typer.Option(
+        "--review-apply", help="Review one live Local Apply Plan before exiting.")] = False,
+    git_executable: Annotated[str | None, typer.Option("--git-executable")] = None,
+    git_sha256: Annotated[str | None, typer.Option("--git-sha256")] = None,
 ) -> None:
-    """Run a project task through the execution graph."""
+    """Run the graph; optionally review one exact plan before this Runtime exits."""
+    if review_apply and (not git_executable or not git_sha256):
+        raise typer.BadParameter(
+            "--review-apply requires Host-pinned --git-executable/--git-sha256")
     gateway = _gateway(config)
 
     async def run() -> None:
-        result = await gateway.run_task(task_id)
-        typer.echo(f"{result.task_id}  {result.status}")
+        if not review_apply:
+            result = await gateway.run_task(task_id)
+            typer.echo(f"{result.task_id}  {result.status}")
+            return
+        from Sprout.gateway.task_queries import TaskQueries
+
+        principal = current_cli_principal()
+        runtime = gateway._runtime
+        try:
+            await TaskQueries(runtime)._owned_task(task_id, principal)
+            import tempfile
+
+            parent = tempfile.mkdtemp(prefix="sprout-g1-")
+            typer.echo(f"Git review evidence: {parent}")
+            await runtime.configure_local_git_review(task_id, principal,
+                executable=git_executable, executable_sha256=git_sha256, export_parent=parent)
+            result = await gateway.run_task(task_id)
+            typer.echo(f"{result.task_id}  {result.status}")
+            proposals = await gateway.list_changes(task_id)
+            eligible = [p for p in proposals if p.id in runtime._local_apply_plans]
+            if len(eligible) != 1:
+                typer.echo("No live complete Local Apply Plan; no write performed.")
+                report = await runtime.get_task_execution_report(task_id)
+                for node in report["nodes"]:
+                    if node.get("reason") or node.get("error"):
+                        typer.echo(str(node.get("reason") or node["error"]))
+                return
+            proposal = eligible[0]
+            body = proposal.metadata["apply_plan"]
+            typer.echo(f"Proposal: {proposal.id}")
+            typer.echo(f"Workspace: {body['workspace_id']}  {body['target']}")
+            typer.echo(f"Plan SHA256: {proposal.metadata['apply_plan_sha256']}")
+            for item in body["files"]:
+                typer.echo(f"{item['path']}: {item['before']} -> {item['after']}")
+            for diff in proposal.diffs:
+                render_diff(diff.path, diff.diff_text)
+            content = proposal.metadata.get("content_diff")
+            if content:
+                typer.echo("Exact Workspace replacement (content snapshots; not Git output):")
+                render_diff("workspace_replacement", content["text"])
+            if not typer.confirm("Approve this entire exact Apply Plan?", default=False):
+                typer.echo("Not approved; no Apply write performed.")
+                return
+            updated = await gateway.approve_proposal(proposal.id, principal=principal)
+            typer.echo(f"proposal_status={updated.status.value}")
+            report = await runtime.get_task_execution_report(task_id)
+            for node in report["nodes"]:
+                if node.get("type") == "apply":
+                    typer.echo(json.dumps(node, ensure_ascii=False, default=str))
+        finally:
+            await runtime.stop()
 
     _run(run())
 
@@ -658,6 +843,7 @@ def apply(
         proposal = await _resolve_proposal(gateway, proposal_id)
         result = await gateway.apply_proposal(
             proposal.id,
+            principal=current_cli_principal(),
             allow_failing_tests=allow_failing_tests,
             force=force,
             override_reason=override_reason,
@@ -699,7 +885,7 @@ def approve(
 
     async def run() -> None:
         proposal = await _resolve_proposal(gateway, proposal_id)
-        updated = await gateway.approve_proposal(proposal.id)
+        updated = await gateway.approve_proposal(proposal.id, principal=current_cli_principal())
         typer.echo(f"approved={updated.status.value}")
 
     _run(run())

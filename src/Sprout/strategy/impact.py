@@ -60,10 +60,19 @@ class ImpactAnalyzer:
         relevant files from the rest, so it drops both.
         """
         project_root = Path(root).resolve()
+        return self.analyze_paths(
+            (path.relative_to(project_root).as_posix() for path in self._files(project_root)),
+            requirement,
+        )
+
+    def analyze_paths(self, paths, requirement: Requirement) -> ImpactReport:
+        """Score captured labels only; labels are data, never file authority."""
+        from pathlib import PurePosixPath
+
         terms = self._terms(requirement.text)
         items: list[ImpactItem] = []
-        for path in self._files(project_root):
-            relative = path.relative_to(project_root).as_posix()
+        for relative in paths:
+            path = PurePosixPath(relative)
             haystack = f"{relative} {path.stem}".casefold()
             score = sum(1 for term in terms if term in haystack)
             category = self._category(relative)

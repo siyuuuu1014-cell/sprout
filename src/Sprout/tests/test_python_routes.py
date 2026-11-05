@@ -2,6 +2,7 @@
 
 import pytest
 
+from Sprout.tests.readonly_host_fixtures import fixture_analysis
 from Sprout.workspace.models import Workspace
 from Sprout.workspace.python_contracts import PythonContractAnalyzer
 from Sprout.workspace.scanner import WorkspaceScanner
@@ -233,7 +234,8 @@ app.include_router(router, prefix="/v1")
         workspace = Workspace(id="routes", root=root)
         task = Task(workspace_id=workspace.id, instruction="analyze")
         intelligence = WorkspaceIntelligence()
-        first = await intelligence.analyze(workspace, task)
+        first = await fixture_analysis(
+            intelligence, workspace, task, paths=("main.py", "routes.py"))
         store = SqliteProjectAnalysisStore(tmp_path / "projects")
         try:
             version = await store.save_analysis(first, expected_snapshot_id=None)
@@ -252,14 +254,16 @@ app.include_router(router, prefix="/v1")
             path = root / "main.py"
             path.write_text(path.read_text(encoding="utf-8").replace("/v1", "/v2"),
                             encoding="utf-8")
-            edited = await intelligence.analyze(workspace, task, previous=restored)
+            edited = await fixture_analysis(intelligence, workspace, task,
+                paths=("main.py", "routes.py"), previous=restored)
             facts = [i for i in edited.knowledge.items if i.kind == "interface_mounted_endpoint"]
             assert facts[0].details["mounted_path"] == "/v2/users/{id}"
             assert any(i.id in edited.stale_knowledge_ids for i in restored.knowledge.items
                        if i.kind == "interface_mounted_endpoint")
             version = await store.save_analysis(edited, expected_snapshot_id=version)
             (root / "routes.py").unlink()
-            removed = await intelligence.analyze(workspace, task, previous=edited)
+            removed = await fixture_analysis(intelligence, workspace, task,
+                paths=("main.py", "routes.py"), previous=edited)
             assert not any(i.kind == "interface_mounted_endpoint" for i in removed.knowledge.items)
             assert facts[0].id in removed.stale_knowledge_ids
             await store.save_analysis(removed, expected_snapshot_id=version)

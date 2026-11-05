@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from Sprout.config.settings import ContextSettings
@@ -38,8 +39,11 @@ class ContextBuilder:
             Callable[[str], Awaitable[WorkspaceAnalysis]] | None
         ) = None,
         skill_disclosure: str = "",
+        isolate_project_context: bool = False,
+        conversation_provider: Callable[..., Awaitable[AgentContext | None]] | None = None,
     ) -> None:
         self._storage = storage
+        self._conversation_provider = conversation_provider
         # ``progressive`` (the default) injects only the L0 index; ``eager``
         # keeps the legacy full-body injection (design §6.1).
         self._skill_disclosure = skill_disclosure
@@ -51,6 +55,11 @@ class ContextBuilder:
         self._session_store = storage.session_store()
         self._settings = context_settings or ContextSettings()
         self._workspace_analysis_provider = workspace_analysis_provider
+        # Negative isolation only, never an execution grant. Legacy callbacks
+        # cannot prove Task/Scope provenance, nor can shared session memories.
+        self._isolate_project_context = (
+            isolate_project_context or workspace_analysis_provider is not None
+        )
         self._memory_store = storage.memory
         estimator = CharEstimator()
         self._allocator = BudgetAllocator(self._settings)
@@ -70,6 +79,14 @@ class ContextBuilder:
         tools: Mapping[str, Tool],
         skills: Mapping[str, Skill],
     ) -> AgentContext:
+        from Sprout.tools.context_keys import _current_project_node
+
+        if self._isolate_project_context or _current_project_node() is not None:
+            if self._conversation_provider is not None and _current_project_node() is None:
+                context = await self._conversation_provider(message, session, tools, skills)
+                if context is not None:
+                    return context
+            return self._isolated_context(message, session, tools, skills)
         knowledge = (
             await self._retriever.retrieve_for(message) if self._retriever else ()
         )
@@ -90,17 +107,7 @@ class ContextBuilder:
             knowledge=knowledge,
         )
         metadata = dict(message.metadata)
-        workspace_context = None
-        if self._workspace_analysis_provider is not None:
-            workspace_id = metadata.get("workspace_id")
-            if isinstance(workspace_id, str) and workspace_id:
-                analysis = await self._workspace_analysis_provider(workspace_id)
-                summary = analysis.context_summary()
-                metadata["workspace_context"] = summary
-                workspace_context = self._build_workspace_context(
-                    analysis,
-                    message,
-                )
+        metadata.pop("workspace_context", None)
         await self._persist_context(session, history, memory)
         return AgentContext(
             session=session,
@@ -111,7 +118,32 @@ class ContextBuilder:
             user={"id": message.user_id},
             files=tuple(message.metadata.get("files", ())),
             metadata=metadata,
-            workspace=workspace_context,
+            workspace=None,
+            skill_disclosure=self._skill_disclosure or PROGRESSIVE,
+        )
+
+    def _isolated_context(self, message, session, tools, skills, *, analysis=None):
+        """Fresh project context, with no unpartitioned retrieval/persistence.
+
+        An analysis is data only. Runtime invokes this synchronous projection
+        inside capture, BEFORE the final authoritative publication checks.
+        No public build argument accepts a reusable analysis as authorization.
+        """
+        budget = message.metadata.get("task_budget")
+        metadata = {}
+        if isinstance(budget, Mapping):
+            # Preserve existing numeric model/tool limits, not opaque content
+            # or replay payloads from another Task. This grants no authority.
+            metadata["task_budget"] = {
+                key: value for key in ("max_model_calls", "max_tool_calls", "max_tokens")
+                if type(value := budget.get(key)) is int and value > 0
+            }
+        return AgentContext(
+            session=replace(session, metadata={}), tools=dict(tools), skills=dict(skills),
+            user={"id": message.user_id},
+            metadata=metadata,
+            workspace=(self._build_workspace_context(analysis, message)
+                       if analysis is not None else None),
             skill_disclosure=self._skill_disclosure or PROGRESSIVE,
         )
 
@@ -130,7 +162,9 @@ class ContextBuilder:
 
         nodes: dict[str, WorkspaceGraphNodeContext] = {}
         edges: dict[str, WorkspaceGraphEdgeContext] = {}
-        query = analysis.query()
+        from Sprout.workspace.query import WorkspaceQuery
+
+        query = WorkspaceQuery(analysis, captured=True)
         if seeds:
             for seed in seeds:
                 subgraph = query.subgraph(seed.name, max_depth=2)
@@ -236,6 +270,29 @@ class ContextBuilder:
         session object is synthetic and never persisted, so node execution does
         not pollute the online session store.
         """
+        # Legacy node outputs lack trusted resource provenance. This negative
+        # check is not a subject grant; NodeExecutor revalidates B1 separately.
+        payload = dict(metadata or {})
+        budget = payload.get("task_budget", {})
+        from Sprout.tools.context_keys import _current_node_publication
+
+        scope = _current_node_publication()
+        admitted = (scope is not None and scope.node.id == node_id
+                    and scope.task.actor.user_id == user_id
+                    and payload.get("task_id") == scope.task.id
+                    and set(files) <= set(scope.captured_paths)
+                    and scope.runtime._node_context_resources(
+                        scope, files, payload.get("resources", ()))
+                    and not payload.get("resume_tool_calls"))
+        if ((files or payload.get("resources")) and not admitted
+                or knowledge or memory
+                or set(payload) - {"task_id", "node_id", "task_budget",
+                                   "resources", "resume_tool_calls"}
+                or payload.get("resume_tool_calls")
+                or not isinstance(budget, Mapping)
+                or set(budget) - {"max_model_calls", "max_tool_calls", "max_tokens"}
+                or any(type(value) is not int or value < 0 for value in budget.values())):
+            raise PermissionError("node_artifact_provenance_unavailable")
         return AgentContext(
             session=Session(id=f"node-{node_id}", user_id=user_id),
             memory=memory,

@@ -11,9 +11,10 @@ from Sprout.config.loader import default_settings
 from Sprout.gateway.rpc_client import RPCClient
 from Sprout.gateway.rpc_gateway import RPCGateway
 from Sprout.runtime.factory import create_runtime
+from Sprout.tests.readonly_host_fixtures import authorized_read_host as authorized_read_host
 
 
-def test_rpc_gateway_dispatches_project_methods(tmp_path: Path) -> None:
+def test_rpc_gateway_dispatches_project_methods(tmp_path: Path, authorized_read_host) -> None:
     (tmp_path / "pyproject.toml").write_text(
         "[project]\nname='demo'\nversion='0.1.0'\n",
         encoding="utf-8",
@@ -40,6 +41,7 @@ def test_rpc_gateway_dispatches_project_methods(tmp_path: Path) -> None:
         runtime = create_runtime(settings)
         workspace = await runtime.open_workspace(tmp_path)
         gateway = RPCGateway(runtime)
+        principal, scope = authorized_read_host(tmp_path / "src/main.py", source="rpc-host")
 
         created = await gateway.handle(
             {
@@ -50,7 +52,7 @@ def test_rpc_gateway_dispatches_project_methods(tmp_path: Path) -> None:
                     "instruction": "explain this project",
                     "execution_mode": "read_only",
                 },
-            }
+            }, principal=principal, delegation_scope=scope,
         )
         assert "result" in created
 
@@ -59,7 +61,7 @@ def test_rpc_gateway_dispatches_project_methods(tmp_path: Path) -> None:
                 "id": "2",
                 "method": "task.run",
                 "params": {"task_id": created["result"]["id"]},
-            }
+            }, principal=principal,
         )
         assert run_result["result"]["status"] in {"waiting_approval", "completed"}
         await runtime.stop()

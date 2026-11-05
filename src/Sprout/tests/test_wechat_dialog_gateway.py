@@ -75,6 +75,8 @@ def test_client_sends_encrypted_customer_service_message() -> None:
 
 
 def test_gateway_callback_executes_task_and_sends_reply(tmp_path: Path) -> None:
+    from Sprout.task.models import DelegationScope
+
     (tmp_path / "pyproject.toml").write_text(
         "[project]\nname='demo'\nversion='0.1.0'\n",
         encoding="utf-8",
@@ -82,12 +84,16 @@ def test_gateway_callback_executes_task_and_sends_reply(tmp_path: Path) -> None:
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "main.py").write_text("def main(): pass\n", encoding="utf-8")
     settings = default_settings()
+    settings.model.provider = "echo"
+    settings.model.model = "echo-1"
     settings.storage.operational = "memory://"
     settings.storage.knowledge = "memory://"
     settings.storage.observations.enabled = False
     settings.storage.metadata = f"sqlite:///{tmp_path / 'metadata.db'}"
     settings.storage.trajectory_dir = str(tmp_path / "trajectory")
     settings.storage.blobs_dir = str(tmp_path / "blobs")
+    settings.storage.session = f"sqlite:///{tmp_path / 'session.db'}"
+    settings.security.audit.path = str(tmp_path / "audit.jsonl")
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"errcode": 0, "msg": "成功"})
@@ -107,6 +113,10 @@ def test_gateway_callback_executes_task_and_sends_reply(tmp_path: Path) -> None:
             default_workspace_id=workspace.id,
             default_channel=0,
             default_appid="wx-app",
+            scopes_by_workspace={workspace.id: DelegationScope(
+                allowed_paths=(str(tmp_path / "src/main.py"),),
+                allowed_actions=frozenset({"tool.invoke", "file.read"}),
+            )},
         )
         encrypted = client.encrypt_message(_callback_xml())
         result = await gateway.handle_callback({"encrypted": encrypted})

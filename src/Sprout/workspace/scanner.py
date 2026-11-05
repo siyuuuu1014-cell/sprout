@@ -151,6 +151,49 @@ class WorkspaceScanner:
     #: ``[security.classify]`` overrides, applied by the shared classifier.
     classify_overrides: Mapping[str, str] = field(default_factory=dict)
 
+    def scan_view(self, workspace, view):
+        """Discovery over captured labels/content, never the workspace root."""
+        from pathlib import PurePosixPath
+
+        view.check(workspace.id)
+        languages, hints, entries = set(), set(), []
+        for entry in view.entries:
+            view.check()
+            path = PurePosixPath(entry.relative_path)
+            language = (_MANIFEST_LANGUAGE_HINTS.get(path.name.casefold())
+                        or _EXTENSION_LANGUAGE_HINTS.get(path.suffix.casefold()))
+            if language:
+                languages.add(language)
+            if path.name.casefold().startswith("dockerfile"):
+                hints.add("docker")
+            if path.name in _compose_names():
+                hints.add("docker-compose")
+            if path.name in {"openapi.yaml", "openapi.yml", "openapi.json"}:
+                hints.add("openapi")
+            if path.suffix == ".proto":
+                hints.add("protobuf")
+            if path.suffix == ".tf":
+                hints.add("terraform")
+            if path.name in {"main.py", "__main__.py", "main.rs", "main.go"}:
+                entries.append(entry.relative_path)
+        view.check()
+        return WorkspaceManifest(
+            workspace.id, revision=view.revision, detected_languages=tuple(sorted(languages)),
+            framework_hints=tuple(sorted(hints)), entry_points=tuple(sorted(entries)),
+            test_commands=self._test_commands(languages),
+            build_commands=self._build_commands(languages),
+        )
+
+    def build_read_plan_view(self, workspace, task, view):
+        view.check(workspace.id)
+        resources = view.resources()
+        return ReadPlan(task_id=task.id, purpose=task.instruction,
+                        resources=resources[:self.max_resources], stage=ReadStage.TARGETED_READ)
+
+    def collect_resources_view(self, workspace, view):
+        view.check(workspace.id)
+        return view.resources()
+
     def scan(self, workspace: Workspace) -> WorkspaceManifest:
         root = workspace.root
         detected: set[str] = set()
