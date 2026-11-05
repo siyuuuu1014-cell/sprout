@@ -88,7 +88,13 @@ from Sprout.runtime.result import RuntimeInfo
 from Sprout.runtime.state import TaskStateMachine
 from Sprout.runtime.workspaces import WorkspaceService
 from Sprout.sandbox.lifecycle import SandboxLifecycleService
-from Sprout.security.approval import ApprovalManager, ApprovalRecord, ApprovalStatus
+from Sprout.security.approval import (
+    ApprovalManager,
+    ApprovalRecord,
+    ApprovalStatus,
+    CapabilityTurn,
+    _CAPABILITY_TURN,
+)
 from Sprout.security.audit import SecurityAuditLog
 from Sprout.security.engine import PolicyEngine
 from Sprout.security.layer import SecurityLayer
@@ -339,6 +345,7 @@ class Runtime:
         task_queue: TaskQueueBackend | None = None,
         settings: Settings | None = None,
     ) -> None:
+        self._capability_turns: dict[str, CapabilityTurn] = {}
         self.storage = storage
         self._project_analysis_tools = WeakKeyDictionary()
         # Host admissions live only for one local dispatch, never in model metadata.
@@ -1814,6 +1821,15 @@ class Runtime:
             valid = any(n.type is NodeType.SANDBOX and n.status is NodeStatus.COMPLETED
                         and n.metadata.get("output", {}).get("root") == str(sandbox.root)
                         and n.metadata.get("output", {}).get("id") == sandbox.id for n in nodes)
+            from Sprout.execution.coding_command_tool import IsolatedCodingCommandTool
+
+            if type(tool) is IsolatedCodingCommandTool:
+                if not valid or tool._task != task or tool._node != scope.node:
+                    raise PermissionError("node_tool_sandbox_unavailable")
+                # The isolated adapter validates relative_cwd and import paths
+                # against the same persisted sandbox before dispatch.
+                return ActionRequest(task_id=task.id, actor=task.actor,
+                                     action=ActionType.TOOL_INVOKE, scope=paths)
             if (not valid or getattr(tool, "_task_id", None) != task.id
                     or getattr(tool, "_scope", None) != scope.task.delegation_scope):
                 raise PermissionError("node_tool_sandbox_unavailable")
@@ -1855,6 +1871,30 @@ class Runtime:
             raise PermissionError("node_file_binding_unavailable")
         subject = await self._node_tool_request(frame[0], frame[2])
         from Sprout.security.access import ActionType
+
+        from Sprout.execution.coding_command_tool import IsolatedCodingCommandTool
+
+        if type(frame[0]) is IsolatedCodingCommandTool:
+            task = await self._metadata_or_raise().get_task(subject.task_id)
+            root = sandbox.root.resolve()
+            target = Path(request.resource.path).resolve()
+            if (task is None or request.task_id != subject.task_id
+                    or not target.is_relative_to(root) or target == root
+                    or request.action not in {ActionType.FILE_WRITE, ActionType.FILE_DELETE}):
+                raise PermissionError("node_file_resource_mismatch")
+            relative = target.relative_to(root).as_posix()
+            self._check_cli_write_target(task, relative)
+            if task != frame[3].task:
+                raise PermissionError("node_file_binding_changed")
+            scope = task.delegation_scope.bind_paths(str(root)).narrow(
+                frame[3].task.delegation_scope.bind_paths(str(root)),
+            )
+            if not scope.permits(request.action.value, target.as_posix()):
+                raise PermissionError("node_file_scope_denied")
+            return replace(
+                request, actor=subject.actor, scope=scope,
+                resource=replace(request.resource, workspace_id=task.workspace_id),
+            )
 
         if request.action is ActionType.FILE_WRITE:
             task = await self._metadata_or_raise().get_task(subject.task_id)
@@ -2734,8 +2774,10 @@ class Runtime:
             allowed = scope.local_evaluation_result is output
         if scope.node.type is NodeType.TEST_DESIGN:
             binding = scope.task.metadata.get("host_acceptance_v1", {})
-            allowed = (not output.get("waiting") and binding.get("sha256")
-                       and output.get("binding_sha256") == binding["sha256"])
+            allowed = not output.get("waiting") and (
+                scope.isolated_design_result is output
+                or (binding.get("sha256") and output.get("binding_sha256") == binding["sha256"])
+            )
         if not (scope.read_captured or scope.node.type is NodeType.SANDBOX
                 or (allowed and self._node_publications.get(scope.node.id) is scope)):
             return
@@ -2914,20 +2956,63 @@ class Runtime:
                 self._agent_step_store = AgentStepStore(":memory:")
         return bind_agent_step_store(self._agent_step_store)
 
-    async def _run_recorded_agent(self, agent, message, context):
-        with self._agent_step_recording():
-            return await agent.run(message, context)
+    async def _start_capability_turn(self, session, principal):
+        previous = self._capability_turns.pop(session.id, None)
+        if previous is not None:
+            previous.active = False
+        if principal is not None and principal.authenticated and principal.source == "cli":
+            root = Path.cwd().resolve()
+            workspaces = await self.list_workspaces() if self.storage.metadata is not None else ()
+            registered = [workspace for workspace in workspaces
+                          if Path(workspace.root).resolve() == root]
+            if len(registered) > 1:
+                return None
+            turn = CapabilityTurn(
+                principal.user_id, session.id, root,
+                workspace_id=registered[0].id if registered else "",
+            )
+            self._capability_turns[session.id] = turn
+            return turn
+        return None
 
-    async def _stream_recorded_agent(self, stream, message, context, **options):
+    def _finish_capability_turn(self, turn, metadata):
+        if turn is None:
+            return
+        current = self._capability_turns.get(turn.session_id) is turn
+        if current and turn.active and metadata.get("approval_required") and turn.offers:
+            return
+        turn.active = False
+        if current:
+            self._capability_turns.pop(turn.session_id)
+
+    async def _run_recorded_agent(self, agent, message, context, *, capability_turn=None):
+        token = _CAPABILITY_TURN.set(capability_turn)
+        try:
+            with self._agent_step_recording():
+                return await agent.run(message, context)
+        except BaseException:
+            self._finish_capability_turn(capability_turn, {})
+            raise
+        finally:
+            _CAPABILITY_TURN.reset(token)
+
+    async def _stream_recorded_agent(self, stream, message, context, *, capability_turn=None,
+                                     **options):
         iterator = stream(message, context, **options).__aiter__()
         try:
             while True:
-                with self._agent_step_recording():
-                    try:
+                token = _CAPABILITY_TURN.set(capability_turn)
+                try:
+                    with self._agent_step_recording():
                         chunk = await anext(iterator)
-                    except StopAsyncIteration:
-                        return
-                yield chunk  # Do not leak a binding into the stream consumer.
+                except StopAsyncIteration:
+                    return
+                finally:
+                    _CAPABILITY_TURN.reset(token)
+                yield chunk
+        except BaseException:
+            self._finish_capability_turn(capability_turn, {})
+            raise
         finally:
             close = getattr(iterator, "aclose", None)
             if close is not None:
@@ -2994,6 +3079,9 @@ class Runtime:
             self._record_security("approval.swept_at_startup", {"count": swept})
 
     async def stop(self) -> None:
+        for turn in self._capability_turns.values():
+            turn.active = False
+        self._capability_turns.clear()
         from Sprout.execution.apply_plan import release as release_apply
         from Sprout.execution.local_receipt import release
 
@@ -3339,6 +3427,7 @@ class Runtime:
             )
         message = await self.middleware.before(message)
         session = await self._sessions.resolve(message, principal=principal)
+        capability_turn = await self._start_capability_turn(session, principal)
         classification: dict[str, Any] = {}
         clarification = await route_clarification(
             self, message, session, principal, classification=classification,
@@ -3405,7 +3494,9 @@ class Runtime:
         agent = self._router.route(message)
         await self.events.publish(Event(AGENT_STARTED, {"session_id": session.id}, message.id))
         try:
-            result = await self._run_recorded_agent(agent, message, context)
+            result = await self._run_recorded_agent(
+                agent, message, context, capability_turn=capability_turn,
+            )
         except Exception as exc:
             await self.events.publish(
                 Event(
@@ -3415,6 +3506,8 @@ class Runtime:
                 )
             )
             raise
+
+        self._finish_capability_turn(capability_turn, result.metadata)
 
         # The agent may have discovered mid-turn that it needs a workspace
         # (``request_workspace``). That supersedes its own answer: it has no
@@ -4250,6 +4343,7 @@ class Runtime:
         message = self._entry_message(message, principal)
         message = await self.middleware.before(message)
         session = await self._sessions.resolve(message, principal=principal)
+        capability_turn = await self._start_capability_turn(session, principal)
         classification: dict[str, Any] = {}
         clarification = await route_clarification(
             self, message, session, principal, classification=classification,
@@ -4323,7 +4417,9 @@ class Runtime:
         result_metadata: dict[str, Any] = {}
         try:
             if stream is None:
-                result = await self._run_recorded_agent(agent, message, context)
+                result = await self._run_recorded_agent(
+                    agent, message, context, capability_turn=capability_turn,
+                )
                 chunks.append(result.content)
                 result_metadata = dict(result.metadata)
             else:
@@ -4332,7 +4428,9 @@ class Runtime:
                 # Opt in only for the known stream contract; legacy text-only
                 # consumers and other agents retain their existing signature.
                 options = {"include_result": True} if type(agent) is AgentLoop else {}
-                async for chunk in self._stream_recorded_agent(stream, message, context, **options):
+                async for chunk in self._stream_recorded_agent(
+                    stream, message, context, capability_turn=capability_turn, **options,
+                ):
                     if isinstance(chunk, AgentResult):
                         if chunk.content:
                             chunks.append(chunk.content)
@@ -4342,6 +4440,7 @@ class Runtime:
                     if chunk:
                         chunks.append(chunk)
                         yield StreamChunk(content=chunk)
+            self._finish_capability_turn(capability_turn, result_metadata)
         except Exception as exc:
             await self.events.publish(
                 Event(
@@ -4478,12 +4577,28 @@ class Runtime:
         original = self._sessions.frozen_principal(owned)
         if self._router is None:
             raise RuntimeError("No agent router configured")
+        capability_turn = self._capability_turns.get(session_id)
+        if not (capability_turn and original.authenticated and original.source == "cli"
+                and original.user_id == capability_turn.user_id):
+            capability_turn = None
+        if capability_turn is not None and capability_turn.workspace_id:
+            workspace = await self.get_workspace(capability_turn.workspace_id)
+            if workspace is None or Path(workspace.root).resolve() != capability_turn.root:
+                self._finish_capability_turn(capability_turn, {})
+                capability_turn = None
         pending = None
         for turn in reversed(await self.history(session_id, limit=50)):
             if turn.role != "assistant":
                 continue
             metadata = _agent_metadata(turn.metadata or {})
             if metadata.get("approval_required") and metadata.get("pending_tool_calls"):
+                for approval_id in metadata.get("approval_ids", ()):
+                    record = await self._approvals.store.get_approval(approval_id)
+                    if record is not None and record.task_id.startswith("turn-") and (
+                        capability_turn is None or capability_turn.id != record.task_id
+                        or not capability_turn.active
+                    ):
+                        raise LookupError("No pending approval found for the active CLI turn")
                 pending = metadata["pending_tool_calls"]
                 break
         if pending is None:
@@ -4516,7 +4631,10 @@ class Runtime:
         agent = self._router.route(message)
         await self.events.publish(Event(AGENT_STARTED, {"session_id": session.id}, message.id))
         try:
-            result = await self._run_recorded_agent(agent, message, context)
+            result = await self._run_recorded_agent(
+                agent, message, context, capability_turn=capability_turn,
+            )
+            self._finish_capability_turn(capability_turn, result.metadata)
         except Exception as exc:
             await self.events.publish(
                 Event(
@@ -6211,6 +6329,36 @@ class Runtime:
 
     async def pending_approvals(self) -> list[ApprovalRecord]:
         return await self._approvals.pending()
+
+    def cli_task_offer(self, session_id, approval_id):
+        turn = self._capability_turns.get(session_id)
+        if turn is not None and turn.active and approval_id in turn.offers:
+            return turn.offers[approval_id][0][0]
+        return None
+
+    async def revoke_cli_task(self, session_id, approval_id, *, principal):
+        await self._sessions.require_owner(session_id, principal)
+        turn = self._capability_turns.get(session_id)
+        if turn is None or not principal.authenticated or principal.source != "cli":
+            raise PermissionError("No active CLI task capability")
+        await self._approvals.revoke_task_capability(turn, approval_id)
+
+    async def cancel_cli_task(self, session_id, *, principal):
+        await self._sessions.require_owner(session_id, principal)
+        if not principal.authenticated or principal.source != "cli":
+            raise PermissionError("CLI task cancellation requires its owner")
+        turn = self._capability_turns.pop(session_id, None)
+        if turn is not None:
+            turn.active = False
+
+    async def approve_cli_task(self, session_id, approval_id, *, principal):
+        await self._sessions.require_owner(session_id, principal)
+        turn = self._capability_turns.get(session_id)
+        if turn is None or not principal.authenticated or principal.source != "cli":
+            raise PermissionError("No active CLI task capability")
+        return await self._approvals.decide_task_capability(
+            turn, approval_id, decided_by=principal.user_id,
+        )
 
     async def decide_approval(
         self,

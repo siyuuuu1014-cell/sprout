@@ -1031,17 +1031,52 @@ async def _handle_cli_approval_prompt(
             record.expires_at is not None and record.expires_at <= datetime.now(UTC)
         ):
             continue
-        _print_approval_record(record, metadata.get("pending_tool_calls"))
-        choice = await _prompt_approval_decision(record)
+        task_offer = getattr(runtime, "cli_task_offer", None)
+        executable = task_offer(session_id, record.id) if task_offer is not None else None
+        task_ids = [record.id]
+        if executable:
+            programs = [executable]
+            for other_id in approval_ids:
+                if other_id == record.id:
+                    continue
+                other = await runtime.approvals.store.get_approval(other_id)
+                if (
+                    other is None or other.status != ApprovalStatus.PENDING
+                    or other.expires_at is None or other.expires_at <= datetime.now(UTC)
+                ):
+                    continue
+                program = task_offer(session_id, other_id)
+                if program:
+                    task_ids.append(other_id)
+                    if program not in programs:
+                        programs.append(program)
+            executable = " | ".join(programs)
+        _print_approval_record(record, metadata.get("pending_tool_calls"), task_offer=executable)
+        choice = (
+            await _prompt_approval_decision(record, task_executable=executable)
+            if executable else await _prompt_approval_decision(record)
+        )
+        if choice == "approve_task":
+            principal = current_cli_principal()
+            for task_approval_id in task_ids:
+                granted = await runtime.approve_cli_task(
+                    session_id, task_approval_id, principal=principal,
+                )
+                approved_any |= granted.status == ApprovalStatus.APPROVED
+            decided = True
+            continue
         if choice == "deny":
-            await runtime.decide_approval(
-                record.id,
-                False,
-                decided_by=user,
-                reason=_approval_text("rejected_reason"),
-                channel="cli",
-            )
-            typer.echo(ui.warning(_approval_text("rejected", approval_id=record.id[:8])))
+            for task_approval_id in task_ids:
+                await runtime.decide_approval(
+                    task_approval_id,
+                    False,
+                    decided_by=user,
+                    reason=_approval_text("rejected_reason"),
+                    channel="cli",
+                )
+                typer.echo(ui.warning(
+                    _approval_text("rejected", approval_id=task_approval_id[:8])
+                ))
             decided = True
             continue
         if choice == "approve_once":
@@ -1459,10 +1494,12 @@ def _approval_action_lines(record: Any, pending: object) -> list[str]:
     return [summary] if summary else []
 
 
-def _print_approval_record(record: Any, pending: object = ()) -> None:
+def _print_approval_record(
+    record: Any, pending: object = (), *, task_offer: str | None = None,
+) -> None:
     typer.echo("")
     typer.echo(ui.text(_approval_text("title"), bold=True))
-    scope = ("similar_scope" if getattr(record, "approval_class", "")
+    scope = ("task_scope" if task_offer else "similar_scope" if getattr(record, "approval_class", "")
              and getattr(record, "session_id", "") else "exact_scope")
     rows = _approval_detail_rows(record)
     rows.extend(
@@ -1512,9 +1549,14 @@ def _approval_detail_rows(record: Any) -> list[tuple[str, str]]:
     ]
 
 
-async def _prompt_approval_decision(record: Any) -> str:
+async def _prompt_approval_decision(record: Any, *, task_executable: str | None = None) -> str:
     choices = [questionary.Choice(_approval_text("yes_once"), "approve_once")]
-    if getattr(record, "approval_class", "") and getattr(record, "session_id", ""):
+    if task_executable:
+        choices.append(questionary.Choice(
+            _approval_text("yes_task", executable=task_executable, root=record.resource_scope),
+            "approve_task",
+        ))
+    elif getattr(record, "approval_class", "") and getattr(record, "session_id", ""):
         choices.append(
             questionary.Choice(_approval_text("yes_similar"), "approve_similar")
         )
@@ -1535,6 +1577,14 @@ def _approval_text(key: str, **values: object) -> str:
 
 
 _APPROVAL_TEXT: dict[str, dict[str, str]] = {
+    "task_scope": {
+        "zh": "仅本次调用，或允许当前任务在同一目录使用该程序。任务授权有期限。",
+        "en": "Approve this invocation or allow this executable in the same directory for this task.",
+    },
+    "yes_task": {
+        "zh": "本任务内允许 {executable} 在 {root} 使用其他参数。程序可间接修改文件或运行 Git，此授权不提供操作系统隔离。Git 仅限版本和执行路径查询。",
+        "en": "Allow other arguments for {executable} in {root} for this task. Programs can modify files or run Git indirectly. This consent provides no OS isolation. Git covers version and exec-path queries only.",
+    },
     "action": {
         "zh": "将执行",
         "zh-Hant": "將執行",

@@ -327,7 +327,28 @@ class ToolExecutor:
                 return ToolResult.denied(decision.reason)
             return ToolResult.denied(f"Tool {name} is denied by the security policy")
 
+        from Sprout.security.approval import _CAPABILITY_TURN
+        from Sprout.security.commands import permits_cli_task_reuse
+        from Sprout.tools.system_tools import CliRunTool
+
+        turn = _CAPABILITY_TURN.get()
+        capability_binding = None
+        if (
+            type(tool) is CliRunTool and turn is not None
+            and scope is None and not task_id and session_id == turn.session_id
+            and requested_by == turn.user_id
+        ):
+            if not turn.active:
+                return ToolResult.denied("CLI task is no longer active")
+            candidate = tool._approval_binding(
+                arguments, turn.id, session_id, "cli", requested_by, turn.resource_scope,
+            )
+            if candidate is not None and candidate[1] == str(turn.root) and not arguments.get("env"):
+                capability_binding = candidate
+                task_id, source, resource_scope = turn.id, "cli", turn.resource_scope
+
         approval_granted = False
+        revalidate = None
         approval_arguments = ({"mcp_classification_v1": mcp_binding, "arguments": arguments}
                               if is_mcp else arguments)
         if decision.decision is AccessDecision.REQUIRE_APPROVAL:
@@ -348,15 +369,42 @@ class ToolExecutor:
                     f"Tool {name} requires approval and source {source!r} is "
                     f"unattended (mode: {mode.value})"
                 )
-            approval_granted = await self.approvals.is_approved(
-                name,
-                approval_arguments,
-                task_id=task_id,
-                session_id=session_id,
-                requested_by=requested_by,
-                source=source,
-                resource_scope=resource_scope,
-            )
+            if capability_binding is not None:
+                if await self.approvals.task_operation_rejected(turn, capability_binding):
+                    return ToolResult.denied("Operation rejected in this task")
+                async def check_capability():
+                    return await self.approvals.task_capability(turn, capability_binding)
+
+                approval_granted = await check_capability()
+                if approval_granted:
+                    revalidate = check_capability
+            from Sprout.execution.coding_command_tool import IsolatedCodingCommandTool
+            from Sprout.execution.coding_commands import PlanBoundCodingCommands
+            from Sprout.security.approval import ApprovalStatus
+
+            if (type(tool) is IsolatedCodingCommandTool
+                    and type(tool._handler) is PlanBoundCodingCommands):
+                try:
+                    grant = await tool._handler.approval(
+                        self.approvals, task=tool._task, node=tool._node,
+                    )
+                except (PermissionError, ValueError) as exc:
+                    return ToolResult.denied(str(exc))
+                if grant.status is ApprovalStatus.PENDING:
+                    return ToolResult.needs_approval(grant.id)
+                if grant.status is not ApprovalStatus.APPROVED:
+                    return ToolResult.denied("Coding task capability rejected or unavailable")
+                approval_granted = True
+            if not approval_granted:
+                approval_granted = await self.approvals.is_approved(
+                    name,
+                    approval_arguments,
+                    task_id=task_id,
+                    session_id=session_id,
+                    requested_by=requested_by,
+                    source=source,
+                    resource_scope=resource_scope,
+                )
             if not approval_granted:
                 record = await self.approvals.request(
                     name,
@@ -368,6 +416,9 @@ class ToolExecutor:
                     session_id=session_id,
                     additional_events=self.events,
                 )
+                if (capability_binding is not None and record.expires_at is not None
+                        and permits_cli_task_reuse(capability_binding[0])):
+                    turn.offer(record.id, capability_binding)
                 return ToolResult.needs_approval(record.id)
 
         try:
@@ -381,15 +432,15 @@ class ToolExecutor:
                 approval_granted=approval_granted,
                 resource_scope=resource_scope,
             )
-            from Sprout.tools.system_tools import CliRunTool
-
             handoff = nullcontext()
             if approval_granted and type(tool) is CliRunTool:
-                binding = tool._approval_binding(
+                binding = capability_binding or tool._approval_binding(
                     contextual, task_id, session_id, source, requested_by, resource_scope,
                 )
                 if binding is not None:
-                    handoff = _approved_cli_call(tool._process_broker, self.approvals, binding)
+                    handoff = _approved_cli_call(
+                        tool._process_broker, self.approvals, binding, revalidate=revalidate,
+                    )
             if is_mcp:
                 handoff = _authorized_mcp_call(
                     tool, contextual, (task_id, session_id, source, requested_by, resource_scope),

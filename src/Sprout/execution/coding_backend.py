@@ -3,12 +3,36 @@
 import asyncio
 import hashlib
 import json
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict
 from uuid import NAMESPACE_URL, uuid5
 
 from Sprout.execution.coding_container import coding_image_ready, coding_plan
 from Sprout.execution.verification_run import input_manifest
 from Sprout.orchestration.models import NodeStatus
+
+
+_CODING_CAPABILITY = ContextVar("coding_capability", default=None)
+_CODING_PROCESS = ContextVar("coding_capability_process", default=None)
+
+
+@contextmanager
+def _coding_capability(check):
+    token = _CODING_CAPABILITY.set(check)
+    try:
+        yield
+    finally:
+        _CODING_CAPABILITY.reset(token)
+
+
+async def _run_coding_process(call, task_id, argv, **kwargs):
+    check = _CODING_CAPABILITY.get()
+    token = _CODING_PROCESS.set((asyncio.current_task(), task_id, tuple(argv), check))
+    try:
+        return await call(task_id, argv, **kwargs)
+    finally:
+        _CODING_PROCESS.reset(token)
 
 
 class DockerCodingBackend:
@@ -60,8 +84,8 @@ class DockerCodingBackend:
             {"id": identity, "node_id": node_id, "task_id": request.task_id,
              "owner": self._owner, "slot": self._slot, "signature": signature,
              "inputs": inputs, "schema_version": 1}, default=str)))
-        inspection = await self._runner.run_task_process(
-            request.task_id, ("docker", "image", "inspect", request.image), timeout_seconds=15)
+        inspection = await _run_coding_process(
+            self._runner.run_task_process, request.task_id, ("docker", "image", "inspect", request.image), timeout_seconds=15)
         if inspection.needs_approval:
             return inspection
         if not coding_image_ready(inspection):
@@ -69,7 +93,7 @@ class DockerCodingBackend:
         authorize = getattr(self._runner, "authorize_task_process", None)
         if not callable(authorize):
             raise ValueError("Coding authorization preflight unavailable")
-        authorization = await authorize(request.task_id, command)
+        authorization = await _run_coding_process(authorize, request.task_id, command)
         if not authorization.allowed:
             return authorization
         await self._check(request, node_id)
@@ -83,8 +107,10 @@ class DockerCodingBackend:
         if not await self._metadata.claim_coding_execution(record):
             raise RuntimeError("Coding claim changed; do not execute")
         try:
-            result = await self._runner.run_task_process(
-                request.task_id, command, timeout_seconds=60, max_output_bytes=64 * 1024)
+            result = await _run_coding_process(
+                self._runner.run_task_process, request.task_id, command,
+                timeout_seconds=60, max_output_bytes=64 * 1024,
+            )
             if result.allowed and (result.exit_code is None or result.error):
                 raise RuntimeError("Coding execution result unconfirmed; do not retry")
         except BaseException:

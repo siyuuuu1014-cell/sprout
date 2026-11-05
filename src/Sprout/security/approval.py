@@ -20,19 +20,24 @@ import asyncio
 import hashlib
 import json
 from collections.abc import Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 from uuid import uuid4
 
 from Sprout.events import APPROVAL_DECIDED, APPROVAL_EXPIRED, APPROVAL_REQUESTED, Event, EventBus
 from Sprout.events.catalog import APPROVAL_REUSED
-from Sprout.task.models import UNATTENDED_SOURCES, TaskSource, coerce_source
+from Sprout.task.models import UNATTENDED_SOURCES, TaskSource, TaskStatus, coerce_source
 
 if TYPE_CHECKING:
     from Sprout.config.settings import SecuritySettings
     from Sprout.security.audit import SecurityAuditLog
+
+
+CODING_TASK_CAPABILITY = "coding_task_capability_v1"
 
 
 class ApprovalStatus(StrEnum):
@@ -193,6 +198,32 @@ class ApprovalStore(Protocol):
     ) -> ApprovalRecord | None: ...
 
 
+@dataclass(slots=True)
+class CapabilityTurn:
+    """Host-owned authority for one interactive CLI turn."""
+
+    user_id: str
+    session_id: str
+    root: Path
+    id: str = field(default_factory=lambda: f"turn-{uuid4()}")
+    active: bool = True
+    workspace_id: str = ""
+    offers: dict[str, tuple] = field(default_factory=dict)
+    grants: set[str] = field(default_factory=set)
+
+    @property
+    def resource_scope(self) -> str:
+        return f"{self.workspace_id}:{self.root}" if self.workspace_id else str(self.root)
+
+    def offer(self, approval_id: str, binding: tuple) -> None:
+        self.offers[approval_id] = binding
+
+
+_CAPABILITY_TURN: ContextVar[CapabilityTurn | None] = ContextVar(
+    "approval_capability_turn", default=None,
+)
+
+
 class ApprovalManager:
     """Creates, queries, decides, and expires approval requests."""
 
@@ -323,7 +354,10 @@ class ApprovalManager:
                             else self.class_key_for(tool, arguments)),
         )
         create_pending = getattr(self._store, "get_or_create_pending_approval", None)
-        if request_approval and task_id and requested_by and session_id and callable(create_pending):
+        if (
+            request_approval and task_id and requested_by and callable(create_pending)
+            and (session_id or tool == CODING_TASK_CAPABILITY)
+        ):
             stored = await create_pending(record)
             if stored.id != record.id:
                 return stored
@@ -347,6 +381,125 @@ class ApprovalManager:
                 additional_events=additional_events,
             )
         return record
+
+    async def coding_task_capability(self, task, binding: str) -> ApprovalRecord:
+        """Read or request the durable isolated coding command category."""
+        if (
+            task.status is not TaskStatus.RUNNING or not task.workspace_id
+            or not task.actor.authenticated or task.actor.source != "cli"
+            or task.source != "cli" or not self.asks_a_human(task.source)
+        ):
+            raise PermissionError("Authenticated CLI task required for coding capability")
+        arguments = {
+            "operation": "Run isolated coding commands and import permitted sandbox changes",
+            "actor": task.actor.user_id,
+            "workspace": task.workspace_id,
+            "task_binding": binding,
+        }
+        fingerprint = self.fingerprint(arguments)
+        for status in (ApprovalStatus.REJECTED, ApprovalStatus.APPROVED):
+            record = await self._store.find_approval(
+                CODING_TASK_CAPABILITY, fingerprint, status, task.id,
+            )
+            if (
+                record is not None and record.requested_by == task.actor.user_id
+                and record.resource_scope == task.workspace_id and record.source == "cli"
+                and not record.single_use
+                and record.expires_at is not None and record.expires_at > datetime.now(UTC)
+            ):
+                return record
+        return await self.request(
+            CODING_TASK_CAPABILITY, arguments, task_id=task.id,
+            requested_by=task.actor.user_id, source=task.source,
+            resource_scope=task.workspace_id, single_use=False,
+            ttl_seconds=self.policy.timeout_seconds or 3600,
+        )
+
+    async def revoke_coding_task_capability(self, approval_id: str, *, principal) -> bool:
+        async with self._consume_lock(approval_id):
+            record = await self._store.get_approval(approval_id)
+            if (
+                record is None or record.tool != CODING_TASK_CAPABILITY
+                or not principal.authenticated or principal.source != "cli"
+                or record.requested_by != principal.user_id
+            ):
+                raise PermissionError("Coding capability owner required")
+            record.status = ApprovalStatus.CONSUMED
+            record.reason = "Coding task capability revoked"
+            return await self._store.save_approval_if_status(record, ApprovalStatus.APPROVED)
+
+    async def decide_task_capability(
+        self, turn: CapabilityTurn, approval_id: str, *, decided_by: str,
+    ) -> ApprovalRecord:
+        if not turn.active or decided_by != turn.user_id or approval_id not in turn.offers:
+            raise PermissionError("Task capability does not belong to this turn")
+        async with self._consume_lock(approval_id):
+            record = await self._store.get_approval(approval_id)
+            if (
+                not turn.active or record is None or record.status is not ApprovalStatus.PENDING
+                or not self._matches_capability_turn(record, turn)
+            ):
+                raise PermissionError("Task capability requires a pending CLI approval")
+            record = await self._apply_decision(
+                record, True, decided_by=decided_by,
+                reason="Approved executable and working directory for this task", channel="cli",
+            )
+            if turn.active and record.status is ApprovalStatus.APPROVED:
+                turn.grants.add(approval_id)
+            return record
+
+    @staticmethod
+    def _matches_capability_turn(record: ApprovalRecord, turn: CapabilityTurn) -> bool:
+        return (
+            record.tool == "cli_tool_run" and record.task_id == turn.id
+            and record.requested_by == turn.user_id and record.session_id == turn.session_id
+            and record.resource_scope == turn.resource_scope and record.source == "cli"
+        )
+
+    async def revoke_task_capability(self, turn: CapabilityTurn, approval_id: str) -> None:
+        async with self._consume_lock(approval_id):
+            if approval_id not in turn.grants:
+                return
+            turn.grants.remove(approval_id)
+            record = await self._store.get_approval(approval_id)
+            if record is not None and self._matches_capability_turn(record, turn):
+                record.status = ApprovalStatus.CONSUMED
+                record.used_at = datetime.now(UTC)
+                record.reason = "Task capability revoked"
+                if await self._store.save_approval_if_status(record, ApprovalStatus.APPROVED):
+                    await self._audit_decision(record, channel="cli")
+
+    async def task_operation_rejected(self, turn: CapabilityTurn, binding: tuple) -> bool:
+        for approval_id, original in tuple(turn.offers.items()):
+            if (*original[:3], *original[4:]) != (*binding[:3], *binding[4:]):
+                continue
+            record = await self._store.get_approval(approval_id)
+            if record is not None and record.status is ApprovalStatus.REJECTED:
+                return True
+        return False
+
+    async def task_capability(self, turn: CapabilityTurn, binding: tuple) -> bool:
+        from Sprout.security.commands import permits_cli_task_reuse
+
+        if not turn.active or not permits_cli_task_reuse(binding[0]):
+            return False
+        for approval_id in tuple(turn.grants):
+            original = turn.offers[approval_id]
+            # Reuse the executable, working directory, environment and authority.
+            # The argv tail and timeout are expressly covered by the CLI choice.
+            if (original[0][0], *original[1:3], *original[4:]) != (
+                binding[0][0], *binding[1:3], *binding[4:]
+            ):
+                continue
+            record = await self._store.get_approval(approval_id)
+            if (
+                turn.active and approval_id in turn.grants and record is not None
+                and record.status is ApprovalStatus.APPROVED
+                and self._matches_capability_turn(record, turn)
+                and record.expires_at is not None and record.expires_at > datetime.now(UTC)
+            ):
+                return True
+        return False
 
     async def find_pending(
         self, tool: str, arguments: Mapping[str, Any], *, task_id: str = ""
@@ -498,6 +651,7 @@ class ApprovalManager:
         decided_by: str = "human",
         reason: str | None = None,
         channel: str = "cli",
+        principal=None,
     ) -> ApprovalRecord:
         if await self._store.get_approval(approval_id) is None:
             raise LookupError(f"Approval not found: {approval_id}")
@@ -509,6 +663,12 @@ class ApprovalManager:
             record = await self._store.get_approval(approval_id)
             if record is None:
                 raise LookupError(f"Approval not found: {approval_id}")
+            if record.tool == CODING_TASK_CAPABILITY and (
+                channel != "cli" or principal is None or not principal.authenticated
+                or principal.source != "cli" or principal.user_id != record.requested_by
+                or decided_by != principal.user_id
+            ):
+                raise PermissionError("Coding capability decision requires its CLI owner")
             if record.status is not ApprovalStatus.PENDING:
                 if record.status is ApprovalStatus.APPROVED and approved:
                     return record

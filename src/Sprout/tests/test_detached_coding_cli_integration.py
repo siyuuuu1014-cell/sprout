@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import sys
+from dataclasses import replace
 from datetime import timedelta
 from uuid import uuid4
 
@@ -27,7 +28,8 @@ from Sprout.task.models import Task, TaskBudget, TaskStatus
 from Sprout.tests.test_coding_docker_integration import inspect_and_remove_owned_stopped
 
 
-async def test_formal_detached_coding_flow(tmp_path):
+@pytest.mark.parametrize("approval_resume", [False, True], ids=["existing", "a2-resume"])
+async def test_formal_detached_coding_flow(tmp_path, approval_resume):
     host, image = os.getenv("SPROUT_TEMPORAL_TEST_HOST"), os.getenv("SPROUT_CODING_TEST_IMAGE")
     if not host or not image:
         pytest.skip("Explicit dedicated Temporal and pinned local Docker image required")
@@ -70,7 +72,9 @@ async def test_formal_detached_coding_flow(tmp_path):
     processes = []
 
     async def invoke(command, *options):
-        child = await asyncio.create_subprocess_exec(sys.executable, "-m", "Sprout", "evolution",
+        module = ("Sprout.tests.offline_evolution_cli_harness"
+                  if command == "replay-continue" else "Sprout")
+        child = await asyncio.create_subprocess_exec(sys.executable, "-m", module, "evolution",
             command, task.id, "--database", str(directory / "metadata.db"), *map(str, options),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         try:
@@ -102,6 +106,10 @@ async def test_formal_detached_coding_flow(tmp_path):
                 "replay_source_task_id": "detached-offline-trial", "acceptance_spec": acceptance,
                 "required_paths": ["app.py"], "require_acceptance_tests": True,
                 "regression_fingerprint": freeze(directory, regression)})
+        if approval_resume:
+            task = replace(task, delegation_scope=replace(
+                task.delegation_scope, allowed_paths=("app.py",),
+            ))
         await metadata.save_task(task)
         submitted = await invoke("coding-submit", "--config", config,
             "--temporal-host", host, "--temporal-namespace", namespace)
@@ -112,12 +120,50 @@ async def test_formal_detached_coding_flow(tmp_path):
         worker = await asyncio.create_subprocess_exec(sys.executable, "-m",
             "Sprout.tests.detached_coding_worker_fixture", "evolution", "coding-worker", task.id,
             "--database", str(directory / "metadata.db"), "--config", str(config),
+            env={**os.environ, "SPROUT_A2_CLI_RESUME": str(int(approval_resume))},
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE)
         observed = await invoke("coding-status", "--wait-seconds", "30")
         assert observed["result"]["status"] == "waiting_approval", observed
         assert worker.returncode is None
         nodes = await metadata.list_execution_nodes(task.id)
+        if approval_resume:
+            await invoke("coding-sync")
+            waiting = next(node for node in nodes if node.type is NodeType.AGENT)
+            approval_id, = waiting.metadata["output"]["pending_approvals"]
+            grant = await runtime.approvals.store.get_approval(approval_id)
+            assert grant.tool == "coding_task_capability_v1"
+            worker.stdin.write(b"interrupt\n")
+            await worker.stdin.drain()
+            out, err = await asyncio.wait_for(worker.communicate(), timeout=20)
+            assert worker.returncode == 0, (out, err)
+            worker = None
+            result = await invoke("replay-continue", "--config", config, "--approve", approval_id)
+            assert result["task_id"] == task.id
+            settled = await metadata.get_execution_node(waiting.id)
+            rows = await metadata._db.fetchall(
+                "SELECT id, state, result_json FROM coding_executions WHERE node_id=?",
+                (waiting.id,),
+            )
+            assert settled.status.value == "completed", settled
+            launches = [
+                json.loads(row["result_json"]) for row in rows if row["state"] == "completed"
+                and json.loads(row["result_json"]).get("started") is True
+            ]
+            assert len(launches) == 1 and launches[0]["exit_code"] == 0
+            grants = await runtime.approvals.store.list_approvals()
+            assert [(item.id, item.status.value) for item in grants] == [(approval_id, "approved")]
+            with pytest.raises(AssertionError, match="Only an existing approval wait"):
+                await invoke("replay-continue", "--config", config, "--approve", approval_id)
+            assert await metadata._db.fetchall(
+                "SELECT id, state, result_json FROM coding_executions WHERE node_id=?",
+                (waiting.id,),
+            ) == rows
+            print(json.dumps({"task_id": task.id, "node_id": waiting.id,
+                              "approval_id": approval_id, "task_status": result["status"],
+                              "coding_launches": len(launches), "exit_code": launches[0]["exit_code"],
+                              "stdout": launches[0]["stdout"], "replay": False}))
+            return
         assert next(node for node in nodes if node.type is NodeType.EVALUATION).metadata[
             "output"]["verification_report"]["verified"] is True
         synced = await invoke("coding-sync")

@@ -70,6 +70,7 @@ class _ProjectNodeScope:
     untracked_tool_use: bool = False
     sandbox_tool_results: tuple = ()
     local_evaluation_result: object = None
+    isolated_design_result: object = None
     read_captured: bool = False
     resource_receipts: tuple = ()
     parent_receipts: tuple = ()
@@ -166,6 +167,7 @@ class _CliHandoff:
     owner: object
     binding: tuple
     expires: float
+    revalidate: object = None
     active: bool = True
     consumed: bool = False
 
@@ -176,7 +178,7 @@ _CLI_HANDOFF_TTL = 5.0
 
 
 @contextmanager
-def _approved_cli_call(broker, approvals, binding):
+def _approved_cli_call(broker, approvals, binding, *, revalidate=None):
     """Executor-only handoff after ApprovalManager consumption, not a token API.
 
     Private in-process service code is trusted; arbitrary Python extensions are
@@ -184,7 +186,7 @@ def _approved_cli_call(broker, approvals, binding):
     propagation to child tasks is insufficient: the consumer checks task identity.
     """
     handoff = _CliHandoff(broker, approvals, asyncio.current_task(), binding,
-                          time.monotonic() + _CLI_HANDOFF_TTL)
+                          time.monotonic() + _CLI_HANDOFF_TTL, revalidate)
     token = _CLI_HANDOFF.set(handoff)
     try:
         yield
@@ -194,7 +196,7 @@ def _approved_cli_call(broker, approvals, binding):
         _CLI_HANDOFF.reset(token)
 
 
-def _consume_cli_approval(broker, approvals, binding):
+async def _consume_cli_approval(broker, approvals, binding):
     handoff = _CLI_HANDOFF.get()
     if handoff is None or binding is None or approvals is None:
         return False
@@ -206,4 +208,6 @@ def _consume_cli_approval(broker, approvals, binding):
                 or time.monotonic() >= handoff.expires or handoff.binding != binding):
             return False
         handoff.consumed = True
-        return True
+    if handoff.revalidate is not None and not await handoff.revalidate():
+        raise PermissionError("Task capability expired, ended or was revoked")
+    return True

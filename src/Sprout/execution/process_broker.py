@@ -1243,13 +1243,26 @@ class ProcessBroker:
             # consuming any CLI handoff, including otherwise valid ones.
             return replace(withheld, error=f"{decision.reason} (source {source!r} is unattended, "
                            f"mode: {self._approvals.mode_for(source).value})")
-        if context is None and _consume_cli_approval(self, self._approvals, cli_binding):
-            return None
+        if context is None:
+            try:
+                if await _consume_cli_approval(self, self._approvals, cli_binding):
+                    return None
+            except PermissionError as exc:
+                return replace(withheld, error=str(exc))
         if self._approvals is None:
             return replace(
                 withheld,
                 error=f"{decision.reason} (no approval manager is configured)",
             )
+        from Sprout.execution.coding_backend import _CODING_PROCESS
+
+        coding = _CODING_PROCESS.get()
+        if (context is None and self._frozen_dispatch.get() is None and coding is not None
+                and coding[:3] == (asyncio.current_task(), task_id, command)
+                and coding[3] is not None):
+            if await coding[3](self._approvals, request.actor, resource_scope, source):
+                return None
+            return replace(withheld, error="Isolated coding task capability unavailable")
         # Task-scoped, not command-scoped: the approval arguments deliberately
         # carry no command, so one grant covers a whole verification round.
         # Keyed per command, a six-command round would ask six times, which no

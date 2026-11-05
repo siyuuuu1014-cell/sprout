@@ -1,8 +1,8 @@
 # SEAM Sprout｜审批体验改造与 Temporal 后续实施交接
 
-> **当前状态（2026-11-05）** PR-A1 收尾阶段，LOCAL_TESTED，等待确认。A/B 最终定向复测通过。C BLOCKED，可信 Sprout 执行入口独立保留，不阻塞 PR-A2。D 已验证单 Python 文件统计。PR-A2 NOT_STARTED，R04 历史验收 ON_HOLD，Temporal DEFERRED。真实模型对话、Docker、全仓 CI 和 Temporal 测试均为 NOT_RUN。
+> **当前状态（2026-11-05）** PR-A1 LOCAL_COMMITTED、PUSHED，未合并。A/B 最终定向复测通过。C BLOCKED，可信 Sprout 执行入口独立保留，不阻塞 PR-A2。D 已验证单 Python 文件统计。PR-A2 IN_PROGRESS，R04 历史验收 ON_HOLD，Temporal DEFERRED。正式 CLI 恢复已在本地 Temporal 和固定 Docker 镜像上通过。双 Node 授权复用已由真实 Docker 夹具验证。正式 CLI 图完成一个 Coding Node，随后停在既有 GitBroker 审查失败。真实模型和全仓 CI 为 NOT_RUN。
 >
-> **当前最高优先级** 修复实际问题、完成核心功能、实现 Coding Agent 真实执行闭环。执行顺序为 PR-A1 → PR-A2 → PR-A3 → Temporal → Coding Agent。保留 Policy.DENY、Broker、工作区范围及 Git Apply 门禁。
+> **当前最高优先级** 修复实际问题、完成核心功能、实现 Coding Agent 真实执行闭环。执行顺序为 PR-A2 → PR-A3 → Temporal → Coding Agent 完整功能闭环。保留 Policy.DENY、Broker、工作区范围及 Git Apply 门禁。
 >
 > 日期：2026-11-05（Asia/Singapore）｜仓库：`https://github.com/siyuuuu1014-cell/sprout`｜目标分支：`dev`  
 > **最新已核实基线：`df4e4c5472ccf0fe536ac563a4617ad54f48502a`（PR #9，2026-11-05 14:23 SGT）**。这比先前交接 `9b536e7` 更新。后续开工前需重新 `git fetch origin` 确认 HEAD，若变化先比较。  
@@ -235,7 +235,7 @@ uv run ruff check src/Sprout/security src/Sprout/tools src/Sprout/agent src/Spro
 
 Temporal 开工顺序：T0 固定现状 replay/queue 类型 → T1 文件与依赖注入分离 → T2 SDK 合同修正 → T3 Worker/Client/Activity 真实集成 → T4 worker 中断与任务恢复 / UNKNOWN Effect / 不重复副作用 → T5 文档/部署命令。**用户现在要求先做审批，Temporal 暂未动工。**
 
-## 9. 推荐立刻执行的下一轮任务（粘贴给 Codex 或新会话）
+## 9. 历史记录（PR-A1 开工指令，已由当前路线取代）
 
 > 请在 `siyuuuu1014-cell/sprout` 最新 `dev` 上，先做“审批体验改造”的 PR-A1（显示准确、审批去重、低风险只读分类与代码量统计入口）。遵守《SEAM Sprout 技术架构与实施总方案 v1.0》的 §9/§12/§15/§17 和《v2.1 修订版》的 R04/R06/R06b/F22，保留既有 `ApprovalManager`、ToolExecutor、Broker、Task 和受保护 `dev`。不得先修 R04 历史 CI 故障，不得重构 Temporal，不得做平行审批体系。先用源代码和测试确认 PR #9 的 `seen_calls`、`workspace/code_metrics.py` 已做了什么；针对实际日志“一个代码行数问题反复弹审批”的负例写失败测试，再以最小更改修复。
 >
@@ -312,3 +312,114 @@ Temporal 开工顺序：T0 固定现状 replay/queue 类型 → T1 文件与依�
 - BLOCKED（C）：可信 Sprout 执行入口独立保留，不阻塞 PR-A2。D 的现有授权单 Python 文件统计和路径拒绝已复测。
 - PR-A2 NOT_STARTED。范围为可信 Task/Turn 上下文、同任务一次能力授权、跨命令复用，以及主体、工作区、期限和撤销约束。
 - R04 历史验收 ON_HOLD。Temporal DEFERRED。真实模型对话、Docker、全仓 CI 和 Temporal 测试均为 NOT_RUN。
+
+
+### PR-A2 开工记录
+
+- PR-A1 LOCAL_COMMITTED、PUSHED，提交为 `e116657f6e9874f557afcb5d0cf50dbe53692630`。推送时 `origin/dev` 为 `df4e4c5472ccf0fe536ac563a4617ad54f48502a`。
+- PR-A2 IN_PROGRESS，本地分支 `codex/approval-pr-a2` 直接继承上述 A1 提交。
+- 调用链核对完成。受节点约束的 ToolExecutor 可从 Runtime 获取可信任务身份和工作区。普通 Agent 执行路径当前只传主体和 Session。CLI 的进程授权交接按实际命令绑定，验证轮次另有专用审批，冻结验证和 Git Apply 有独立门禁。
+- 待实现服务端 Task/Turn 上下文、显式任务能力授权与审批呈现、期限和撤销、任务结束时失效，以及进程执行集成和负例回归。
+- A2 定向测试和实际审批次数为 NOT_RUN。此前 A1 的 224 passed、1 skipped 仅属于 A1。
+
+
+### PR-A2 CLI Turn 实现与复测
+
+- IN_PROGRESS，当前分支 codex/approval-pr-a2，基线 e116657f6e9874f557afcb5d0cf50dbe53692630。A1 已推送，未合并。
+- 已实现认证 CLI 普通会话的 Host Turn、任务授权选项、同一可执行文件和工作目录下跨参数和超时复用。授权基于现有 ApprovalRecord，复用资格保存在当前 Runtime。ProcessBroker 仍执行策略判定，并在消费精确调用交接时重新检查任务授权。
+- 已验证确定性模型发出五个不同命令，实际子进程启动五次，CLI 提示一次。拒绝提示一次、启动零次。同 Session 新 Turn 重新要求审批，批准后取消阻断恢复。
+- PASS：A2 独立最终测试 6 passed。直接回归此前 186 passed、1 skipped，符号链接不可用。新增取消用例在独立最终测试中通过。NOT_RUN：真实模型、全仓 CI、Docker 和 Temporal。
+- 当前能力按可执行文件和工作目录授权，参数和超时可变，环境覆盖不在授权内。工作目录限制沿用现有进程策略，宿主进程没有新增文件系统隔离。
+- 待完成：持久 Task 节点的能力授权、注册 Workspace 绑定、跨进程恢复和 CLI 撤销入口。当前撤销和取消由 Runtime 入口提供。R04 历史验收 ON_HOLD。
+
+
+### PR-A2 v2 定向验收
+
+- DONE：CLI 一次审批可覆盖本批次明确展示的多个程序。每条待审批保留独立记录和决定。后续命令只在已批准的程序、Turn 和工作目录内复用。
+- DONE：普通 CLI Turn 在当前目录与唯一注册 Workspace 根目录匹配时绑定其 ID 和路径，恢复时重新核对注册路径。未配置 MetadataStore 的嵌入场景保留原目录绑定。
+- DONE：Python 与 Git 的确定性测试实际运行五条命令，提示 1 次，创建 2 条审批记录，成功工具执行和子进程启动均为 5 次。最终定向回归 188 passed、1 skipped，跳过项需要符号链接。
+- BLOCKED：持久 Task 节点的授权接入未完成。Coding Node 使用隔离命令执行器，现有 CLI Turn 许可不能代替隔离节点的身份、工作区和恢复合同。
+- NOT_RUN：持久节点跨节点复用、Runtime 重启后恢复、真实模型、全仓 CI、Docker、Temporal。跨进程恢复需持久授权与现有节点执行凭证协同，防止已执行操作被重放。当前 CLI Turn 复用资格随 Runtime 退出失效。
+
+
+### PR-A2 v3 批次拒绝回归
+
+- DONE：拒绝当前展示的 Python 和 Git 批次时，CLI 一次提示处理两条审批，状态均为 REJECTED，实际启动 0 次。修复前的同一用例观察到 2 次提示。
+- PASS：最终定向回归 189 passed、1 skipped。符号链接不可用。既有跨程序批准测试继续断言 1 次提示、2 条审批、5 次真实启动和 5 个结果。
+- IN_PROGRESS：持久 Coding Task 路径为 NodeExecutor → IsolatedCodingCommandTool → PlanBoundCodingCommands → CodingNodeSession → IsolatedNodeDispatcher → DockerCodingBackend。节点输出持有 pending_approvals 和 pending_tool_calls。持久任务的任务级授权、跨节点复用、审批恢复与重建验收尚未实现。
+- NOT_RUN：持久 Coding Node 真执行、重建 Runtime 后的恢复、Temporal、全仓 CI。Docker 引擎检查返回 29.8.0，尚未运行容器验收。现有本地节点守卫和执行记录仍需接入并验证，当前没有证据将缺口归因于 Temporal。
+
+
+### PR-A2 v4 持久 Coding Task 授权
+
+- IN_PROGRESS。现有审批存储新增版本化操作类别 coding_task_capability_v1。授予隔离 Coding 命令和受限产物导入，绑定 Task、CLI Actor、Workspace 和冻结任务输入。不同 Node 仍分别校验持久所有权。
+- 已接入 ToolExecutor 的 REQUIRE_APPROVAL 分支及现有 replay-continue --approve。审批和恢复沿用现有等待节点。独立验证与 Git Apply 使用各自的授权。
+- PASS：SQLite 用例观察到 1 条初始审批，两次申请返回同一 ID。重开审批库及新建 ApprovalManager 后，第二个已认领 Node 读到同一授权。已完成 Node 无法再次取得授权。覆盖过期、撤销、拒绝、取消、完成和不同 Task。
+- PASS：最终定向回归 113 passed，1 skipped。跳过的 Docker 图测试要求 SPROUT_CODING_TEST_IMAGE 指向显式固定镜像。
+- NOT_RUN：持久 Coding Node 的实际容器执行、完整 Runtime 重建并恢复、审批后原 Task 端到端跑完、Temporal 和全仓 CI。SQLite 重开验证仅覆盖授权持久性和节点守卫。本轮未记录真实容器启动或完成 Node。
+
+
+### PR-A2 v5 固定镜像验收
+
+- DONE：Coding 命令适配器向 Broker 提供绑定本次调用的私有校验。Broker 先应用原策略，仅在 REQUIRE_APPROVAL 时查验当前 Task 能力。范围为后端生成的镜像检查、预检和容器启动，继续检查当前节点所有权、Actor、Workspace 和权限期限。冻结验证不消费该交接。
+- PASS：固定本地镜像 sha256:11880faa03b5dda1f3f54a915ad1b0e3d2a97664799d7a9bfcd3790a9dc7a31d。Task 773f2d82-96e0-4736-a42f-0377fae51b41 使用审批 56b0bfc3-2a06-40e5-8573-0faae338033e。重开 SQLite 审批库并重建管理器、守卫和命令适配器后，等待节点及后续节点均真实运行。两个 Coding 容器退出码 0，stdout 均为 coding-node-ok。两个已完成节点重新进入守卫时未调用执行器。另有 1 次基线验证容器启动。
+- 验收范围：测试用审批 API 明确批准 1 次，产生 1 条记录，没有交互提示。Coding 进程策略显式返回 REQUIRE_APPROVAL，真实 Broker 没有再建单。夹具直接用 NodeExecutionGuard 恢复，未执行完整 Runtime 重建或 replay-continue CLI。
+- FAILED：原有 Docker 图用例进入最终审批节点时未找到预期的 pending ChangeProposal。该失败在 v5 Broker 修改前已复现，未对 A1 基线执行 Docker 对照。最终相关集合 68 passed、1 failed。
+- NOT_RUN：完整 Runtime 重建与 CLI 续跑、真实模型、Temporal 和全仓 CI。PR-A2 保持 IN_PROGRESS。
+
+
+### PR-A2 v6 基线对照与验收边界
+
+- 对照：在独立 detached 工作树检出 A1 e116657f6e9874f557afcb5d0cf50dbe53692630，用相同固定镜像运行原始图测试。A1 与 A2 existing-graph 均在最终审批处缺少 ChangeProposal。两个 SQLite 节点记录均为 git_diff_unavailable: Task-owned GitBroker review required。该失败在 A1 已可复现。
+- PASS：A2 双节点容器夹具再次通过。Task e662431c-0a9a-4421-b95f-33709a8f4eac 使用审批 220eecae-bd8a-42b1-bde6-e919aa481785。两个 Coding 节点退出码均为 0，stdout 均为 coding-node-ok，完成后重新进入守卫未增加执行器调用。
+- 定向统计：68 passed、1 failed、1 skipped。失败为上述既有图用例，跳过的是要求专用 Temporal 路由的 detached CLI 集成入口。
+- NOT_RUN：完整 Runtime 重建并经 replay-continue --approve 恢复。当前没有运行中的专用 Temporal 测试端点。双节点 Docker 夹具通过守卫恢复，验收范围不包含真实 CLI 续跑。PR-A2 保持 IN_PROGRESS。
+
+
+### PR-A2 v7 专项验收状态
+
+- PRE_EXISTING_FAILURE：existing-graph 在 A1 e116657f 和 A2 上使用同一固定镜像均缺少待审批 ChangeProposal。节点记录为 git_diff_unavailable: Task-owned GitBroker review required。保留原始断言。
+- ENV_BLOCKED：PATH 和已检查的本地工具目录、下载目录及 SDK 常用缓存未发现可直接运行的 Temporal 开发服务器。127.0.0.1:17233 没有监听。SDK 自动下载路径未执行。
+- NOT_RUN：启动专用 Temporal 服务、关闭并重建完整 Runtime、通过真实 replay-continue --approve 继续原 Task、在该路径采集 Docker 启动、输出和防重放证据。本轮没有新增或运行 CLI 集成用例。
+- 沿用 v6 实测统计 68 passed、1 failed、1 skipped。失败为上述基线问题，跳过为缺少专用 Temporal 端点的 detached CLI 集成。双节点 Docker 结果仍属于守卫夹具验收。PR-A2 保持 IN_PROGRESS。
+
+
+### PR-A2 v8 正式 CLI 入口验收
+
+- 环境已就绪。Windows amd64 官方 Temporal CLI v1.10.0，内置 Server 1.32.2。发行 ZIP 与官方 checksums.txt 匹配。二进制 SHA-256 为 4CFD15F9753EB6AA47CA2AF00467C087F4AFC389C650B0B50A40982656057075。服务仅监听 127.0.0.1:17233，测试后已关闭。
+- A1 原始 detached CLI 用例和 A2 首次尝试均在 coding-submit 返回 preparation_subject_unavailable。仅给 A2 测试任务补齐显式工作区范围后，真实 CLI 提交与 Worker 启动通过。
+- FAILED：Task a80bce59-70f5-4af4-bb32-e152ff139c6a 的 agent 节点进入 waiting_resource。SQLite 记录 PermissionError: node_artifact_provenance_unavailable。该错误发生在创建任务能力审批前。补齐范围后的失败尚未在 A1 对照。
+- NOT_RUN：真实 replay-continue --approve、原任务重建后续跑、该路径的审批 ID、后续节点授权复用和防重放。既有 Docker 图失败仍标记 PRE_EXISTING_FAILURE。本轮没有修改审批或 Temporal 生产代码。PR-A2 保持 IN_PROGRESS。
+
+
+### PR-A2 v9 来源与正式恢复验收
+
+- A1 和 A2 均在显式工作区范围下复现隔离 TEST_DESIGN 来源缺失。READ、SANDBOX、PLAN 的来源记录存在，输出摘要匹配，父节点凭据齐全。TEST_DESIGN 已完成，但 _remember_node_product 的 host_acceptance_v1 分支不识别隔离基线结果，未生成待持久化的来源记录。
+- 独立 R04 衔接补丁复用现有产物校验及来源持久化，验证隔离基线的上游来源，并登记真实执行结果。恢复只接纳当前持久守卫节点的待执行调用。Coding 工具绑定与 FileBroker 导入使用实时 Task、Node、Sandbox 和具体请求路径。
+- PASS：正式 coding-submit 和独立 Worker 到达任务能力等待。原 Worker 退出后，真实 replay-continue --approve 重新组装 Runtime/Worker。Task 3f83971f-00fb-46fe-a0ca-f4e987a1ffe9 及其 :agent 节点保持不变。审批 10094896-0c85-46ce-a7aa-509325eabae3 是唯一记录。原 Node 完成，一次 Coding 容器启动，退出码 0，stdout 为空。再次 CLI 续跑被拒绝，持久执行记录相同。
+- PRE_EXISTING_FAILURE：任务随后停在 GitBroker 审查，最终状态 waiting_resource。正式图本次只执行一个 Coding Node，跨第二 Node 仅有 v5/v6 的双节点容器夹具证据。
+- 最终测试：正式 CLI 1 passed、1 deselected；审批、来源和守卫定向回归 56 passed。专项定位过程中旧 A1/A2 图在来源缺失处失败，另一次真实续跑的导入结果保持 uncertain，未重放。Temporal 测试服务由每次调用的 finally 关闭。
+
+
+### PR-A2 v10 提交前审查
+
+- 正式 replay-continue 使用生产 CLI main 和命令处理器。offline_evolution_cli_harness 替换模型、ToolExecutor Policy、ProcessBroker 和 FileBroker 策略，真实 Temporal、SQLite、Docker 与恢复入口参与验收。生产默认策略和真实模型未验收。
+- ContextBuilder 复制经当前守卫校验的待执行调用，避免接纳后的可变别名。隔离导入在 Broker 判定前显式检查当前 Task 和具体文件 Scope。
+- PASS：83 项定向回归覆盖审批、恢复输入、Scope、执行记录和来源校验。正式 CLI 1 passed、1 deselected。Task 89afc110-147e-4612-a325-6405463aa4c1 使用唯一审批 00e51ad0-c097-482e-9421-40492560aed9，原 Agent 完成，Coding 容器启动 1 次，退出码 0，stdout 为空。再次续跑未增加执行记录。
+- PRE_EXISTING_FAILURE：最终 GitBroker 审查在 A1 已复现。正式 CLI 图仅有一个 Coding Node，双节点复用证据来自独立真实 Docker 夹具。
+- 补丁基线为 A1 e116657f6e9874f557afcb5d0cf50dbe53692630。完整 v10 包含 R04 衔接修复。拆分应用时先应用独立 R04，再应用 A2 增量。
+
+
+### PR-A2 v11 CLI Git 副作用复核
+
+- v10 的 Git 程序级任务授权可将 git push 送达被拦截的子进程入口。v11 将 Git 任务授权限制为固定的 --version 和 --exec-path。普通 push 和 commit 需要单独的精确审批。
+- 已有强推拒绝规则对实际解析后的 git 可执行文件名匹配。测试对强推提供精确审批，Broker 仍拒绝。子进程全部拦截，仅观察到两次安全查询尝试。
+- 最终 Git 定向回归 143 passed、1 skipped。跳过项需要符号链接。Python/Git 批量批准与拒绝继续通过。v10 正式 CLI 恢复结果沿用。
+
+
+### PR-A2 v11 最终边界复核
+
+- PASS。拦截式 Broker 测试覆盖 git -C <repo> push --force、git push origin branch --force 和末尾 -f。即使取得精确审批，默认 DENY 仍拒绝启动。实际 Git 写入和网络发布均为零。
+- 普通 CLI 的程序级任务授权允许 Python 等获批程序在同一 Turn 使用其他参数，可能间接修改文件或启动 Git。该授权没有操作系统隔离，和隔离 Coding Task 授权分别处理。提示已说明这一范围。直接 Git 任务授权限于 --version 和 --exec-path。
+- 最终定向结果 143 passed、1 skipped。跳过项需要符号链接。正式 CLI 恢复沿用 v10 已通过结果。GitBroker 图失败仍为 PRE_EXISTING_FAILURE。
+- A2 功能冻结，等待提交审查。最终 v11 增量以完整 v10 工作树为基线。

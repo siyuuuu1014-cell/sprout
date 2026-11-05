@@ -360,6 +360,13 @@ class NodeExecutor:
                 or current.delegation_scope.is_expired()):
             raise PermissionError("node_publication_authority_changed")
         nodes = await self._metadata.list_execution_nodes(current.id)
+        # The guarded resume envelope belongs to this node. Its pending tool
+        # calls are replay input, not a completed upstream artifact.
+        guard = persisted.metadata.get("execution_guard", {})
+        output = persisted.metadata.get("output")
+        if (guard.get("resume_key") and isinstance(output, dict)
+                and output.get("waiting") is True and output.get("pending_approvals")):
+            nodes = [item for item in nodes if item.id != node.id]
         admitted = await scope.runtime._admit_node_products(scope, nodes)
         if (not admitted and (node.dependencies or node.result_ref is not None
                 or any(item.task_id != current.id or item.result_ref is not None
@@ -690,12 +697,20 @@ class NodeExecutor:
                 return {"waiting": True, "waiting_kind": "configuration",
                         "reason": "isolated_session_not_assembled",
                         "acceptance_spec": spec.to_payload(), "acceptance_fingerprint": fingerprint}
+            from Sprout.tools.context_keys import _current_project_node
+
+            scope = _current_project_node()
+            if scope is not None:
+                await self._check_model_publication(node, workspace, task)
             session = self._coding_session_factory(task=task, node=node, sandbox=sandbox)
             measured = await session.verify(acceptance_spec=spec.to_payload(),
                                             regression_spec=None, phase="baseline")
-            return {**measured, "isolated_design": True, "acceptance_spec": spec.to_payload(),
-                    "acceptance_fingerprint": fingerprint, "baseline": measured.get("results", []),
-                    "baseline_failed": measured.get("status") == "failed"}
+            result = {**measured, "isolated_design": True, "acceptance_spec": spec.to_payload(),
+                      "acceptance_fingerprint": fingerprint, "baseline": measured.get("results", []),
+                      "baseline_failed": measured.get("status") == "failed"}
+            if scope is not None:
+                scope.isolated_design_result = result
+            return result
         if task.metadata.get("host_acceptance_v1") is not None:
             return await self._host_test_design(node, workspace, task, sandbox)
         payload = previous.get("acceptance_spec")
