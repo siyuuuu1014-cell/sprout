@@ -150,6 +150,20 @@ async def test_ordinary_analysis_output_is_preserved(tmp_path, flag):
 @pytest.mark.parametrize("plugin", [False, True])
 @pytest.mark.parametrize("flag", [None, False])
 async def test_ordinary_or_unrelated_plugin_keeps_approval_flow(tmp_path, plugin, flag):
+    if not plugin:
+        from Sprout.tests.owned_analysis_fixture import owned_analysis
+
+        async def operation(tool, call, approvals, workspace):
+            args = {"path": str(workspace.root / "service.py"), "include_system_tools": flag}
+            first = await call(args)
+            # Built-in capture does not create reusable tool approvals. The
+            # unrelated plugin below still exercises the normal approval flow.
+            assert not first.ok and first.approval_id is None
+            assert first.error == "project_analysis_scope_unavailable"
+            assert not await approvals.store.list_approvals()
+
+        await owned_analysis(tmp_path, operation, policy=boundary("ask"))
+        return
     tool = module.ProjectAnalyzeTool()
     if plugin:
         tool = SimpleNamespace(spec=tool.spec, invoke=AsyncMock(return_value=ToolResult.success()))
@@ -168,32 +182,36 @@ async def test_ordinary_or_unrelated_plugin_keeps_approval_flow(tmp_path, plugin
     tool.invoke.assert_awaited_once()
 
 
-async def test_caller_mutation_during_approval_cannot_change_frozen_request(tmp_path):
-    args = {"path": str(tmp_path), "include_system_tools": False, "metadata": {"x": []}}
-    tool = module.ProjectAnalyzeTool()
-    tool.invoke = AsyncMock(return_value=ToolResult.success())
-    registry = ToolRegistry()
-    registry.register(tool)
-    approvals = ApprovalManager(MemoryOperationalStore())
+async def test_caller_mutation_during_approval_cannot_change_frozen_request(tmp_path, monkeypatch):
+    from Sprout.tests.owned_analysis_fixture import owned_analysis
 
-    async def mutate(*unused, **kwargs):
-        args["include_system_tools"] = True
-        args["metadata"]["x"].append("changed")
-        return True
+    async def operation(tool, call, approvals, workspace):
+        args = {"path": str(workspace.root / "service.py"),
+                "include_system_tools": False, "metadata": {"x": []}}
+        invoke = AsyncMock(wraps=tool.invoke)
+        tool.invoke = invoke
 
-    approvals.is_approved = AsyncMock(side_effect=mutate)
-    executor = ToolExecutor(registry, approvals=approvals, policy_engine=boundary("ask"))
-    result = await executor.execute(tool.spec.name, args)
-    assert result.ok
-    received = tool.invoke.await_args.args[0]
-    assert received["include_system_tools"] is False
-    assert received["metadata"] == {"x": []}
+        original = ToolExecutor._audit
+
+        async def mutate(self, *unused, **kwargs):
+            args["include_system_tools"] = True
+            args["metadata"]["x"].append("changed")
+            return await original(self, *unused, **kwargs)
+
+        monkeypatch.setattr(ToolExecutor, "_audit", mutate)
+        result = await call(args)
+        assert result.ok
+        received = invoke.await_args.args[0]
+        assert received["include_system_tools"] is False
+        assert received["metadata"] == {"x": []}
+
+    await owned_analysis(tmp_path, operation)
 
 
 @pytest.mark.parametrize("policy_kind", ["allow", "ask", "deny", "scope_deny"])
 @pytest.mark.parametrize("flag", [None, False])
 async def test_non_probe_request_retains_policy_outcome(tmp_path, policy_kind, flag):
-    if policy_kind == "allow":
+    if policy_kind in {"allow", "ask"}:
         from Sprout.tests.owned_analysis_fixture import owned_analysis
 
         async def operation(tool, call, approvals, workspace):
@@ -201,9 +219,14 @@ async def test_non_probe_request_retains_policy_outcome(tmp_path, policy_kind, f
             if flag is not None:
                 args["include_system_tools"] = flag
             result = await call(args)
-            assert result.ok and result.approval_id is None
-            assert result.data["languages"] == ["python"]
-        await owned_analysis(tmp_path, operation)
+            if policy_kind == "ask":
+                assert not result.ok and result.approval_id is None
+                assert result.error == "project_analysis_scope_unavailable"
+                assert not await approvals.store.list_approvals()
+            else:
+                assert result.ok and result.approval_id is None
+                assert result.data["languages"] == ["python"]
+        await owned_analysis(tmp_path, operation, policy=boundary(policy_kind))
         return
     tool = module.ProjectAnalyzeTool()
     tool.invoke = AsyncMock(return_value=ToolResult.success("ordinary"))

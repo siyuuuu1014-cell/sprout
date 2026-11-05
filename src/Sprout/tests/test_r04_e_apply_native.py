@@ -8,9 +8,10 @@ import asyncio
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import tempfile
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
@@ -368,10 +369,13 @@ async def test_native_apply_vertical(tmp_path, monkeypatch, mode):
 
 async def prepare_apply_fixture(tmp_path, monkeypatch, mode, *, seven_inputs=False):
     assert os.name == "nt"
-    git = Path("D:/dev/Git/mingw64/bin/git.exe")
-    assert hashlib.sha256(git.read_bytes()).hexdigest() == (
-        "cab4c4eea1d869cf9f7be73868dc9a90ad2df1b1b673e5f8c8714a576c25ea96"
-    )
+    installed = shutil.which("git")
+    assert installed, "Native fixture requires an installed Git for Windows"
+    git = Path(installed).resolve()
+    # Pin the actual Host installation, not a developer-machine absolute path.
+    if git.parent.name.lower() == "cmd":
+        git = git.parent.parent / "mingw64/bin/git.exe"
+    git_sha256 = hashlib.sha256(git.read_bytes()).hexdigest()
     monkeypatch.setenv("PATH", str(git.parent) + os.pathsep + os.environ.get("PATH", ""))
     root = tmp_path / "repo"
     root.mkdir()
@@ -530,7 +534,7 @@ async def prepare_apply_fixture(tmp_path, monkeypatch, mode, *, seven_inputs=Fal
             task.id,
             principal,
             executable=git,
-            executable_sha256="cab4c4eea1d869cf9f7be73868dc9a90ad2df1b1b673e5f8c8714a576c25ea96",
+            executable_sha256=git_sha256,
             export_parent=exports,
         )
     return locals()
@@ -605,3 +609,89 @@ def test_native_cli_review_apply(tmp_path, monkeypatch, approved):
         asyncio.run(query())
     finally:
         store.close()
+
+
+# Shared immutable evidence: two actual Windows runs, POSIX refusal only.
+@pytest.fixture(scope="module")
+def current_delivery(tmp_path_factory):
+    root = tmp_path_factory.mktemp("current-delivery")
+    if os.name != "nt":
+        from Sprout.execution.apply_plan import receipt_context
+
+        # No Windows credential is fabricated or upgraded on POSIX.
+        with pytest.raises(PermissionError, match="local_apply_unavailable"):
+            asyncio.run(receipt_context(None, None, None))
+        return {"platform": "posix", "positive_apply": "NOT_SUPPORTED"}
+
+    async def run(correct, monkeypatch):
+        directory = root / ("correct" if correct else "incorrect")
+        directory.mkdir()
+        ctx = await prepare_apply_fixture(directory, monkeypatch, "single")
+        runtime, store, task = ctx["runtime"], ctx["storage"].metadata, ctx["task"]
+        if not correct:
+            from Sprout.llm.messages import LLMResponse, ToolCall
+
+            ctx["model"].responses[1] = LLMResponse(tool_calls=(ToolCall(
+                "wrong-implementation", "sandbox_write_file",
+                {"path": "src/app.py", "content": "def echo(value):\n    return -999\n"}),))
+        before_revision = _fixture_revision(ctx["git"], ctx["root"])
+        try:
+            await runtime._execute_task(task, artifact_snapshot=None)
+            nodes = await store.list_execution_nodes(task.id)
+            evaluation = next(n for n in nodes if n.type.value == "evaluation")
+            assert evaluation.metadata["execution_guard"]["state"] == "completed"
+            assert evaluation.metadata["output"]["status"] == ("passed" if correct else "failed")
+            proposals = await runtime.list_change_proposals(task.id)
+            assert (ctx["root"] / "src/app.py").read_bytes() == ctx["old"].encode()
+            if correct:
+                assert runtime._local_acceptance_receipts and len(proposals) == 1
+                proposal = proposals[0]
+                assert proposal.metadata["git_diff"]["status"] == "available"
+                assert len(proposal.metadata["git_diff"]["commands"]) == 5
+                file, = proposal.metadata["apply_plan"]["files"]
+                expected = file["new_text"].encode()
+                assert file["new_text"].replace("\r\n", "\n") == ctx["new"]
+                await runtime.approve_change_proposal(proposal.id,
+                    principal=ctx["principal"], decided_by="offline-fixture-human")
+                transaction = await store.get_apply_transaction(str(uuid5(
+                    NAMESPACE_URL, "ordinary-apply:" + proposal.id)))
+                assert transaction and transaction["phase"] == "COMPLETED"
+                assert (ctx["root"] / "src/app.py").read_bytes() == expected
+                assert (await store.get_change_proposal(proposal.id)).status.value == "applied"
+            else:
+                assert not runtime._local_acceptance_receipts and not proposals
+                transaction = None
+                expected = ctx["old"].encode()
+            assert _fixture_revision(ctx["git"], ctx["root"]) == before_revision, (
+                "Apply must not commit")
+            approvals = await runtime._approvals.store.list_approvals()
+            evidence = {
+                "task": asdict(await store.get_task(task.id)),
+                "nodes": [asdict(n) for n in await store.list_execution_nodes(task.id)],
+                "verification": await runtime.get_verification_report(task.id),
+                "proposals": [asdict(p) for p in await runtime.list_change_proposals(task.id)],
+                "approval": [asdict(a) for a in approvals],
+                "transaction": transaction,
+                "bytes": (ctx["root"] / "src/app.py").read_bytes().hex(),
+                "expected": expected.hex(),
+                "revision": before_revision,
+            }
+            (directory / "CURRENT_DELIVERY.json").write_text(
+                json.dumps(evidence, default=str, indent=2), encoding="utf-8")
+            return evidence
+        finally:
+            await runtime.stop()
+            store.close()
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        correct = asyncio.run(run(True, monkeypatch))
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        incorrect = asyncio.run(run(False, monkeypatch))
+    return {"platform": "windows", True: correct, False: incorrect}
+
+
+def _fixture_revision(executable, root):
+    import subprocess
+
+    return subprocess.run([str(executable), "-C", str(root), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True, timeout=15).stdout.strip()

@@ -8,6 +8,80 @@ from Sprout.gateway.identity import Principal
 from Sprout.task.models import DelegationScope
 
 
+async def fixture_analysis(intelligence, workspace, task, *, paths, previous=None):
+    """Static/storage component driver over explicitly named fixture inputs.
+
+    This is synthetic test data, never a Runtime capture, read grant or source
+    receipt. Delta and stale-fact helpers are exercised separately from the
+    pure analyzer; persistence remains the caller's explicit test operation.
+    """
+    from dataclasses import replace
+
+    from Sprout.workspace.authorized_content import AuthorizedContentView, AuthorizedEntry
+    from Sprout.workspace.classifier import classify
+
+    entries = tuple(AuthorizedEntry.synthetic(
+        name, (workspace.root / name).read_bytes(), classify(name))
+        for name in paths if (workspace.root / name).is_file())
+    analysis = await intelligence.analyze_view(workspace, task,
+        AuthorizedContentView(workspace.id, entries))
+    if previous is not None:
+        changed = analysis.fingerprint.changed_resources(previous.fingerprint)
+        stale = intelligence._stale_knowledge_ids(previous, set(changed))
+        analysis = replace(analysis, changed_resources=changed, stale_knowledge_ids=stale,
+            stale_knowledge_items=intelligence._stale_knowledge_items(previous, stale))
+    return analysis
+
+
+async def prompt_from_owned_read(rig, check, *, plan_text="edit main.py", sandbox=None,
+                                 agent_metadata=None):
+    """Formatter test inside a real owner with an actual READ/PLAN source chain.
+
+    The callback may test formatting synthetic feedback; it issues no EVALUATION
+    record or Receipt and never publishes that synthetic feedback to a model.
+    """
+    from Sprout.agent.base import ModelAgent
+    from Sprout.llm.messages import LLMResponse
+    from Sprout.orchestration.models import NodeType
+    from Sprout.tests.test_r04_b4_restoration import next_node, save_result
+    from Sprout.workspace.models import ReadPlan, ResourceRef
+
+    class Model:
+        async def chat(self, messages, **kwargs):
+            return LLMResponse(content=plan_text)
+
+    rig.runtime.register_agent("prompt-fixture", ModelAgent(Model()), default=True)
+    executor = rig.runtime._executor(rig.storage.metadata)
+    plan = ReadPlan(task_id=rig.task.id,
+                    resources=(ResourceRef(rig.workspace.id, "src/main.py"),))
+    read = await next_node(rig, NodeType.READ)
+    output = await executor.execute_node(read, rig.workspace, plan, rig.task)
+    await save_result(rig, read, output)
+    parents = (read.id,)
+    if sandbox is not None:
+        from unittest.mock import AsyncMock
+
+        # Explicit host-effect double for context/tool-shape tests only. The
+        # temporary files are real; no Git isolation or write authority claim.
+        executor._sandbox = AsyncMock(return_value={"id": sandbox.id,
+            "kind": sandbox.kind, "root": str(sandbox.root)})
+        isolated = await next_node(rig, NodeType.SANDBOX, parents)
+        value = await executor.execute_node(isolated, rig.workspace, plan, rig.task)
+        await save_result(rig, isolated, value)
+        parents = (isolated.id,)
+    planning = await next_node(rig, NodeType.PLAN, parents)
+    planned = await executor.execute_node(planning, rig.workspace, plan, rig.task)
+    await save_result(rig, planning, planned)
+    node = await next_node(rig, NodeType.AGENT, (planning.id,), agent_metadata)
+    with rig.runtime._project_analysis_scope(rig.task, rig.workspace, node):
+        await executor._check_model_publication(node, rig.workspace, rig.task)
+        result = check(executor, executor._resources(output, rig.workspace), planned["plan"])
+        import inspect
+
+        if inspect.isawaitable(result):
+            await result
+
+
 async def native_analysis_subject(runtime, workspace, paths):
     """Real local entry identity/session and finite Task; no platform substitute."""
     from Sprout.gateway.local_identity import current_cli_principal

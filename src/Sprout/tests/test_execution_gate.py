@@ -47,6 +47,8 @@ from Sprout.skills.registry import SkillRegistry
 from Sprout.storage.bundle import StorageBundle
 from Sprout.storage.local.sqlite.metadata import open_metadata_store
 from Sprout.task.models import Task
+from Sprout.tests.test_r04_b2_capture import captured as captured
+from Sprout.tests.test_r04_pa2_b1_binding import rig as rig
 from Sprout.tools.registry import ToolRegistry
 from Sprout.tools.system_tools import CliDownloadTool, CliRunTool
 from Sprout.workspace.models import (
@@ -363,19 +365,21 @@ async def test_evaluation_runs_static_checks_on_changed_files(
         await sandbox.remove(ref)
 
 
-def test_agent_prompt_includes_plan_and_feedback() -> None:
-    prompt = NodeExecutor._agent_prompt(
-        Task(id="task-1", instruction="fix the bug"),
-        Workspace(id="ws", root=Path("."), kind=WorkspaceKind.LOCAL_DIRECTORY),
-        (),
-        feedback={"status": "failed", "failed_commands": ["test: pytest -q"]},
-        plan="1. edit a.py\n2. add a test",
-    )
+async def test_agent_prompt_includes_plan_and_feedback(rig, captured) -> None:
+    from Sprout.tests.readonly_host_fixtures import prompt_from_owned_read
 
-    assert "Plan from the planning step:" in prompt
-    assert "1. edit a.py" in prompt
-    assert "Previous verification feedback:" in prompt
-    assert "test: pytest -q" in prompt
+    with pytest.raises(PermissionError, match="node_artifact_provenance_unavailable"):
+        NodeExecutor._agent_prompt(rig.task, rig.workspace, (), plan="unbound")
+
+    def check(executor, resources, plan):
+        prompt = executor._agent_prompt(rig.task, rig.workspace, resources,
+            feedback={"status": "failed", "failed_commands": ["test: pytest -q"]}, plan=plan)
+        assert "Plan from the planning step:" in prompt
+        assert "1. edit a.py" in prompt
+        assert "Previous verification feedback:" in prompt
+        assert "test: pytest -q" in prompt
+
+    await prompt_from_owned_read(rig, check, plan_text="1. edit a.py\n2. add a test")
 
 
 # -- R5 + R7: the proposal carries the verification and the file names ---------
@@ -426,19 +430,16 @@ async def test_approval_carries_the_failed_verification_and_raises_the_risk(
         )
 
         executor = _node_executor(storage, RecordingProcessBroker())
-        output = await executor._approval(workspace, task)
-
-        proposals = await storage.metadata.list_change_proposals(task.id)
-        assert len(proposals) == 1
-        proposal = proposals[0]
-        # R5: the failure travels onto the proposal instead of being dropped.
-        assert [item.name for item in proposal.test_results] == ["test: pytest -q"]
-        assert proposal.test_results[0].passed is False
-        assert proposal.risk == "high"
-        assert output["waiting"] is True
-        assert output["test_status"] == "failed"
-        assert output["failed_commands"] == ["test: pytest -q"]
-        assert set(proposal.files_changed) == {"tracked.txt"}
+        with pytest.raises(PermissionError, match="git_diff_unavailable"):
+            await executor._approval(workspace, task)
+        # A saved failed report remains diagnostic DATA; it cannot manufacture
+        # Git provenance or a publishable Proposal. Keep the actual failure.
+        nodes = await storage.metadata.list_execution_nodes(task.id)
+        results = executor._test_results_from(executor._output_for(nodes, NodeType.EVALUATION))
+        assert [item.name for item in results] == ["test: pytest -q"]
+        assert results[0].passed is False and results[0].output == "1 failed"
+        assert await storage.metadata.list_change_proposals(task.id) == []
+        assert (repo / "tracked.txt").read_text() == "one"
         storage.metadata.close()
     finally:
         await sandbox.remove(ref)
@@ -464,11 +465,12 @@ async def test_approval_skips_proposal_when_no_files_changed(tmp_path) -> None:
         await storage.metadata.save_execution_node(_sandbox_node(task.id, ref.root))
 
         executor = _node_executor(storage, RecordingProcessBroker())
-        output = await executor._approval(workspace, task)
-
-        assert output.get("waiting") is None
-        assert output["status"] == "no_changes"
+        # A clean-looking worktree without a trusted View is unavailable,
+        # not a proved no_changes result. No false Proposal may be emitted.
+        with pytest.raises(PermissionError, match="git_diff_unavailable"):
+            await executor._approval(workspace, task)
         assert await storage.metadata.list_change_proposals(task.id) == []
+        assert (repo / "tracked.txt").read_text() == "one"
         storage.metadata.close()
     finally:
         await sandbox.remove(ref)

@@ -213,7 +213,12 @@ async def test_model_flags_do_not_certify_unknown_agent_output(rig, monkeypatch)
                              principal=rig.principal)
     context = await rig.runtime._contexts.build(message=Message(user_id="owner", content="next"),
         session=rig.session, tools={}, skills={})
-    assert "UNPROVEN_PROJECT_CONTENT" not in repr(context.memory)
+    # T7 restores text dialogue; model flags still cannot issue project evidence.
+    assert context.metadata["conversation_history_only"] is True
+    assert context.workspace is None and not context.files and not context.knowledge
+    assert not context.metadata.get("project_analysis_followup")
+    assert not rig.runtime._ordinary_assistant_turns
+    assert all(not turn.metadata for turn in context.memory.working)
 
 
 def test_zero_calls_does_not_certify_project_context(rig):

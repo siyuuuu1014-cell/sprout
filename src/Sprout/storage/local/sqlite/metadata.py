@@ -402,7 +402,33 @@ class SqliteMetadataStore:
         return changed == 1
 
     async def claim_verification_execution(self, record: dict[str, Any]) -> bool:
-        if record.get("schema_version") == 3:
+        # Function JSON v3 predates the live Docker EVALUATION v3 contract.
+        # Its completed-task experiment is not a live Guard authority record.
+        function_record = (type(record.get("schema_version")) is int
+                           and record["schema_version"] == 3
+                           and record.get("protocol") == "function_json_v1")
+        if function_record:
+            import hashlib
+            from uuid import NAMESPACE_URL, uuid5
+
+            try:
+                contract = record["contract"]
+                purpose = contract["purpose"]
+                expected_id = str(uuid5(NAMESPACE_URL, record["task_id"]
+                    + ":function-" + purpose + ":" + contract["case"]["id"]))
+                signature = hashlib.sha256(json.dumps(
+                    contract, sort_keys=True, default=str).encode()).hexdigest()
+                if (purpose not in {"acceptance", "regression"}
+                        or contract["request"]["task_id"] != record["task_id"]
+                        or record["id"] != expected_id or record["signature"] != signature
+                        or record["input_manifest"] != contract["input_manifest"]
+                        or not record["owner"]
+                        or record["command"][record["command"].index("--name") + 1]
+                        != record["container_name"]):
+                    return False
+            except (KeyError, TypeError, ValueError, IndexError):
+                return False
+        if record.get("schema_version") == 3 and not function_record:
             authority = record.get("authority", {})
             if (type(record.get("schema_version")) is not int
                     or any(not isinstance(record.get(key), str) or not record[key]
@@ -455,7 +481,7 @@ class SqliteMetadataStore:
                  record["node_id"], _json_dumps(authority["node_metadata"]), record["owner"]),
             )
             return changed == 1
-        if record.get("schema_version", 2) != 2:
+        if record.get("schema_version", 2) != 2 and not function_record:
             return False
         changed = await self._db.execute(
             "INSERT OR IGNORE INTO verification_executions "

@@ -167,7 +167,16 @@ class User(Base):
     __tablename__ = "users"
     id = mapped_column(Integer, primary_key=True)
 ''')
-    result = await ProjectAnalyzeTool().invoke({"path": str(tmp_path)})
+    from Sprout.tests.owned_analysis_fixture import owned_analysis
+
+    assert not (await ProjectAnalyzeTool().invoke({"path": str(tmp_path)})).ok
+
+    async def operation(tool, call, approvals, workspace):
+        (workspace.root / "service.py").write_bytes((tmp_path / "models.py").read_bytes())
+        return await call({"path": str(workspace.root / "service.py")})
+
+    result = await owned_analysis(tmp_path, operation)
+    assert result.ok, result.error
     table = next(item for item in result.data["knowledge"] if item["kind"] == "database_table")
     assert table["details"]["model"] == "User"
     assert not sentinel.exists()
@@ -273,7 +282,14 @@ class User(Base):
     try:
         service = WorkspaceService(storage)
         workspace = await service.open(root, workspace_id="project")
-        first = await service.analyze(workspace.id)
+        from Sprout.task.models import Task
+        from Sprout.tests.readonly_host_fixtures import fixture_analysis
+        from Sprout.workspace.intelligence import WorkspaceIntelligence
+
+        task = Task(workspace_id=workspace.id, instruction="analyze fixture")
+        intelligence = WorkspaceIntelligence()
+        first = await fixture_analysis(intelligence, workspace, task, paths=("models.py",))
+        await storage.projects.save_analysis(first, expected_snapshot_id=None)
         original = next(item for item in first.knowledge.items if item.kind == "database_table")
         storage.projects.close()
         storage.projects = SqliteProjectAnalysisStore(tmp_path / "projects")
@@ -284,7 +300,11 @@ class User(Base):
         source.write_text(source.read_text(encoding="utf-8")
                           + '    team_id = mapped_column(Integer, nullable=False)\n',
                           encoding="utf-8")
-        changed = await service.analyze("project")
+        changed = await fixture_analysis(
+            intelligence, workspace, task, paths=("models.py",), previous=restored)
+        from Sprout.workspace.invalidation import snapshot_id
+
+        await storage.projects.save_analysis(changed, expected_snapshot_id=snapshot_id(restored))
         current = next(item for item in changed.knowledge.items if item.kind == "database_table")
         assert [column["name"] for column in current.details["columns"]] == ["id", "team_id"]
         stored = await storage.projects.load_analysis("project")
@@ -292,7 +312,9 @@ class User(Base):
             current
         )
         source.unlink()
-        deleted = await WorkspaceService(storage).analyze("project")
+        deleted = await fixture_analysis(
+            intelligence, workspace, task, paths=("models.py",), previous=changed)
+        await storage.projects.save_analysis(deleted, expected_snapshot_id=snapshot_id(changed))
         assert not any(item.kind == "database_table" for item in deleted.knowledge.items)
         assert current.id in deleted.stale_knowledge_ids
         final = await storage.projects.load_analysis("project")

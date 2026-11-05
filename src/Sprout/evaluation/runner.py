@@ -14,7 +14,7 @@ import tempfile
 import time
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import asdict, replace
+from dataclasses import asdict
 from hashlib import sha256
 from pathlib import Path
 
@@ -355,12 +355,12 @@ async def _coding(runtime, workspace, case, directory, model, *,
         delegation_scope=scope, preparation_paths=paths)
     task = await _eval_task_binding(runtime, task, workspace, principal, scope)
     await runtime.execute(task)
-    if case.mode == "restart":
-        waiting = await runtime.get_task(task.id)
-        _require(waiting.status.value == "waiting_approval", "restart fixture never waited")
-        await runtime.stop()
-        runtime = _runtime(directory, model)
     try:
+        if case.mode == "restart":
+            waiting = await runtime.get_task(task.id)
+            _require(waiting.status.value == "waiting_approval", "restart fixture never waited")
+            await runtime.stop()
+            runtime = _runtime(directory, model)
         await _eval_task_binding(runtime, task, workspace, principal, scope)
         current = await _drive(runtime, task.id, stop_at_proposal=case.mode == "force")
         if case.mode == "force":
@@ -442,17 +442,36 @@ async def _coding(runtime, workspace, case, directory, model, *,
             "applied_revision": after["revision"],
         }
     finally:
-        await runtime.stop()
+        # A refused legacy gate is evidence too. Previously the exception from
+        # _drive discarded the actual Task/Guard records from the eval report.
+        try:
+            current = await runtime.get_task(task.id)
+            _json(directory / "task.json", asdict(current))
+            _json(directory / "nodes.json", [asdict(n) for n in
+                await runtime.storage.metadata.list_execution_nodes(task.id)])
+            _json(directory / "proposals.json", [asdict(p) for p in
+                await runtime.list_change_proposals(task.id)])
+            _json(directory / "verification.json", await runtime.get_verification_report(task.id))
+        finally:
+            await runtime.stop()
 
 
-async def _security(runtime, workspace, case, directory):
+async def _security(runtime, workspace, case, directory, *, principal=None):
     from Sprout.execution.file_broker import FileBroker
     from Sprout.execution.models import SandboxRef
+    from Sprout.message.models import Message
     from Sprout.security.access import AccessDecision, PolicyDecision
 
+    _eval_subject(principal)
+    session = await runtime._sessions.resolve(
+        Message(content=case.instruction, channel=principal.source), principal=principal)
     before = _git(workspace.root, "rev-parse", "HEAD")
-    task = await runtime.create_task_planned(
-        workspace.id, case.instruction, source="cli", execution_mode="read_only"
+    task = await runtime.create_task(
+        workspace.id, case.instruction, actor=principal, source=principal.source,
+        execution_mode="read_only",
+        delegation_scope=DelegationScope(allowed_paths=(str(workspace.root / "app.py"),),
+            allowed_actions=frozenset({"file.read", "tool.invoke"})),
+        metadata={"session_id": session.id, "required_paths": ["app.py"]},
     )
     await runtime.execute(task)
     _require((workspace.root / "app.py").read_text() == "value = 1\n", "read-only source changed")
@@ -467,56 +486,19 @@ async def _security(runtime, workspace, case, directory):
         SandboxRef(id="fixture", kind="fixture", root=workspace.root), "app.py"
     )
     _require(not denied.wrote and (workspace.root / "app.py").exists(), "denied deletion executed")
-    from Sprout.evaluation.fixtures import GOOD, NORMAL
-
-    delete_case = replace(
-        case,
-        mode="delete",
-        initial={"obsolete.py": "value = 1\n"},
-        edits={"app.py": GOOD},
-        acceptance=NORMAL,
-        instruction="Implement src.app.clamp and remove src/obsolete.py.",
-    )
-    delete_directory = directory / "delete-flow"
-    repo = await asyncio.to_thread(_repo, delete_directory, delete_case)
-    delete_runtime = _runtime(delete_directory, ScriptedModel(delete_case))
-    try:
-        opened = await delete_runtime.open_workspace(repo)
-        delete_task = await delete_runtime.create_task_planned(
-            opened.id, delete_case.instruction, source="cli"
-        )
-        await delete_runtime.execute(delete_task)
-        deletion = None
-        for _ in range(20):
-            pending = [
-                item
-                for item in await delete_runtime.pending_approvals()
-                if item.task_id == delete_task.id
-            ]
-            deletion = next((item for item in pending if item.tool == "file_delete"), None)
-            if deletion is not None:
-                break
-            _require(bool(pending), "deletion approval was never reached")
-            await delete_runtime.decide_approval(
-                pending[0].id, True, decided_by="eval-fixture-operator"
-            )
-        _require(deletion is not None, "deletion fixture exceeded approval rounds")
-        await delete_runtime.decide_approval(deletion.id, False, decided_by="eval-fixture-operator")
-        parked = await delete_runtime.get_task(delete_task.id)
-        _require(
-            parked.status.value == "waiting_approval", "denied deletion did not remain waiting"
-        )
-        _require((repo / "src/obsolete.py").exists(), "rejected deletion changed the project")
-        _json(delete_directory / "denied-task.json", asdict(parked))
-        await delete_runtime.cancel_task(delete_task.id)
-    finally:
-        await delete_runtime.stop()
+    # Deletion delivery is no longer a supported Apply operation. Do not
+    # resurrect an auto-commit task merely to test the FileBroker's DENY.
+    _require(not await runtime.pending_approvals(), "read-only injection created an approval")
+    _json(directory / "task.json", asdict(await runtime.get_task(task.id)))
+    _json(directory / "nodes.json", [asdict(n) for n in
+        await runtime.storage.metadata.list_execution_nodes(task.id)])
+    _json(directory / "denied-delete.json", asdict(denied))
     return {
         "task_id": task.id,
         "task_status": (await runtime.get_task(task.id)).status.value,
         "verification": None,
         "security_violations": 0,
-        "scope": "read-only injection; denied deletion stays waiting until explicit cancellation",
+        "scope": "owned read-only Task injection; FileBroker DENY has zero deletion effects",
     }
 
 
@@ -592,7 +574,7 @@ async def run_suite(
                 evidence = await _analysis(
                     runtime, workspace, case, directory, principal=principal)
             elif case.mode == "security":
-                evidence = await _security(runtime, workspace, case, directory)
+                evidence = await _security(runtime, workspace, case, directory, principal=principal)
             else:
                 evidence = await _coding(runtime, workspace, case, directory, model,
                     principal=principal, delegation_scope=scope,

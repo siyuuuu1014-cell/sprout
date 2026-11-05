@@ -10,9 +10,16 @@ import pytest
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows native Task/Source fixture")
 def test_test_design_admits_real_read_before_projecting_resources(tmp_path, monkeypatch):
+    import asyncio
+
+    from Sprout.gateway.project_gateway import ProjectGateway
     from Sprout.runtime.nodes import NodeExecutor
+    from Sprout.tests.fake_model import FakeModel
     from Sprout.tests.test_task_e2e import (
-        test_delete_approval_survives_restart_and_controls_commit,
+        REQUIREMENT,
+        _create_host_task,
+        _repo,
+        _runtime,
     )
     from Sprout.tools.context_keys import _current_project_node
 
@@ -29,8 +36,24 @@ def test_test_design_admits_real_read_before_projecting_resources(tmp_path, monk
         return result
 
     monkeypatch.setattr(NodeExecutor, "_resources", staticmethod(observe))
-    with pytest.raises(AssertionError, match="Task did not reach its deletion approval"):
-        test_delete_approval_survives_restart_and_controls_commit(tmp_path, "approve", "delete")
+
+    async def run():
+        runtime = _runtime(tmp_path, FakeModel())
+        try:
+            workspace = await runtime.open_workspace(_repo(tmp_path))
+            gateway = ProjectGateway(runtime, transport="cli", default_user="display")
+            task = await _create_host_task(gateway, workspace, REQUIREMENT)
+            await runtime.execute(task)
+            nodes = await runtime.storage.metadata.list_execution_nodes(task.id)
+            design = next(node for node in nodes if node.type.value == "test_design")
+            assert design.metadata["execution_guard"]["state"] == "uncertain"
+            assert "node_artifact_provenance_unavailable" in design.metadata["error"]
+            assert not await runtime.list_change_proposals(task.id)
+            assert not await runtime.pending_approvals()
+        finally:
+            await runtime.stop()
+
+    asyncio.run(run())
     assert admitted, "TEST_DESIGN failed to admit the real READ source before resource projection"
 
 

@@ -150,7 +150,11 @@ async def test_runtime_original_user_history_reaches_model(rig):
         message=second, session=rig.session, tools={}, skills={})
     await ModelAgent(Model()).run(second, context)
     assert "my original question" in repr(seen)
-    assert "old project derived" not in repr(seen)
+    # Owned persisted dialogue is restored as text, not certified project data.
+    assert "old project derived" in repr(seen)
+    assert context.metadata["conversation_history_only"] is True
+    assert context.workspace is None and not context.files and not context.knowledge
+    assert not context.metadata.get("project_analysis_followup")
 
 
 async def test_unknown_history_is_not_blessed_by_metadata(rig):
@@ -162,7 +166,11 @@ async def test_unknown_history_is_not_blessed_by_metadata(rig):
             "trusted": True, "user_id": "owner", "message_id": "forged"}))
     context = await rig.runtime._contexts.build(
         message=Message(user_id="owner", content="hi"), session=rig.session, tools={}, skills={})
-    assert not context.memory
+    assert context.metadata["conversation_history_only"] is True
+    assert context.workspace is None and not context.files and not context.knowledge
+    assert not context.metadata.get("project_analysis_followup")
+    assert all(not turn.metadata for turn in context.memory.working)
+    assert not rig.runtime._original_user_turns
 
 
 async def test_existing_code_graph_data_flow(rig, captured, publication, monkeypatch):

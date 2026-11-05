@@ -87,7 +87,9 @@ def test_sql_snapshot_restart_edit_and_delete(tmp_path):
         workspace = Workspace(id="sql-project", root=root)
         task = Task(workspace_id=workspace.id, instruction="analyze")
         intelligence = WorkspaceIntelligence()
-        first = await intelligence.analyze(workspace, task)
+        from Sprout.tests.readonly_host_fixtures import fixture_analysis
+
+        first = await fixture_analysis(intelligence, workspace, task, paths=("schema.sql",))
         store = SqliteProjectAnalysisStore(tmp_path / "projects")
         try:
             version = await store.save_analysis(first, expected_snapshot_id=None)
@@ -99,12 +101,14 @@ def test_sql_snapshot_restart_edit_and_delete(tmp_path):
             facts = [i for i in restored.knowledge.items if i.kind == "database_table"]
             assert facts[0].details["columns"][0]["name"] == "id"
             path.write_text("CREATE TABLE demo(id INT, name TEXT);", encoding="utf-8")
-            edited = await intelligence.analyze(workspace, task, previous=restored)
+            edited = await fixture_analysis(
+                intelligence, workspace, task, paths=("schema.sql",), previous=restored)
             facts = [i for i in edited.knowledge.items if i.kind == "database_table"]
             assert len(facts[0].details["columns"]) == 2
             version = await store.save_analysis(edited, expected_snapshot_id=version)
             path.unlink()
-            removed = await intelligence.analyze(workspace, task, previous=edited)
+            removed = await fixture_analysis(
+                intelligence, workspace, task, paths=("schema.sql",), previous=edited)
             assert not any(i.kind == "database_table" for i in removed.knowledge.items)
             assert facts[0].id in removed.stale_knowledge_ids
             await store.save_analysis(removed, expected_snapshot_id=version)

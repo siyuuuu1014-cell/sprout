@@ -250,7 +250,10 @@ async def test_restart_rechecks_subject_before_drive_and_closes_new_runtime(
     monkeypatch.setattr(rig.runtime, "execute", waiting)
     monkeypatch.setattr(rig.runtime, "stop", AsyncMock())
     new_runtime = SimpleNamespace(get_workspace=AsyncMock(return_value=rig.workspace),
-                                   stop=AsyncMock())
+                                   stop=AsyncMock(), storage=rig.storage,
+                                   list_change_proposals=AsyncMock(return_value=[]),
+                                   get_verification_report=AsyncMock(return_value={
+                                       "verified": False, "checks": []}))
     async def changed_subject(task_id):
         return replace(saved[0], actor=replace(rig.principal, user_id="different-owner"))
     new_runtime.get_task = changed_subject

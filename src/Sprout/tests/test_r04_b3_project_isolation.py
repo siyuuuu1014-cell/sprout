@@ -444,7 +444,7 @@ async def test_isolation_drops_session_payload_but_preserves_numeric_budget(rig)
     context = await rig.runtime._contexts.build(
         message=message, session=session, tools={}, skills={})
     assert context.session.metadata == {}
-    assert context.metadata == {"task_budget": {
+    assert context.metadata == {"conversation_history_only": True, "task_budget": {
         "max_tool_calls": 1, "max_model_calls": 2, "max_tokens": 32}}
     assert session.metadata  # No mutation of authoritative Session.
     assert "hidden-shared-session" not in repr(context)

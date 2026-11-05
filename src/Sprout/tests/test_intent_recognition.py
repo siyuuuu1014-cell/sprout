@@ -153,18 +153,41 @@ def test_project_analyze_intent_builds_tool_call_for_supported_languages(text: s
 
 
 @pytest.mark.asyncio
-async def test_workspace_intent_invokes_project_analyze_tool() -> None:
+async def test_workspace_intent_invokes_project_analyze_tool(tmp_path) -> None:
+    from Sprout.agent.loop import AgentLoop
+    from Sprout.gateway.local_identity import current_cli_principal
+    from Sprout.task.models import DelegationScope
+    from Sprout.tests.test_r04_gateway_authority_native import _runtime
+
     model = ProjectAnalyzeIntentModel()
-    runtime, _ = build_runtime(model=model)
+    runtime, workspace = await _runtime(tmp_path)
+    runtime.models.register(model, default=True)
+    existing = runtime.agents.get(runtime.default_agent)
+    runtime.register_agent("analysis-intent", AgentLoop(model,
+        executor=existing.executor), default=True)
+    principal = current_cli_principal()
 
-    reply = await runtime.handle(Message("请扫描项目结构"))
+    async def provider(*, message, session, principal):
+        return await runtime.create_task(workspace.id, message.content,
+            actor=principal, source=principal.source, execution_mode="read_only",
+            delegation_scope=DelegationScope(
+                allowed_paths=(str(workspace.root / "service.py"),),
+                allowed_actions=frozenset({"tool.invoke", "file.read"})),
+            metadata={"session_id": session.id, "required_paths": ["service.py"]})
 
-    assert reply.content == "project analyzed"
-    assert model.saw_project_analyze_result is True
-    turns = await runtime.history(reply.session_id)
-    metadata = turns[0].metadata["message_metadata"]
-    assert metadata["intent"] == "workspace"
-    assert metadata["resume_tool_calls"][0]["name"] == "project_analyze"
+    try:
+        reply = await runtime.handle(Message("请扫描项目结构", channel="cli"),
+            principal=principal, analysis_task_provider=provider)
+        assert reply.content == "project analyzed"
+        assert model.saw_project_analyze_result is True
+        turns = await runtime.history(reply.session_id)
+        metadata = turns[0].metadata["message_metadata"]
+        assert metadata["intent"] == "workspace"
+        tasks = await runtime.storage.metadata.list_tasks()
+        assert tasks and tasks[-1].status.value == "completed"
+        assert tasks[-1].metadata["session_id"] == reply.session_id
+    finally:
+        await runtime.stop()
 
 
 @pytest.mark.asyncio

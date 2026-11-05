@@ -33,12 +33,25 @@ async def test_online_analysis_request_reaches_authorized_project_result(
     rig.runtime.register_agent("online", AgentLoop(model, executor=ActionExecutor(rig.executor)),
                                default=True)
     monkeypatch.setattr("Sprout.agent.loop.get_agent_step_store", lambda: Mock())
-    await rig.runtime.handle(Message(
+    message = Message(
         "请分析项目结构", channel="cli", user_id="owner", session_id=rig.session.id,
-        metadata={"workspace_path": str(rig.root / "src")}), principal=rig.principal)
+        metadata={"workspace_path": str(rig.root / "src")})
+    refused = await rig.runtime.handle(message, principal=rig.principal)
     assert not captured.opens
-    assert any(str(m.role) == "tool" and "project_analysis_scope_unavailable" in m.content
-               for m in seen)
-    # Deliberate RED: success requires an authoritative analysis Task admission
-    # contract, not selecting a stored Task merely because Session ids match.
+    assert "authorized_analysis_task_required" in refused.content
+    assert not any(str(m.role) == "tool" and "main" in m.content for m in seen)
+    # First-party admission supplies a NEW finite Task, not a stored completed
+    # result or model-supplied authorization fields.
+    monkeypatch.setattr(rig.storage.metadata, "claim_execution_node", rig.commission)
+
+    async def provider(*, message, session, principal):
+        return await rig.runtime.create_task(rig.workspace.id, message.content,
+            actor=principal, source=principal.source, execution_mode="read_only",
+            delegation_scope=rig.task.delegation_scope,
+            metadata={"session_id": session.id, "required_paths": ["src/main.py"]})
+
+    result = await rig.runtime.handle(message, principal=rig.principal,
+                                      analysis_task_provider=provider)
+    assert result.content == "controlled response"
+    assert captured.opens == ["src/main.py"]
     assert any(str(m.role) == "tool" and "main" in m.content for m in seen)
