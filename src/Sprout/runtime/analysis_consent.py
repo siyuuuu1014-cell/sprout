@@ -13,13 +13,20 @@ from Sprout.task.paths import scope_path
 from Sprout.workspace.models import ResourceKind, ResourceRef
 
 
+def code_metrics_request(text):
+    text = text.strip().casefold()
+    return bool(re.match(
+        r"(?:请|帮我|麻烦)?\s*(?:统计|计算|数一下|count\b)"
+        r".*(?:行数|多少行|\blines\b)|^你现在有多少行代码", text))
+
+
 def explicit_request(text):
     """A CLI imperative can select analysis; it never grants its effects."""
     text = text.strip().casefold()
     if re.search(r'(?:不要|无需|不必|停止|取消)\s*(?:再|重新|继续)?\s*(?:分析|扫描)|'
                  r"\b(?:do not|don't)\s+(?:analy[sz]e|scan)", text):
         return False
-    return bool(re.search(
+    return code_metrics_request(text) or bool(re.search(
         r'^(?:请|帮我|麻烦)?\s*(?:重新)?(?:分析|扫描|analy[sz]e\b|inspect\b)|'
         r'^(?:请)?继续.*(?:未完成|失败|被拒绝).*(?:项目分析|分析项目)', text))
 

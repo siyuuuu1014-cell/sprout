@@ -366,3 +366,49 @@ async def test_loop_returns_tool_result_when_model_fails_after_resume() -> None:
     assert "工具已执行" in result.content
     assert "echo: resume" in result.content
     assert "provider down" in result.content
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pending", [False, True])
+async def test_exact_cli_tool_duplicate_is_dispatched_once_per_turn(monkeypatch, pending):
+    calls = []
+
+    async def execute(self, name, arguments, **kwargs):
+        calls.append((name, arguments))
+        if pending:
+            return ToolResult.needs_approval("approval-1")
+        return ToolResult.failure("command denied")
+
+    monkeypatch.setattr(ToolExecutor, "execute", execute)
+    original = ToolCall("first", "cli_tool_run", {"command": "python", "args": ["-c", "1"]})
+    duplicate = ToolCall("second", original.name, dict(reversed(list(original.arguments.items()))))
+    different = ToolCall("third", original.name, {"command": "python", "args": ["-c", "2"]})
+    responses = [
+        LLMResponse(tool_calls=(original, duplicate)),
+        LLMResponse(tool_calls=(duplicate, different)),
+        LLMResponse(content="done"),
+    ]
+    loop = AgentLoop(model=ScriptedModel(responses),
+                     executor=ActionExecutor(ToolExecutor(tools=ToolRegistry())))
+    result = await loop.run(Message("go"), _context({}))
+    if pending:
+        assert result.metadata["approval_ids"] == ["approval-1"]
+        assert calls == [(original.name, original.arguments)]
+    else:
+        assert calls == [(original.name, original.arguments),
+                         (different.name, different.arguments)]
+
+@pytest.mark.asyncio
+async def test_cli_tool_can_run_again_after_an_edit(monkeypatch):
+    calls = []
+
+    async def execute(self, name, arguments, **kwargs):
+        calls.append(name)
+        return ToolResult.success("ok")
+
+    monkeypatch.setattr(ToolExecutor, "execute", execute)
+    command = ToolCall("first", "cli_tool_run", {"command": "pytest"})
+    edit = ToolCall("edit", "sandbox_edit_file", {"path": "app.py"})
+    repeat = ToolCall("last", command.name, command.arguments)
+    executor = ActionExecutor(ToolExecutor(tools=ToolRegistry()))
+    await executor.run_calls_detailed((command, edit, repeat), seen_calls={})
+    assert calls == ["cli_tool_run", "sandbox_edit_file", "cli_tool_run"]

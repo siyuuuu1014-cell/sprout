@@ -21,7 +21,7 @@ def analysis_followup(text):
         return False
     return bool(re.search(
         r"进一步分析|继续分析|核心模块|模块之间|刚才.*分析|上一轮.*分析|之前.*分析|分析了什么|"
-        r"上述.*(?:模块|分析)|"
+        r"上述.*(?:模块|分析)|(?:刚才|上一轮|之前|上述).*(?:统计|行数|注释|空行)|"
         r"\b(?:further analysis|core modules|relationships between modules)\b", text))
 
 

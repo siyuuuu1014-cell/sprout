@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -74,15 +75,35 @@ class ActionExecutor:
         *,
         requested_by: str = "unknown",
         session_id: str = "",
+        seen_calls: dict | None = None,
     ) -> list[ToolCallOutcome]:
         outcomes: list[ToolCallOutcome] = []
         for call in calls[: self._max_actions]:
-            result = await self._tools.execute(
-                call.name,
-                call.arguments,
-                requested_by=requested_by,
-                session_id=session_id,
-            )
+            key = None
+            if seen_calls is not None and call.name in {
+                "cli_tool_run", "project_analyze", "workspace_query",
+            }:
+                try:
+                    key = (call.name, json.dumps(dict(call.arguments), sort_keys=True,
+                                                 allow_nan=False))
+                except (TypeError, ValueError):
+                    pass
+            if key is not None and key in seen_calls:
+                prior = seen_calls[key]
+                result = prior if prior.approval_id else ToolResult.failure(
+                    f"Duplicate request suppressed. Use the earlier tool result: {prior.to_text()}")
+            else:
+                result = await self.run_call(call, requested_by=requested_by,
+                                             session_id=session_id)
+                if seen_calls is not None and (
+                    result.ok and call.name not in {"project_analyze", "workspace_query"}
+                ):
+                    # Another successful operation may have changed the inputs.
+                    for prior_key in tuple(seen_calls):
+                        if not seen_calls[prior_key].approval_id:
+                            del seen_calls[prior_key]
+                if key is not None:
+                    seen_calls[key] = result
             outcomes.append(ToolCallOutcome(call=call, result=result))
         return outcomes
 

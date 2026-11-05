@@ -229,8 +229,10 @@ def _project_analyze_tool_call(message: Message, intent: str) -> dict[str, Any] 
         re.search(r"分析|扫描|\b(?:analy[sz]e|inspect|scan)\b", text)
         and any(term in text for term in ("项目", "project", "目录", "directory", "folder"))
     )
-    if not explicit_analysis and not project_analysis and not any(
-            term.casefold() in text for term in _PROJECT_ANALYZE_TERMS):
+    from Sprout.runtime.analysis_consent import code_metrics_request
+
+    if not (code_metrics_request(text) or explicit_analysis or project_analysis or any(
+            term.casefold() in text for term in _PROJECT_ANALYZE_TERMS)):
         return None
     metadata = dict(message.metadata)
     raw_path = (
@@ -2185,6 +2187,8 @@ class Runtime:
             result = project(analysis)
             if projector is not None:
                 admission["projected_data"] = projector(analysis, view)
+                if admission.get("code_metrics"):
+                    return admission["projected_data"]
             return result
 
         result = await self._capture_project_selection(
@@ -3117,7 +3121,7 @@ class Runtime:
         This local-only lane does not select Tasks by Session, create a Scope,
         or reinterpret old/running graphs. The existing guard owns execution.
         """
-        from Sprout.runtime.analysis_consent import explicit_request
+        from Sprout.runtime.analysis_consent import code_metrics_request, explicit_request
         from Sprout.runtime.dialogue import (
             analysis_followup,
             code_status,
@@ -3251,6 +3255,14 @@ class Runtime:
             node = ExecutionNode(task_id=task.id, type=NodeType.AGENT)
             admission = {"task": task, "workspace": workspace, "paths": paths,
                          "target": target, "message": message, "analysis_result": None}
+            if cli_request and code_metrics_request(message.content):
+                if len(paths) != 1 or not paths[0].casefold().endswith(".py"):
+                    raise PermissionError("code_metrics_requires_one_python_file")
+                from Sprout.workspace.code_metrics import python_metrics
+
+                admission["content_project"] = lambda analysis, view: python_metrics(
+                    view.get(paths[0]))
+                admission["code_metrics"] = True
             self._online_analysis_requests[node.id] = admission
             graph = ExecutionGraph(task_id=task.id, nodes=(node,), entry_node_ids=(node.id,))
             result = await SequentialOrchestrator(store).execute(

@@ -31,7 +31,7 @@ def save(path, value):
 
 
 @pytest.mark.parametrize("case", ["small", "large", "missing", "denied", "oversize", "recovery",
-                                  "total_budget"])
+                                  "total_budget", "metrics", "metrics_denied"])
 def test_cli_selected_file_analysis(tmp_path, monkeypatch, case):
     real = case == "real"  # Explicit external runner only; never selected by pytest.
     project, home, data = (tmp_path / name for name in ("project", "home", "data"))
@@ -51,7 +51,8 @@ def test_cli_selected_file_analysis(tmp_path, monkeypatch, case):
         (project / "oversize.py").write_bytes(b"# bounded input\n" * 75_000)
     selected = {"small": paths[0], "large": paths[1], "missing": "missing.py",
                 "denied": paths[0], "oversize": "oversize.py", "recovery": "oversize.py",
-                "real": paths[1], "total_budget": "total0.py"}[case]
+                "real": paths[1], "total_budget": "total0.py",
+                "metrics": paths[1], "metrics_denied": paths[1]}[case]
     manifest = [f"total{i}.py" for i in range(9)]
     if case == "total_budget":
         for label in manifest:
@@ -70,7 +71,7 @@ def test_cli_selected_file_analysis(tmp_path, monkeypatch, case):
         lines.append(key + "=" + json.dumps(str(data / key)))
     lines += ['[storage.observations]', 'enabled=false', '[memory]', 'enabled=false',
               '[security.audit]', 'path=' + json.dumps(str(data / "audit.jsonl"))]
-    if case == "denied":
+    if case in {"denied", "metrics_denied"}:
         lines += ['[security.rules.workspace]',
                   json.dumps("file.read:" + str(project / selected)) + '="deny"']
     config.write_text("\n".join(lines), "utf-8")
@@ -171,6 +172,9 @@ def test_cli_selected_file_analysis(tmp_path, monkeypatch, case):
     stop = Runtime.stop
 
     async def stopping(runtime):
+        observations["approvals"] = [
+            asdict(record) for record in await runtime.approvals.store.list_approvals()
+        ]
         for task in await runtime.storage.metadata.list_tasks():
             observations["tasks"].append(asdict(task))
             observations["nodes"].extend(asdict(n) for n in
@@ -196,6 +200,10 @@ def test_cli_selected_file_analysis(tmp_path, monkeypatch, case):
     monkeypatch.setattr(chat.questionary, "select", lambda *a, **kw: Answer("current"))
     monkeypatch.setattr(chat.questionary, "text", lambda *a, **kw: Answer(json.dumps(manifest)))
     sequence = [f"分析 {selected} 的结构"]
+    if case in {"metrics", "metrics_denied"}:
+        sequence = [f"统计{selected}的总行数、代码行数和注释行数"]
+    if case == "metrics":
+        sequence.append("刚才统计的文件有多少注释行？")
     if case == "total_budget":
         sequence = ["分析 " + "、".join(manifest) + " 的结构"]
     if case in {"small", "large"}:
@@ -215,7 +223,21 @@ def test_cli_selected_file_analysis(tmp_path, monkeypatch, case):
     save(tmp_path / "OBSERVATIONS.json", observations)
     (tmp_path / "CLI.log").write_text(result.output, "utf-8")
     assert result.exit_code == 0, (result.output, result.exception)
-    if case in {"small", "large", "recovery", "real"}:
+    if case == "metrics":
+        assert len(observations["tools"]) == 1, observations
+        tool = observations["tools"][0]
+        assert tool["ok"], observations
+        metrics = tool["data"]
+        assert metrics["total_lines"] == len((project / selected).read_bytes().splitlines())
+        assert metrics["code_lines"] + metrics["blank_lines"] + metrics["comment_lines"] == (
+            metrics["total_lines"])
+        assert "Total lines" in result.output
+        assert any("Comment-only lines" in str(message["content"])
+                   for model in observations["models"] for message in model["messages"])
+        assert not any(record["tool"] == "cli_tool_run"
+                       for record in observations["approvals"])
+        assert len(observations["tasks"]) == 1
+    elif case in {"small", "large", "recovery", "real"}:
         success = [t for t in observations["tools"] if t["ok"]]
         assert len(success) == 1, observations
         if not real:
@@ -234,9 +256,10 @@ def test_cli_selected_file_analysis(tmp_path, monkeypatch, case):
                 "oversize": "project_capture_file_too_large",
                 "recovery": "project_capture_file_too_large",
                 "total_budget": "project_capture_total_budget"}
-    if case in expected:
-        assert expected[case] in result.output, observations
-    if case in {"missing", "denied", "oversize", "total_budget"}:
+    error_case = "denied" if case == "metrics_denied" else case
+    if error_case in expected:
+        assert expected[error_case] in result.output, observations
+    if error_case in {"missing", "denied", "oversize", "total_budget"}:
         assert not any(t["ok"] for t in observations["tools"])
     if case == "oversize":
         assert "1048576" in result.output
