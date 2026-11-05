@@ -26,7 +26,8 @@ def save(path, payload):
     path.write_text(json.dumps(payload, default=str, ensure_ascii=False, indent=2), 'utf-8')
 
 
-@pytest.mark.parametrize('scenario', ['normal', 'cancel_then_continue', 'explicit_deny'])
+@pytest.mark.parametrize('scenario', ['normal', 'cancel_then_continue', 'explicit_deny',
+                                     'discovery_budget'])
 def test_default_cli_analysis_has_real_effect_and_session_continuity(
         tmp_path, monkeypatch, scenario):
     project, home, data = (tmp_path / p for p in ('project', 'home', 'data'))
@@ -52,6 +53,20 @@ def test_default_cli_analysis_has_real_effect_and_session_continuity(
         lines += ['[security.rules.workspace]',
                   json.dumps('directory.list:' + str(project)) + '="deny"']
     config.write_text('\n'.join(lines), 'utf-8')  # No test-specific directory ALLOW.
+    if scenario == 'discovery_budget':
+        from Sprout.execution.file_broker import FileBroker
+        from Sprout.execution.file_snapshot import DirectoryReadLimits
+
+        enumerate_readable = FileBroker.enumerate_readable
+
+        async def small_directory_budget(broker, *args, **kwargs):
+            # Lower the test limit; the real broker still authorizes and enumerates.
+            kwargs['limits'] = DirectoryReadLimits(max_entries=1)
+            result = await enumerate_readable(broker, *args, **kwargs)
+            save(tmp_path / 'DIRECTORY_RESULT.json', asdict(result))
+            return result
+
+        monkeypatch.setattr(FileBroker, 'enumerate_readable', small_directory_budget)
     monkeypatch.setenv('SPROUT_CONFIG', str(config))
     inputs, models, effects, snapshots, boundaries = [], [], [], [], []
     state = {'message': '', 'restored': False}
@@ -73,8 +88,13 @@ def test_default_cli_analysis_has_real_effect_and_session_continuity(
                     question='')
                 response = LLMResponse(content=json.dumps(value))
             elif any(m.role == 'tool' and m.name == 'project_analyze' for m in messages):
-                assert 'clamp_zero' in text and 'Graph:' in text
-                response = LLMResponse(content='REAL_ANALYSIS_RESULT: app.py defines clamp_zero.')
+                if scenario == 'discovery_budget':
+                    assert 'project_analysis_scope_unavailable' in text
+                    response = LLMResponse(content='Directory analysis did not complete.')
+                else:
+                    assert 'clamp_zero' in text and 'Graph:' in text
+                    response = LLMResponse(
+                        content='REAL_ANALYSIS_RESULT: app.py defines clamp_zero.')
             else:
                 if '刚才' in state['message'] or state['restored']:
                     assert 'REAL_ANALYSIS_RESULT' in text
@@ -200,6 +220,10 @@ def test_default_cli_analysis_has_real_effect_and_session_continuity(
     if scenario == 'explicit_deny':
         assert not completed and not effects and not snapshots[0]['approvals']
         assert 'denied' in result.output.lower() or '拒绝' in result.output
+        return
+    if scenario == 'discovery_budget':
+        assert not completed and effects and not any(effect['ok'] for effect in effects)
+        assert 'project_auto_discovery_unavailable' in result.output
         return
     assert len(completed) == (3 if scenario == 'normal' else 1)
     assert len([e for e in effects if e['name'] == 'project_analyze' and e['ok']]) == len(completed)

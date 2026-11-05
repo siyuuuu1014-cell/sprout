@@ -53,6 +53,8 @@ class WorkspaceGraphBuilder:
         """Build a graph exclusively from captured labels and bytes."""
         from pathlib import PurePosixPath
 
+        from Sprout.workspace.authorized_content import EXPLICIT_PYTHON_ANALYSIS_FILE_BYTES
+
         view.check(workspace.id)
         files = {ref.path: WorkspaceNode(
             id=self._node_id(workspace.id, ref.path), resource=ref, kind=ref.kind.value,
@@ -109,7 +111,9 @@ class WorkspaceGraphBuilder:
             label = PurePosixPath(path)
             if label.suffix not in {".py", *_GENERIC_SYMBOL_SUFFIXES}:
                 continue
-            if len(data) > self.max_source_bytes:
+            limit = (min(view.limits.max_file_bytes, EXPLICIT_PYTHON_ANALYSIS_FILE_BYTES)
+                     if label.suffix == ".py" else self.max_source_bytes)
+            if len(data) > limit:
                 raise ValueError("view_graph_source_budget")
             symbols = []
             if label.suffix == ".py":

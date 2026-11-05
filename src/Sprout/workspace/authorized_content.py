@@ -19,6 +19,12 @@ from Sprout.workspace.models import ResourceKind, ResourceRef, Workspace
 VISIBLE_KINDS = frozenset({ResourceKind.PUBLIC, ResourceKind.SOURCE, ResourceKind.TEST,
                            ResourceKind.CONFIG, ResourceKind.DOCUMENTATION})
 
+EXPLICIT_PYTHON_ANALYSIS_FILE_BYTES = 1024 * 1024
+
+
+class ProjectAnalysisError(PermissionError):
+    """Runtime-produced failure detail, never an access credential."""
+
 
 def relative_label(value: str) -> str:
     """Validate an in-memory label, not a replacement for R03 path authority."""

@@ -2060,7 +2060,11 @@ class Runtime:
         from Sprout.tools.context_keys import _current_project_analysis_call
         from Sprout.tools.project_analyze_tool import ProjectAnalyzeTool
         from Sprout.tools.result import ToolResult
-        from Sprout.workspace.authorized_content import VISIBLE_KINDS
+        from Sprout.workspace.authorized_content import (
+            EXPLICIT_PYTHON_ANALYSIS_FILE_BYTES,
+            VISIBLE_KINDS,
+            ContentLimits,
+        )
         from Sprout.workspace.models import ResourceRef
 
         arguments = deepcopy(dict(arguments))
@@ -2132,7 +2136,15 @@ class Runtime:
                     scope_path(str(frame.node_scope.workspace.root / path))))
         if not paths:
             raise PermissionError("project_capture_selection_unavailable")
-        selection = await self._issue_project_analysis_selection(paths)
+        limits = None
+        if (not discovered and isinstance(tool, ProjectAnalyzeTool)
+                and frame.node_scope.task.source == "cli"
+                and frame.node_scope.node.id in self._online_analysis_requests
+                and all(path.casefold().endswith(".py") for path in paths)):
+            # Only a live explicit CLI Python selection gets the larger read budget.
+            # CODE preparation, discovery and query retain their existing budgets.
+            limits = ContentLimits(max_file_bytes=EXPLICIT_PYTHON_ANALYSIS_FILE_BYTES)
+        selection = await self._issue_project_analysis_selection(paths, limits=limits)
         if not isinstance(tool, ProjectAnalyzeTool):
             return await self._query_project_selection(selection, arguments)
 
@@ -2391,6 +2403,7 @@ class Runtime:
         from Sprout.workspace.authorized_content import (
             AuthorizedContentView,
             AuthorizedEntry,
+            ProjectAnalysisError,
             _CaptureSelection,
         )
         from Sprout.workspace.models import ResourceRef
@@ -2428,7 +2441,8 @@ class Runtime:
                         raise PermissionError("project_consumer_policy_denied")
                 remaining = selection.limits.max_total_bytes - total
                 if remaining <= 0:
-                    raise PermissionError("project_capture_total_budget")
+                    raise ProjectAnalysisError("project_capture_total_budget: max_total_bytes="
+                                               + str(selection.limits.max_total_bytes))
                 kind = self._file_broker._classify(workspace.root / path, sandbox)
                 request = replace(subject, action=ActionType.FILE_READ, resource=ResourceRef(
                     workspace.id, subject.resource.path, kind=kind,
@@ -2446,7 +2460,20 @@ class Runtime:
                                        if expected_identities is not None else None),
                 )
                 if not result.ok:
-                    raise PermissionError("project_capture_read_denied")
+                    if result.reason == "snapshot_budget_exceeded":
+                        if remaining < selection.limits.max_file_bytes:
+                            raise ProjectAnalysisError("project_capture_total_budget: "
+                                "max_total_bytes=" + str(selection.limits.max_total_bytes))
+                        raise ProjectAnalysisError("project_capture_file_too_large: max_file_bytes="
+                            + str(selection.limits.max_file_bytes)
+                            + "; max_total_bytes=" + str(selection.limits.max_total_bytes))
+                    reason = {
+                        "snapshot_not_found": "project_capture_file_not_found",
+                        "snapshot_authorization_denied": "project_capture_read_denied",
+                        "snapshot_identity_changed": "project_capture_file_changed",
+                        "snapshot_classification_denied": "project_capture_unsupported_file_type",
+                    }.get(result.reason, "project_capture_read_failed")
+                    raise ProjectAnalysisError(reason)
                 entries.append(AuthorizedEntry(path, kind, result.data, result.digest,
                                                result.identity))
                 total += len(result.data)
@@ -3192,7 +3219,8 @@ class Runtime:
                     await self._record_project_capture_policy(request, decision)
                     if (decision.decision is not AccessDecision.ALLOW
                             or not scope.permits(ActionType.FILE_READ.value, absolute)):
-                        raise PermissionError("analysis_task_resource_unavailable")
+                        raise PermissionError(
+                            "analysis_task_resource_unavailable: analysis_file_policy_denied")
                 # A real entry file reaches ToolExecutor. A registered manifest
                 # still requires separate per-file authorization below it.
                 target = str(workspace.root / paths[0])
