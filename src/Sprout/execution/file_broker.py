@@ -174,6 +174,22 @@ class FileBroker:
                 if not await authorize(path):
                     raise PermissionError("directory_authorization_changed")
             return DirectoryListingResult(True, entries=tuple(visible))
+        except (FileBoundaryError, PermissionError) as exc:
+            # Only fixed internal categories may leave the boundary. OS error
+            # text can contain names or other data outside the visible scope.
+            reason = str(exc)
+            if reason == "secure_open_refused:5":
+                reason = "directory_access_denied"
+            if reason not in {
+                "directory_access_denied", "directory_budget_exceeded",
+                "directory_identity_changed", "directory_link_or_special_file",
+                "directory_authorization_denied", "directory_authorization_changed",
+                "directory_authority_changed", "directory_subject_unavailable",
+                "directory_subject_mismatch", "directory_workspace_mismatch",
+                "directory_result_invalid",
+            }:
+                reason = "directory_enumeration_unavailable"
+            return DirectoryListingResult(reason=reason)
         except (OSError, ValueError):
             return DirectoryListingResult(reason="directory_enumeration_unavailable")
 

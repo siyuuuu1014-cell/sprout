@@ -37,6 +37,14 @@ if TYPE_CHECKING:
     from Sprout.session.models import Session, Turn
 
 CLARIFICATION_KEY = "intent_clarification_v1"
+_PROJECT_OFFER = "需要我先看一下当前项目吗？"
+_PROJECT_REQUEST = "分析当前项目"
+
+
+def _project_offer_request(text: str) -> bool:
+    return "".join(text.split()).translate(str.maketrans("", "", "，,。？?")) in {
+        "你是谁你能做什么", "你能做什么",
+    }
 
 
 def clarification_store(runtime: Runtime) -> IntentClarificationStore | None:
@@ -67,7 +75,7 @@ async def _reply(
 
 async def route_clarification(
     runtime: Runtime, message: Message, session: Session, principal: Principal | None,
-    *, classification: dict[str, Any] | None = None,
+    *, classification: dict[str, Any] | None = None, analysis_task_provider=None,
 ) -> OutboundMessage | None:
     """Return an early response or None to preserve ordinary routing.
 
@@ -88,6 +96,32 @@ async def route_clarification(
                 or session.metadata.get("entry_principal_v1") != snapshot["principal"]):
             raise PermissionError("Clarification identity unavailable")
         expired = datetime.fromisoformat(record["expires_at"]) <= datetime.now(UTC)
+        if record["question"] == _PROJECT_OFFER and _project_offer_request(snapshot["request"]):
+            answer = message.content.strip().rstrip("。！!")
+            if expired:
+                choice = "expired"
+            elif answer in {"需要", "好的", "可以", "是的"}:
+                choice = "read" if analysis_task_provider is not None else "cancel"
+            elif answer in {"不用", "不用了", "不需要", "取消"}:
+                choice = "cancel"
+            else:
+                choice = "superseded"
+            if not await store.resolve_intent_clarification(
+                session, record["id"], message.id, message.content, choice,
+            ):
+                return await _reply(runtime, message, session,
+                                    "分析提议已失效或已处理。", persist=False)
+            if choice == "read":
+                return await runtime._dispatch_project_analysis(
+                    replace(message, content=_PROJECT_REQUEST, metadata={}),
+                    session, principal=principal, analysis_task=None, classification={},
+                    analysis_task_provider=analysis_task_provider, reply_to=message,
+                )
+            if choice in {"cancel", "expired"}:
+                return await _reply(runtime, message, session,
+                                    "未开始项目分析。请重新发送明确请求。")
+            return None
+
         # Only a live question interprets ordinary text as a selection. An
         # expired row is retired atomically, then this is a normal chat turn.
         new_write_request = False
@@ -221,6 +255,10 @@ async def route_clarification(
         return await _reply(runtime, message, session,
                             "请说明要修改的具体对象和要求；这条短回复不会执行历史请求。",
                             blocked_reason="operation_target_required")
+    if (store is not None and analysis_task_provider is not None and principal is not None
+            and principal.authenticated and principal.source == "cli"
+            and _project_offer_request(message.content)):
+        return await _ask(runtime, message, session, principal, project_offer=True)
     if not needs_intent_clarification(message.content):
         return None
     return await _ask(runtime, message, session, principal)
@@ -242,7 +280,7 @@ async def route_semantic_clarification(
 
 async def _ask(
     runtime: Runtime, message: Message, session: Session, principal: Principal | None,
-    *, allow_write: bool = True, missing_scope: bool = False,
+    *, allow_write: bool = True, missing_scope: bool = False, project_offer: bool = False,
 ) -> OutboundMessage:
     store = clarification_store(runtime)
     if store is None or principal is None or not session.user_id:
@@ -272,9 +310,15 @@ async def _ask(
         question = (f"关于“{message.content.strip()}”，还缺少具体操作对象或范围。"
                     "请重新发送包含对象、目标和范围的完整请求；也可回答“只分析”或“取消”。"
                     "“好的”或“直接修改”不会授权执行这个未明确的请求。")
-    outbound = _outbound(message, session, question, clarification_required=True)
+    content = question
+    if project_offer:
+        question = _PROJECT_OFFER
+        choices = ("read", "cancel")
+        content = ("我是 SEAM Sprout，可以分析项目、协助修改代码和运行验证。\n\n"
+                   + question)
+    outbound = _outbound(message, session, content, clarification_required=True)
     turn = await runtime._persist_turns(
-        session, message, AgentResult(question, metadata=dict(outbound.metadata)),
+        session, message, AgentResult(content, metadata=dict(outbound.metadata)),
     )
     expires = (datetime.now(UTC) + timedelta(minutes=30)).isoformat()
     if await store.issue_intent_clarification(

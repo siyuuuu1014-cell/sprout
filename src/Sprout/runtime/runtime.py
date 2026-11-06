@@ -2129,6 +2129,7 @@ class Runtime:
                 admission = self._online_analysis_requests.get(frame.node_scope.node.id)
                 if admission is not None:
                     admission["unavailable_reason"] = "project_auto_discovery_unavailable"
+                    admission["directory_listing_reason"] = listing.reason
                 raise PermissionError("project_auto_discovery_unavailable")
             identities = {}
             for entry in listing.entries:
@@ -3210,7 +3211,7 @@ class Runtime:
     # -- online path ---------------------------------------------------------
     async def _dispatch_project_analysis(
         self, message, session, *, principal, analysis_task, classification,
-        analysis_task_provider=None,
+        analysis_task_provider=None, reply_to=None,
     ):
         """Admit an explicit host reference; routing hints confer no authority.
 
@@ -3404,9 +3405,13 @@ class Runtime:
                                    session_id=session.id, correlation_id=message.id,
                                    metadata={"analysis_status": "unavailable" if reason else "ok",
                                              "reason": reason})
-        await self._persist_turns(session, message, AgentResult(content=content, metadata=(
+        result_metadata = (
             {"project_analysis_ref_v1": {"task_id": task.id, "node_id": node.id}}
-            if not reason else {})))
+            if not reason else {}
+        )
+        await self._persist_turns(
+            session, reply_to or message, AgentResult(content=content, metadata=result_metadata),
+        )
         return outbound
 
     async def handle(
@@ -3439,6 +3444,7 @@ class Runtime:
         classification: dict[str, Any] = {}
         clarification = await route_clarification(
             self, message, session, principal, classification=classification,
+            analysis_task_provider=analysis_task_provider,
         )
         if clarification is not None:
             return await self.middleware.after(message, clarification)
@@ -4355,6 +4361,7 @@ class Runtime:
         classification: dict[str, Any] = {}
         clarification = await route_clarification(
             self, message, session, principal, classification=classification,
+            analysis_task_provider=analysis_task_provider,
         )
         if clarification is not None:
             clarification = await self.middleware.after(message, clarification)
