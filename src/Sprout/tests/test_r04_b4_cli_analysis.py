@@ -25,7 +25,8 @@ async def cli(rig, captured, monkeypatch):
     from Sprout.runtime.intent_analysis import response_example
 
     state = SimpleNamespace(
-        terminal=False, classification=0, analysis=True, seen=[], prompts=[],
+        terminal=False, classification=0, expected_prompt_classifications=1,
+        analysis=True, seen=[], prompts=[],
         answers=["src/main.py", True], inputs=["分析 manifest 中指定的文件"],
         display=[], lives=[], session=rig.session.id, user="DISPLAY_NOT_IDENTITY",
         workspace_id=rig.workspace.id, intents=[], query=None,
@@ -77,7 +78,7 @@ async def cli(rig, captured, monkeypatch):
         state.prompts.append(str(text))
         class Prompt:
             async def ask_async(self):
-                assert state.classification == 1, "prompt before R02 or duplicate classification"
+                assert state.classification == state.expected_prompt_classifications
                 assert not any(live.active for live in state.lives), "Live owns terminal"
                 answer = state.answers.pop(0)
                 if isinstance(answer, BaseException):

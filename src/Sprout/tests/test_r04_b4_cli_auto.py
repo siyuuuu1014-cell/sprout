@@ -104,3 +104,108 @@ async def test_auto_platform_failure_does_not_publish_success(automatic, monkeyp
     await cli.run()
     assert not cli.captured.opens
     assert not any("CLI_PROJECT_MAIN_RESULT" in value for value in cli.state.display)
+
+
+@pytest.fixture
+async def durable_offer_cli(automatic, tmp_path, monkeypatch):
+    from Sprout.rootstock.backends.sqlite_store import open_session_store
+
+    cli = automatic
+    runtime = cli.rig.runtime
+    store = open_session_store(str(tmp_path / "offer.db"))
+    await store.save_session(cli.rig.session)
+    monkeypatch.setattr(runtime, "_session_store", store)
+    monkeypatch.setattr(runtime, "_sessions", type(runtime._sessions)(store))
+    cli.state.expected_prompt_classifications = 0
+    try:
+        yield cli
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(("answers", "consent", "expected"), [
+    (["需要"], True, True),
+    (["需要", "需要"], True, True),
+    (["需要"], False, False),
+    (["不用了", "需要"], True, False),
+    (["你好", "需要"], True, False),
+])
+async def test_capability_offer_requires_followup_and_directory_consent(
+    durable_offer_cli, answers, consent, expected,
+):
+    cli = durable_offer_cli
+    cli.state.inputs = ["你是谁你能做什么", *answers]
+    cli.state.answers = [consent]
+    await cli.run()
+    assert any("需要我先看一下当前项目吗" in value for value in cli.state.display)
+    assert cli.create.await_count == int(expected)
+    assert bool(cli.captured.opens) == expected
+    if expected:
+        assert any("CLI_PROJECT_MAIN_RESULT" in value for value in cli.state.display)
+
+
+@pytest.mark.parametrize("case", ["other_session", "expired", "no_offer"])
+async def test_short_reply_cannot_consume_unavailable_project_offer(durable_offer_cli, case):
+    from dataclasses import replace
+    from unittest.mock import AsyncMock
+
+    from Sprout.message.models import Message
+
+    cli = durable_offer_cli
+    runtime = cli.rig.runtime
+    session = cli.rig.session
+    provider = AsyncMock(return_value=None)
+    if case != "no_offer":
+        offer = await runtime.handle(
+            Message("你是谁你能做什么", session_id=session.id),
+            principal=cli.rig.principal, analysis_task_provider=provider,
+        )
+        assert offer.metadata["clarification_required"]
+    if case == "other_session":
+        session = replace(session, id="different-session")
+        await runtime._session_store.save_session(session)
+    elif case == "expired":
+        await runtime._session_store._db.execute(
+            "UPDATE intent_clarifications_v1 SET expires_at=? WHERE session_id=?",
+            ("2000-01-01T00:00:00+00:00", session.id),
+        )
+    await runtime.handle(
+        Message("需要", session_id=session.id),
+        principal=cli.rig.principal, analysis_task_provider=provider,
+    )
+    provider.assert_not_awaited()
+    cli.create.assert_not_called()
+    assert not cli.captured.opens
+
+
+@pytest.mark.parametrize(("failure", "expected_reason"), [
+    (file_access.FileBoundaryError("secure_open_refused:5"), "directory_access_denied"),
+    (file_access.FileBoundaryError("directory_budget_exceeded"), "directory_budget_exceeded"),
+    (file_access.FileBoundaryError("directory_identity_changed"), "directory_identity_changed"),
+    (file_access.FileBoundaryError("directory_link_or_special_file"),
+     "directory_link_or_special_file"),
+    (PermissionError("directory_authorization_denied"), "directory_authorization_denied"),
+    (OSError("private filename must not escape"), "directory_enumeration_unavailable"),
+])
+async def test_discovery_failure_reason_is_safe_and_still_denied(
+    automatic, monkeypatch, failure, expected_reason,
+):
+    cli = automatic
+    reasons = []
+    async def unavailable(*args):
+        raise failure
+    monkeypatch.setattr(file_access, "directory_entries", unavailable)
+    broker = cli.rig.runtime._file_broker
+    original = broker.enumerate_readable
+    async def observed(*args, **kwargs):
+        result = await original(*args, **kwargs)
+        assert not result.ok
+        assert result.entries == ()
+        reasons.append(result.reason)
+        return result
+    monkeypatch.setattr(broker, "enumerate_readable", observed)
+    await cli.run()
+    assert reasons == [expected_reason]
+    assert not cli.captured.opens
+    assert not any("CLI_PROJECT_MAIN_RESULT" in value for value in cli.state.display)
+    assert not any("private filename" in value for value in cli.state.display)
