@@ -81,7 +81,7 @@ uv run sprout stop serve
 /language zh-Hant
 ```
 
-Consulta los idiomas compatibles en `src/Sprout/cli/i18n_languages.md`.
+Consulta los idiomas compatibles en `docs/architecture/i18n_languages.md`.
 
 ## Temporal
 

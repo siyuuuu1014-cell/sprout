@@ -159,7 +159,7 @@ def _normalize_model_routes(data: Mapping[str, Any]) -> Mapping[str, Any]:
 def _normalize_storage_aliases(data: Mapping[str, Any]) -> Mapping[str, Any]:
     """Accept the public ``sprout_*`` storage names as well as legacy fields.
 
-    ``guidance.md`` section 19 names the authorities ``core``, ``conversation``,
+    ``docs/architecture/guidance.md`` section 19 names the authorities ``core``, ``conversation``,
     ``audit``, and ``usage``. The internal :class:`StorageSettings` fields still
     use the historical implementation names, so config files written against
     the new public surface are translated here instead of forcing every caller

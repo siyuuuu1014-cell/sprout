@@ -258,7 +258,7 @@ uv run sprout stop serve          # 停止 Web 控制台
 ```
 
 支持的语言见
-[`src/Sprout/cli/i18n_languages.md`](src/Sprout/cli/i18n_languages.md)。选择
+[`docs/architecture/i18n_languages.md`](docs/architecture/i18n_languages.md)。选择
 结果保存在 `~/.sprout/settings.json`，下一次启动会继续使用。
 
 ### Temporal
@@ -364,7 +364,7 @@ uv run pytest
 uv run ruff check .
 ```
 
-开发流程与 CLI/MCP 暴露规则见 [guidance.md](guidance.md)。
+开发流程与 CLI/MCP 暴露规则见 [guidance.md](docs/architecture/guidance.md)。
 
 ## 贡献者
 

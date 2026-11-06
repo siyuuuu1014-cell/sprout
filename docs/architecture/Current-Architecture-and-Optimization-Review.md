@@ -340,11 +340,11 @@ uv run pytest -q -p no:cacheprovider --basetemp=.workbuddy/test-runs/architectur
 
 以下为本机可点击的代表性实现位置；路径映射随项目移动需更新。
 
-- [Runtime 工厂](D:/dev/projects/sprout/src/Sprout/runtime/factory.py)、[Runtime](D:/dev/projects/sprout/src/Sprout/runtime/runtime.py)、[节点执行](D:/dev/projects/sprout/src/Sprout/runtime/nodes.py)、[变更管理](D:/dev/projects/sprout/src/Sprout/runtime/changes.py)。
-- [工作区服务](D:/dev/projects/sprout/src/Sprout/runtime/workspaces.py)、[分析组合](D:/dev/projects/sprout/src/Sprout/workspace/intelligence.py)、[项目存储](D:/dev/projects/sprout/src/Sprout/storage/local/sqlite/projects.py)。
-- [验收规格](D:/dev/projects/sprout/src/Sprout/strategy/acceptance.py)、[测试和 Demo 生成](D:/dev/projects/sprout/src/Sprout/execution/acceptance.py)、[完成门禁](D:/dev/projects/sprout/src/Sprout/execution/verification.py)。
-- [队列](D:/dev/projects/sprout/src/Sprout/runtime/queue.py)、[Local 终端](D:/dev/projects/sprout/src/Sprout/orchestration/terminal/local.py)、[Temporal workflows](D:/dev/projects/sprout/src/Sprout/orchestration/temporal_workflows.py)。
-- [工具授权](D:/dev/projects/sprout/src/Sprout/tools/executor.py)、[系统工具](D:/dev/projects/sprout/src/Sprout/tools/system_tools.py)、[候选管理](D:/dev/projects/sprout/src/Sprout/evolution/candidate_manager.py)、[成长硬门禁](D:/dev/projects/sprout/src/Sprout/evolution/hard_gate.py)。
-- [Web 应用](D:/dev/projects/sprout/web/webapi/app.py)、[手工看板 API](D:/dev/projects/sprout/web/webapi/routes/tasks.py)、[前端工程配置](D:/dev/projects/sprout/web/frontend/package.json)。
+- [Runtime 工厂](../../src/Sprout/runtime/factory.py)、[Runtime](../../src/Sprout/runtime/runtime.py)、[节点执行](../../src/Sprout/runtime/nodes.py)、[变更管理](../../src/Sprout/runtime/changes.py)。
+- [工作区服务](../../src/Sprout/runtime/workspaces.py)、[分析组合](../../src/Sprout/workspace/intelligence.py)、[项目存储](../../src/Sprout/storage/local/sqlite/projects.py)。
+- [验收规格](../../src/Sprout/strategy/acceptance.py)、[测试和 Demo 生成](../../src/Sprout/execution/acceptance.py)、[完成门禁](../../src/Sprout/execution/verification.py)。
+- [队列](../../src/Sprout/runtime/queue.py)、[Local 终端](../../src/Sprout/orchestration/terminal/local.py)、[Temporal workflows](../../src/Sprout/orchestration/temporal_workflows.py)。
+- [工具授权](../../src/Sprout/tools/executor.py)、[系统工具](../../src/Sprout/tools/system_tools.py)、[候选管理](../../src/Sprout/evolution/candidate_manager.py)、[成长硬门禁](../../src/Sprout/evolution/hard_gate.py)。
+- [Web 应用](../../web/webapi/app.py)、[手工看板 API](../../web/webapi/routes/tasks.py)、[前端工程配置](../../web/frontend/package.json)。
 
 最终原则：**分析事实可以不完整，但不能伪精确；变更可以人工豁免落盘，但不能伪验证；模块可以共享契约，但不能共享不明确的状态权威。**

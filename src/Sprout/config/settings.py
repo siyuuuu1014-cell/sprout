@@ -63,7 +63,7 @@ class ObservationSettings:
 class StorageSettings:
     # Sprout runtime authorities. The legacy field names remain the storage
     # bundle's implementation names; the public topology is the new
-    # ``sprout_*`` layout described in guidance.md section 19.
+    # ``sprout_*`` layout described in docs/architecture/guidance.md section 19.
     operational: str = _sqlite_dsn("sprout_audit.db")
     knowledge: str = _sqlite_dsn("sprout_knowledge.db")
     metadata: str = _sqlite_dsn("sprout_core.db")

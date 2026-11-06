@@ -12,7 +12,7 @@ from uuid import uuid4
 class Session:
     """A control-conversation session (``sprout_conversation.db`` authority).
 
-    The authority columns of ``guidance.md`` §19.2 (``channel``,
+    The authority columns of ``docs/architecture/guidance.md`` §19.2 (``channel``,
     ``target_ref_id``, ``title``, ``status``, ``locale``, ``summary``,
     ``updated_at``) are first-class fields so the CLI/gateway can render and
     filter sessions without unpacking ``metadata``. They are appended after the
@@ -54,7 +54,7 @@ class Turn:
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     seq: int = 0
     metadata: dict[str, Any] = field(default_factory=dict)
-    # --- Message authority columns (guidance.md §19.2) ---
+    # --- Message authority columns (docs/architecture/guidance.md §19.2) ---
     # Appended last so existing positional construction (e.g. the lanediag
     # probe) keeps working. ``content_type='folded_block'`` + ``line_count``
     # implement the CLI multi-line paste contract (§19.2 L694-697).

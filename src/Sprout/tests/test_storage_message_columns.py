@@ -1,6 +1,6 @@
 """§19.2 session/message authority columns — round-trip + migration (落库-1/2).
 
-Verifies the guidance.md §19.2 column contract for ``sessions`` (11 cols) and
+Verifies the docs/architecture/guidance.md §19.2 column contract for ``sessions`` (11 cols) and
 ``turns`` (12 cols) is honoured end-to-end: model -> SQL -> read-back, plus the
 in-place migration that upgrades pre-existing 4-column / 7-column databases.
 """
