@@ -179,7 +179,15 @@ class TemporalOrchestratorBackend:
             }
             await self._save_record(record)
             if self._metadata is not None:
-                await self._transition_task(graph.task_id, TaskStatus.WAITING_RESOURCE)
+                park = getattr(self._metadata, "park_unconfirmed_temporal_start", None)
+                if (
+                    park is not None
+                    and phase in {"connect", "start"}
+                    and not record.get("accepted")
+                ):
+                    await park(graph.task_id, record["id"])
+                else:
+                    await self._transition_task(graph.task_id, TaskStatus.WAITING_RESOURCE)
             return TaskResult(
                 task_id=graph.task_id,
                 status=TaskStatus.WAITING_RESOURCE,

@@ -89,11 +89,11 @@ from Sprout.runtime.state import TaskStateMachine
 from Sprout.runtime.workspaces import WorkspaceService
 from Sprout.sandbox.lifecycle import SandboxLifecycleService
 from Sprout.security.approval import (
+    _CAPABILITY_TURN,
     ApprovalManager,
     ApprovalRecord,
     ApprovalStatus,
     CapabilityTurn,
-    _CAPABILITY_TURN,
 )
 from Sprout.security.audit import SecurityAuditLog
 from Sprout.security.engine import PolicyEngine
@@ -1870,9 +1870,8 @@ class Runtime:
         if frame is None or getattr(frame[0], "_sandbox", None) != sandbox:
             raise PermissionError("node_file_binding_unavailable")
         subject = await self._node_tool_request(frame[0], frame[2])
-        from Sprout.security.access import ActionType
-
         from Sprout.execution.coding_command_tool import IsolatedCodingCommandTool
+        from Sprout.security.access import ActionType
 
         if type(frame[0]) is IsolatedCodingCommandTool:
             task = await self._metadata_or_raise().get_task(subject.task_id)
@@ -2882,13 +2881,22 @@ class Runtime:
             record = self._node_products.get((scope.task.id, node.id))
             if record is None:
                 record = await self._load_node_product(scope, node)
+            recorded_task = record[0] if record is not None else None
+            # A worker can capture the Task before Temporal reconciles the
+            # accepted submission. Preserve equality of every other field.
+            if (recorded_task is not None
+                    and recorded_task.status is TaskStatus.WAITING_RESOURCE
+                    and scope.task.status is TaskStatus.RUNNING):
+                recorded_task = replace(recorded_task, status=TaskStatus.RUNNING)
             if (record is None or record[5] is not self or node.status is not NodeStatus.COMPLETED
-                    or record[0] != scope.task
+                    or recorded_task != scope.task
                     or record[1] != replace(scope.workspace, manifest=None)
                     or record[2].type != node.type or record[3] != output
                     or record[2].metadata.get("execution_guard", {}).get("owner")
                     != node.metadata.get("execution_guard", {}).get("owner")):
                 raise PermissionError("node_artifact_provenance_unavailable")
+            if recorded_task is not record[0]:
+                self._node_products[(scope.task.id, node.id)] = (recorded_task, *record[1:])
             found = True
             admitted_ids.add(node.id)
             paths.update(record[4])
