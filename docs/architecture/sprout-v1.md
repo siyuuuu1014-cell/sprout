@@ -681,7 +681,7 @@ Python CLI/Web Runtime + 本地 SQLite/Blob/JSONL + 用户自有 Git 仓库；�
 - [Verification](https://github.com/siyuuuu1014-cell/sprout/blob/dev/src/Sprout/execution/verification.py)
 - [Memory Compactor](https://github.com/siyuuuu1014-cell/sprout/blob/dev/src/Sprout/memory/compactor.py)
 - [Growth Facade](https://github.com/siyuuuu1014-cell/sprout/blob/dev/src/Sprout/evolution/unified.py)
-- [Architecture Review](https://github.com/siyuuuu1014-cell/sprout/blob/dev/Current-Architecture-and-Optimization-Review.md)
+- [Architecture Review](https://github.com/siyuuuu1014-cell/sprout/blob/dev/docs/architecture/Current-Architecture-and-Optimization-Review.md)
 
 **核实方法和限制：** 通过 GitHub 连接核查了默认开发分支的完整文件树（共 844 文件）和上述核心源码，以及多项上游开源工程的真实目录、代表性实现。本研究没有逐行审计所有文件、没有在当前会话运行 Sprout 的单测或真实模型调用，也没有验证所有第三方开源实现能直接移植。所有拟议接口、分期和指标均需通过 PR 级测试与架构评审验证。
 

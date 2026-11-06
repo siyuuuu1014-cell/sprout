@@ -338,7 +338,7 @@ The interactive CLI can switch its menu language without restarting:
 ```
 
 Supported languages are listed in
-[`src/Sprout/cli/i18n_languages.md`](src/Sprout/cli/i18n_languages.md). The
+[`docs/architecture/i18n_languages.md`](docs/architecture/i18n_languages.md). The
 selection is stored in `~/.sprout/settings.json` and reused by the next session.
 
 ### Temporal
@@ -446,7 +446,7 @@ uv run pytest
 uv run ruff check .
 ```
 
-See [guidance.md](guidance.md) for the development workflow and CLI/MCP exposure rules.
+See [guidance.md](docs/architecture/guidance.md) for the development workflow and CLI/MCP exposure rules.
 
 ## Contributors
 

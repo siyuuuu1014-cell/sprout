@@ -1,7 +1,7 @@
 """§19.2 attachment + message↔task link authority tables (落库-2/4).
 
 Verifies the two tables that had *no* schema at all — ``attachments`` (11 cols)
-and ``message_task_link`` (5 cols) — now exist with the guidance.md §19.2
+and ``message_task_link`` (5 cols) — now exist with the docs/architecture/guidance.md §19.2
 column contract, and that the runtime's online write path actually populates
 them (attachment envelope lane + task-creation edge).
 """

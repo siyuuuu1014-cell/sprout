@@ -128,7 +128,7 @@ CLI user-facing strings are routed through `Sprout.cli.i18n`. Static strings
 are stored as translation pairs and rendered in the active language; dynamic
 strings fall back to English when no translation is registered. Supported
 languages and the runtime switch command are documented in
-`src/Sprout/cli/i18n_languages.md`.
+`i18n_languages.md`.
 
 - Use `Sprout.cli.i18n.L(zh, en)` for new CLI labels.
 - Register additional languages with `add_translations()` instead of adding a
