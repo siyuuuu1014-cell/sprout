@@ -43,8 +43,10 @@ def automatic(cli, monkeypatch):
     return cli
 
 
-async def test_whole_project_natural_language_repl_not_manual_manifest(automatic):
+@pytest.mark.parametrize("request_text", ["分析当前整个项目", "你能分析当前项目吗"])
+async def test_whole_project_natural_language_repl_not_manual_manifest(automatic, request_text):
     cli = automatic
+    cli.state.inputs = [request_text]
     await cli.run()
     cli.create.assert_awaited_once()
     kwargs = cli.create.call_args.kwargs

@@ -274,7 +274,15 @@ class AgentLoop:
             (m.content for m in reversed(messages) if m.role is Role.ASSISTANT and m.content),
             "",
         )
-        content = last_assistant or "Reached the maximum number of tool steps."
+        # A resumed turn can inherit an approval prompt as its last assistant
+        # text. Only current tool messages can describe what actually ran.
+        resumed_output = (
+            _tool_result_fallback(messages, None, response_language) if resume_calls else None
+        )
+        content = (
+            (resumed_output if resume_calls else last_assistant)
+            or "Reached the maximum number of tool steps."
+        )
         return AgentResult(
             content=content,
             metadata={
@@ -591,7 +599,7 @@ def _language_label(language: str) -> str:
 
 def _tool_result_fallback(
     messages: list[LLMMessage],
-    error: Exception,
+    error: Exception | None,
     language: str,
 ) -> str | None:
     tool_results = [
@@ -606,7 +614,8 @@ def _tool_result_fallback(
         f"[{message.name or message.tool_call_id or 'tool'}]\n{message.content}"
         for message in tool_results[-3:]
     )
-    return f"{header}\n\n{details}\n\n{type(error).__name__}: {error}"
+    suffix = f"\n\n{type(error).__name__}: {error}" if error is not None else ""
+    return f"{header}\n\n{details}{suffix}"
 
 
 def _localized_tool_fallback_header(language: str) -> str:
