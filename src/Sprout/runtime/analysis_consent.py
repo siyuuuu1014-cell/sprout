@@ -26,7 +26,9 @@ def explicit_request(text):
     if re.search(r'(?:不要|无需|不必|停止|取消)\s*(?:再|重新|继续)?\s*(?:分析|扫描)|'
                  r"\b(?:do not|don't)\s+(?:analy[sz]e|scan)", text):
         return False
-    return code_metrics_request(text) or bool(re.search(
+    return code_metrics_request(text) or bool(re.fullmatch(
+        r"(?:你)?(?:能|可以|能否)(?:帮我)?\s*分析(?:一下)?\s*当前项目(?:吗)?[？?。]?", text
+    )) or bool(re.search(
         r'^(?:请|帮我|麻烦)?\s*(?:重新)?(?:分析|扫描|analy[sz]e\b|inspect\b)|'
         r'^(?:请)?继续.*(?:未完成|失败|被拒绝).*(?:项目分析|分析项目)', text))
 

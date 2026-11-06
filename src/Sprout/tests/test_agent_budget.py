@@ -412,3 +412,43 @@ async def test_cli_tool_can_run_again_after_an_edit(monkeypatch):
     executor = ActionExecutor(ToolExecutor(tools=ToolRegistry()))
     await executor.run_calls_detailed((command, edit, repeat), seen_calls={})
     assert calls == ["cli_tool_run", "sandbox_edit_file", "cli_tool_run"]
+
+
+def test_cli_current_project_question_selects_native_analysis():
+    from Sprout.runtime.analysis_consent import explicit_request
+
+    assert explicit_request("你能分析当前项目吗？")
+    assert not explicit_request("你能不要分析当前项目吗？")
+    assert not explicit_request("你能分析当前项目吗？先不要分析")
+
+
+@pytest.mark.parametrize("error", [None, "Process timed out", "Process exited with code 1"])
+async def test_resumed_tool_budget_reports_current_result(error):
+    calls = []
+
+    class RecordingTool(EchoTool):
+        async def invoke(self, arguments):
+            calls.append(arguments["text"])
+            if error and arguments["text"] == "resumed result":
+                return ToolResult.failure(error)
+            return await super().invoke(arguments)
+
+    tools = ToolRegistry()
+    tools.register(RecordingTool())
+    model = ScriptedModel([LLMResponse(tool_calls=(
+        ToolCall(id="next", name="echo_tool", arguments={"text": "follow-up result"}),
+    ))])
+    loop = AgentLoop(model=model, executor=ActionExecutor(tools=ToolExecutor(tools=tools)))
+    result = await loop.run(
+        Message(""),
+        _context_with_tools({
+            "task_budget": {"max_model_calls": 1},
+            "resume_tool_calls": [
+                {"id": "approved", "name": "echo_tool", "arguments": {"text": "resumed result"}},
+            ],
+        }, {"echo_tool": tools.get("echo_tool")}),
+    )
+    assert result.metadata["truncated"]
+    assert (error or "resumed result") in result.content
+    assert "follow-up result" in result.content
+    assert calls == ["resumed result", "follow-up result"]
