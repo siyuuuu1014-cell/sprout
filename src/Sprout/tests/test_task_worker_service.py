@@ -46,6 +46,21 @@ async def test_only_task_workflow_activity_and_storage_lifecycle(monkeypatch):
     runtime.storage.close.assert_awaited_once()
 
 
+async def test_task_worker_closes_storage_if_activity_binding_fails(monkeypatch):
+    runtime = SimpleNamespace(storage=SimpleNamespace(close=AsyncMock()))
+    connect = AsyncMock()
+    monkeypatch.setattr("Sprout.runtime.factory.create_runtime", lambda settings: runtime)
+    monkeypatch.setattr(Client, "connect", connect)
+    monkeypatch.setattr(
+        "Sprout.orchestration.activities.node.bind_node_activity",
+        Mock(side_effect=RuntimeError("binding failed")),
+    )
+    with pytest.raises(RuntimeError, match="binding failed"):
+        await run_task_worker(TemporalConfig(), settings=default_settings())
+    connect.assert_not_called()
+    runtime.storage.close.assert_awaited_once()
+
+
 @pytest.mark.parametrize("dsn", ["memory://", "sqlite:///:memory:", ""])
 async def test_task_worker_rejects_volatile_metadata(monkeypatch, dsn):
     factory = Mock()

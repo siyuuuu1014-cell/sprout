@@ -104,6 +104,27 @@ class MemoryOperationalStore:
         return len(self.turns)
 
     # Approvals
+    async def get_or_create_pending_approval(self, record: ApprovalRecord) -> ApprovalRecord:
+        keys = (
+            "tool", "arguments_fingerprint", "requested_by", "task_id", "session_id",
+            "source", "resource_scope", "action_hash", "single_use", "approval_class",
+        )
+        for current in self.approvals.values():
+            if (
+                current.status == ApprovalStatus.PENDING
+                and (current.expires_at is None or current.expires_at > record.created_at)
+                and all(getattr(current, key) == getattr(record, key) for key in keys)
+            ):
+                deadline = record.expires_at
+                if deadline is not None and (
+                    current.expires_at is None or deadline < current.expires_at
+                ):
+                    current = replace(current, expires_at=deadline)
+                    self.approvals[current.id] = current
+                return replace(current)
+        self.approvals[record.id] = replace(record)
+        return record
+
     async def save_approval(self, record: ApprovalRecord) -> None:
         self.approvals[record.id] = replace(record)
 

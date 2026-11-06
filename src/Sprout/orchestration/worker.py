@@ -15,11 +15,10 @@ async def run_task_worker(config: TemporalConfig, *, settings, on_ready=None) ->
     in-process queue consumer. Required infrastructure is deployed separately.
     Cancellation joins the Temporal worker before closing storage.
     """
-    from temporalio import activity
     from temporalio.client import Client
     from temporalio.worker import Worker
 
-    from Sprout.orchestration.temporal_codec import node_from_dict
+    from Sprout.orchestration.activities.node import bind_node_activity
     from Sprout.orchestration.temporal_workflows import SproutExecutionWorkflow
     from Sprout.runtime.factory import create_runtime
 
@@ -32,11 +31,8 @@ async def run_task_worker(config: TemporalConfig, *, settings, on_ready=None) ->
 
     runtime = create_runtime(settings)
 
-    @activity.defn(name="run_sprout_node")
-    async def execute_node(node):
-        return await runtime.execute_node(node_from_dict(node))
-
     try:
+        execute_node = bind_node_activity(runtime)
         client = await asyncio.wait_for(
             Client.connect(config.host, namespace=config.namespace), timeout=15)
         async with Worker(client, task_queue=config.task_queue,
@@ -54,14 +50,13 @@ async def run_worker(config: TemporalConfig | None = None) -> None:
     from temporalio.worker import Worker
 
     from Sprout.config.loader import load_settings
+    from Sprout.orchestration.activities.growth import bind_growth_activity
+    from Sprout.orchestration.activities.node import bind_node_activity
     from Sprout.orchestration.temporal_workflows import (
         SproutExecutionWorkflow,
         SproutGatewayWorkflow,
         SproutGrowthWorkflow,
         SproutTaskWorkflow,
-        run_growth_automation,
-        run_sprout_node,
-        set_activity_runtime,
     )
     from Sprout.runtime.factory import create_runtime
 
@@ -71,8 +66,15 @@ async def run_worker(config: TemporalConfig | None = None) -> None:
 
     await ensure_storage_ready(settings)
     runtime = create_runtime(settings)
-    await runtime.start()
-    set_activity_runtime(runtime)
+    try:
+        await runtime.start()
+    except BaseException:
+        # Runtime.stop closes storage only after Runtime has entered startup.
+        if runtime._started:
+            await runtime.stop()
+        else:
+            await runtime.storage.close()
+        raise
     try:
         client = await Client.connect(config.host, namespace=config.namespace)
         worker = Worker(
@@ -84,11 +86,8 @@ async def run_worker(config: TemporalConfig | None = None) -> None:
                 SproutGrowthWorkflow,
                 SproutTaskWorkflow,
             ],
-            activities=[run_growth_automation, run_sprout_node],
+            activities=[bind_growth_activity(runtime), bind_node_activity(runtime)],
         )
         await worker.run()
     finally:
-        try:
-            await runtime.stop()
-        finally:
-            set_activity_runtime(None)
+        await runtime.stop()

@@ -1,13 +1,14 @@
 """Explicit continuation of an existing tool/process approval wait."""
 
 from dataclasses import asdict
+from datetime import UTC, datetime
 
 from Sprout.cli.commit_submission import _route
 from Sprout.cli.experiment_runtime import experiment_runtime
 from Sprout.evolution.coding_assembly import build_coding_session_factory
 from Sprout.evolution.coding_run import coding_execution
 from Sprout.orchestration.models import NodeStatus, NodeType
-from Sprout.security.approval import ApprovalStatus
+from Sprout.security.approval import CODING_TASK_CAPABILITY, ApprovalStatus
 from Sprout.storage.local.sqlite.commit_status import _regular
 
 
@@ -48,11 +49,14 @@ async def continue_coding(database, task_id, *, settings, principal, approval_id
                     or grant.requested_by != principal.user_id
                     or grant.resource_scope != task.workspace_id
                     or grant.status is not ApprovalStatus.PENDING
-                    or grant.tool not in {"process_run", "isolated_coding_command", "skill_view"}):
+                    or grant.tool not in {
+                        "process_run", "isolated_coding_command", "skill_view", CODING_TASK_CAPABILITY,
+                    }):
                 raise ValueError("Exact current-task pending tool/process approval required")
             decision = await runtime.approvals.decide(approval_id, True,
                 decided_by=principal.user_id, channel="cli",
-                reason="Explicit replay-continue --approve; not code or Git approval")
+                reason="Explicit replay-continue --approve; not code or Git approval",
+                **({"principal": principal} if grant.tool == CODING_TASK_CAPABILITY else {}))
             if decision.status is not ApprovalStatus.APPROVED:
                 return {**base, "reason": "approval_not_granted",
                         "next_action": "Review expiry/state"}
@@ -70,6 +74,13 @@ async def continue_coding(database, task_id, *, settings, principal, approval_id
             }:
                 return {**base, "reason": "approval_not_granted",
                         "next_action": "Review the current node approval state"}
+            if grant.tool == CODING_TASK_CAPABILITY and (
+                grant.status is not ApprovalStatus.APPROVED
+                or grant.expires_at is None or grant.expires_at <= datetime.now(UTC)
+                or grant.task_id != task_id or grant.requested_by != principal.user_id
+                or grant.resource_scope != task.workspace_id
+            ):
+                return {**base, "reason": "coding_task_capability_unavailable"}
         async with coding_execution(
             runtime, task, host=host, namespace=namespace, resume=True,
         ) as run:

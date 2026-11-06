@@ -192,9 +192,9 @@ class SqliteDatabase:
 
     async def execute_batch(
         self, statements: Iterable[tuple[str, tuple[Any, ...]]]
-    ) -> None:
+    ) -> list[int]:
         """Run several statements as one atomic transaction on the writer."""
-        await asyncio.to_thread(self._sync_execute_batch, list(statements))
+        return await asyncio.to_thread(self._sync_execute_batch, list(statements))
 
     def execute_sync(self, sql: str, parameters: tuple[Any, ...] = ()) -> None:
         """Blocking variant used by schema migrations in synchronous constructors."""
@@ -207,16 +207,41 @@ class SqliteDatabase:
             self._conn.commit()
             return changed
 
-    def _sync_execute_batch(self, statements: list[tuple[str, tuple[Any, ...]]]) -> None:
+    def _sync_execute_batch(self, statements: list[tuple[str, tuple[Any, ...]]]) -> list[int]:
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
-                for sql, parameters in statements:
-                    self._conn.execute(sql, parameters)
+                changes = [self._conn.execute(sql, parameters).rowcount
+                           for sql, parameters in statements]
                 self._conn.commit()
+                return changes
             except Exception:
                 self._conn.rollback()
                 raise
+
+    async def fetchone_or_execute(
+        self,
+        read: tuple[str, tuple[Any, ...]],
+        write: tuple[str, tuple[Any, ...]],
+        *,
+        before_read: tuple[str, tuple[Any, ...]] | None = None,
+    ) -> sqlite3.Row | None:
+        def transaction() -> sqlite3.Row | None:
+            with self._lock:
+                self._conn.execute("BEGIN IMMEDIATE")
+                try:
+                    if before_read is not None:
+                        self._conn.execute(*before_read)
+                    row = self._conn.execute(*read).fetchone()
+                    if row is None:
+                        self._conn.execute(*write)
+                    self._conn.commit()
+                except BaseException:
+                    self._conn.rollback()
+                    raise
+                return row
+
+        return await asyncio.to_thread(transaction)
 
     # -- reads ----------------------------------------------------------------
     async def fetchone(

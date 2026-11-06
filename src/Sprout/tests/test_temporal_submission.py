@@ -10,6 +10,108 @@ from Sprout.storage.local.sqlite.metadata import open_metadata_store
 from Sprout.task.models import Task, TaskStatus
 
 
+async def test_worker_confirmation_survives_late_start_failure(tmp_path):
+    store = open_metadata_store(str(tmp_path / "confirmation.db"))
+    task = Task(workspace_id="fixture")
+    try:
+        await store.save_task(task)
+        record = {"id": "workflow", "task_id": task.id, "state": "pending",
+                  "namespace": "fixture", "task_queue": "fixture", "payload": {"nodes": []}}
+        await store.ensure_task_submission(record)
+        assert not await store.confirm_temporal_activity(
+            {**record, "task_queue": "wrong"}, "wrong-run")
+        assert (await store.get_task(task.id)).status == task.status
+        assert await store.confirm_temporal_activity(record, "original-run")
+        await store.update_task_submission({**record, "state": "uncertain"})
+        await store.park_unconfirmed_temporal_start(task.id, record["id"])
+        assert not await store.confirm_temporal_activity(record, "wrong-run")
+        saved, = await store.list_task_submissions(task.id)
+        assert saved["accepted"] and saved["run_id"] == "original-run"
+        assert (await store.get_task(task.id)).status == TaskStatus.RUNNING
+    finally:
+        store.close()
+
+
+async def test_worker_confirmation_concurrent_runs_and_rollback(tmp_path):
+    import asyncio
+    import sqlite3
+
+    store = open_metadata_store(str(tmp_path / "concurrent.db"))
+    task = Task(workspace_id="fixture")
+    try:
+        await store.save_task(task)
+        record = {"id": "workflow", "task_id": task.id, "state": "pending",
+                  "namespace": "fixture", "task_queue": "fixture", "payload": {"nodes": []}}
+        await store.ensure_task_submission(record)
+        await store._db.execute(
+            "CREATE TRIGGER reject_running BEFORE UPDATE OF status ON tasks "
+            "WHEN NEW.status = 'running' BEGIN SELECT RAISE(ABORT, 'test rollback'); END"
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="test rollback"):
+            await store.confirm_temporal_activity(record, "rollback-run")
+        assert await store.list_task_submissions(task.id) == [record]
+        assert (await store.get_task(task.id)).status == task.status
+        await store._db.execute("DROP TRIGGER reject_running")
+        confirmed = await asyncio.gather(
+            store.confirm_temporal_activity(record, "first"),
+            store.confirm_temporal_activity(record, "second"),
+        )
+        assert sorted(confirmed) == [False, True]
+        saved, = await store.list_task_submissions(task.id)
+        assert await store.confirm_temporal_activity(record, saved["run_id"])
+        await store.update_task_submission({**saved, "state": "resolved"})
+        assert not await store.confirm_temporal_activity(record, saved["run_id"])
+        terminal_record = {**record, "id": "terminal"}
+        await store.ensure_task_submission(terminal_record)
+        await store.update_task_status(task.id, TaskStatus.COMPLETED)
+        assert not await store.confirm_temporal_activity(terminal_record, "terminal-run")
+        assert (await store.get_task(task.id)).status == TaskStatus.COMPLETED
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("changed", ["workflow_id", "workflow_run_id", "task_queue",
+                                     "namespace", "activity_type", "payload",
+                                     "missing_workflow", "missing_run", "zero_rows", "task_id"])
+async def test_activity_rejects_mismatched_submission(changed):
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from temporalio.testing import ActivityEnvironment
+
+    from Sprout.orchestration.activities.node import bind_node_activity
+
+    node = {"task_id": "task", "id": "node"}
+    record = {"id": "workflow", "task_id": "task", "namespace": "namespace", "task_queue": "queue",
+              "run_id": "run", "payload": {"nodes": [node]}}
+    metadata = SimpleNamespace(list_task_submissions=AsyncMock(return_value=[record]),
+                               get_task_submission=AsyncMock(return_value=record),
+                               confirm_temporal_activity=AsyncMock(return_value=False))
+    runtime = SimpleNamespace(storage=SimpleNamespace(metadata=metadata),
+                              execute_node=AsyncMock())
+    environment = ActivityEnvironment()
+    identity = {"workflow_id": "workflow", "workflow_run_id": "run",
+                "workflow_type": "SproutExecutionWorkflow", "namespace": "namespace",
+                "task_queue": "queue", "activity_type": "run_sprout_node", "is_local": False}
+    if changed == "payload":
+        node = {**node, "id": "foreign-node"}
+    elif changed == "task_id":
+        node = {**node, "task_id": "foreign-task"}
+        metadata.list_task_submissions.return_value = []
+    elif changed == "missing_workflow":
+        identity["workflow_id"] = None
+    elif changed == "missing_run":
+        identity["workflow_run_id"] = None
+    elif changed != "zero_rows":
+        identity[changed] = "foreign"
+    environment.info = replace(environment.info, **identity)
+    with pytest.raises(PermissionError, match="persisted submission"):
+        await environment.run(bind_node_activity(runtime), node)
+    assert metadata.confirm_temporal_activity.await_count == int(changed == "zero_rows")
+    runtime.execute_node.assert_not_awaited()
+
+
 def _client(monkeypatch, client=None, error=None):
     async def connect(*args, **kwargs):
         if error:
@@ -404,6 +506,188 @@ async def test_worker_connect_failure_closes_runtime(monkeypatch):
     with pytest.raises(ConnectionError):
         await run_worker()
     assert runtime.stopped
+
+
+async def test_generic_workers_keep_node_and_growth_runtime_isolated(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+
+    from temporalio import activity
+
+    from Sprout.orchestration.activities import node
+    from Sprout.orchestration.terminal.temporal import TemporalConfig
+    from Sprout.orchestration.worker import run_worker
+
+    ready = {key: asyncio.Event() for key in ("a", "b")}
+    exit_worker = {key: asyncio.Event() for key in ready}
+    registered = {}
+
+    class Runtime:
+        def __init__(self, key):
+            self.key = key
+            self.storage = SimpleNamespace(metadata=object())
+            self.running = False
+
+        async def start(self):
+            self.running = True
+
+        async def stop(self):
+            self.running = False
+
+        async def execute_node(self, request):
+            await asyncio.sleep(0)
+            assert self.running
+            return {"node_id": request.id, "runtime": self.key}
+
+    class Growth:
+        def __init__(self, metadata, workspace_id, trajectory_dir, *, runtime):
+            assert metadata is runtime.storage.metadata
+            self.runtime = runtime
+            self.output = {"workspace": workspace_id, "directory": trajectory_dir,
+                           "runtime": runtime.key}
+
+        async def run_once(self):
+            await asyncio.sleep(0)
+            assert self.runtime.running
+            return self.output
+
+    class Worker:
+        def __init__(self, client, *, task_queue, workflows, activities):
+            self.key = task_queue
+            registered[self.key] = {
+                activity._Definition.must_from_callable(fn).name: fn for fn in activities
+            }
+
+        async def run(self):
+            ready[self.key].set()
+            await exit_worker[self.key].wait()
+
+    async def prepare(settings):
+        pass
+
+    runtimes = {key: Runtime(key) for key in ready}
+    pending = iter(runtimes.values())
+    sentinel = object()
+    monkeypatch.setattr(node, "_activity_runtime", sentinel)
+    monkeypatch.setattr("Sprout.config.loader.load_settings", lambda: None)
+    monkeypatch.setattr("Sprout.storage.bootstrap.ensure_storage_ready", prepare)
+    monkeypatch.setattr("Sprout.runtime.factory.create_runtime", lambda settings: next(pending))
+    monkeypatch.setattr("Sprout.evolution.automation.GrowthAutomation", Growth)
+    monkeypatch.setattr("temporalio.worker.Worker", Worker)
+    _client(monkeypatch, object())
+
+    async def check(key):
+        activities = registered[key]
+        assert set(activities) == {"run_sprout_node", "run_growth_automation"}
+        request = {"id": key, "type": "read", "created_at": "2026-11-05T00:00:00+00:00"}
+        assert await activities["run_sprout_node"](request) == {
+            "node_id": key, "runtime": key,
+        }
+        assert await activities["run_growth_automation"](key, "traces") == {
+            "workspace": key, "directory": "traces", "runtime": key,
+        }
+
+    workers = {
+        key: asyncio.create_task(run_worker(TemporalConfig(task_queue=key))) for key in ready
+    }
+    try:
+        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in ready.values())), 5)
+        await asyncio.gather(check("a"), check("b"))
+        exit_worker["a"].set()
+        await workers["a"]
+        assert not runtimes["a"].running
+        await check("b")
+        assert node._activity_runtime is sentinel
+    finally:
+        for event in exit_worker.values():
+            event.set()
+        await asyncio.gather(*workers.values())
+    assert not runtimes["b"].running
+
+
+@pytest.mark.parametrize("partially_started", [False, True])
+async def test_generic_worker_start_failure_does_not_register_activities(
+    monkeypatch, partially_started,
+):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    from Sprout.orchestration.activities import node
+    from Sprout.orchestration.worker import run_worker
+
+    sentinel = object()
+    monkeypatch.setattr(node, "_activity_runtime", sentinel)
+    close = AsyncMock()
+    runtime = SimpleNamespace(
+        start=AsyncMock(side_effect=RuntimeError("startup failed")),
+        stop=AsyncMock(side_effect=close),
+        storage=SimpleNamespace(close=close),
+        _started=partially_started,
+    )
+    connect = AsyncMock()
+    worker = Mock()
+    monkeypatch.setattr("Sprout.config.loader.load_settings", lambda: None)
+    monkeypatch.setattr("Sprout.storage.bootstrap.ensure_storage_ready", AsyncMock())
+    monkeypatch.setattr("Sprout.runtime.factory.create_runtime", lambda settings: runtime)
+    monkeypatch.setattr("temporalio.client.Client.connect", connect)
+    monkeypatch.setattr("temporalio.worker.Worker", worker)
+    with pytest.raises(RuntimeError, match="startup failed"):
+        await run_worker()
+    connect.assert_not_called()
+    worker.assert_not_called()
+    assert node._activity_runtime is sentinel
+    close.assert_awaited_once()
+    assert runtime.stop.await_count == int(partially_started)
+
+
+@pytest.mark.parametrize("changed", [None, "id", "workspace_id", "source", "scope", "owner"])
+async def test_ack_recovery_admits_only_the_same_node_product(changed):
+    from dataclasses import dataclass, replace
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from Sprout.orchestration.models import ExecutionNode, NodeStatus, NodeType
+    from Sprout.runtime.runtime import Runtime
+    from Sprout.task.models import DelegationScope, Task
+
+    @dataclass
+    class Workspace:
+        manifest: object = None
+
+    task = Task(workspace_id="workspace", instruction="Read", status=TaskStatus.RUNNING)
+    producer = ExecutionNode(task_id=task.id, type=NodeType.READ, status=NodeStatus.COMPLETED,
+                             metadata={"output": [], "execution_guard": {"owner": "owner"}})
+    snapshot = replace(task, status=TaskStatus.WAITING_RESOURCE)
+    if changed in {"id", "workspace_id", "source"}:
+        snapshot = replace(snapshot, **{changed: "other"})
+    if changed == "scope":
+        snapshot = replace(snapshot, delegation_scope=DelegationScope(allowed_paths=("other",)))
+    recorded_node = producer
+    if changed == "owner":
+        recorded_node = replace(producer, metadata={"execution_guard": {"owner": "other"}})
+    runtime = SimpleNamespace(_persist_node_products=AsyncMock(), _node_products={})
+    scope = SimpleNamespace(task=task, workspace=Workspace(),
+                            node=SimpleNamespace(dependencies=(producer.id,)))
+    runtime._node_products[(task.id, producer.id)] = (
+        snapshot, scope.workspace, recorded_node, [], (), runtime,
+    )
+    if changed is None:
+        await Runtime._admit_node_products(runtime, scope, [producer])
+        assert scope.captured_paths == ()
+        assert runtime._node_products[(task.id, producer.id)][0] == task
+    else:
+        with pytest.raises(PermissionError, match="node_artifact_provenance_unavailable"):
+            await Runtime._admit_node_products(runtime, scope, [producer])
+
+
+async def test_unbound_worker_activities_fail_explicitly():
+    from Sprout.orchestration.activities.growth import bind_growth_activity
+    from Sprout.orchestration.activities.node import bind_node_activity
+
+    with pytest.raises(RuntimeError, match="no runtime configured"):
+        await bind_node_activity(None)({})
+    with pytest.raises(RuntimeError, match="no runtime configured"):
+        await bind_growth_activity(None)("workspace", "traces")
 
 
 @pytest.mark.parametrize("change", ["none", "node", "kind", "reason", "malformed"])

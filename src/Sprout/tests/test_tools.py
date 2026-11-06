@@ -331,28 +331,72 @@ async def test_executor_fails_safe_without_approval_manager() -> None:
 
 
 @pytest.mark.asyncio
-async def test_executor_requests_approval_then_runs_after_consent() -> None:
+@pytest.mark.parametrize("approved", [True, False])
+@pytest.mark.parametrize("bus_layout", ["shared", "distinct", "executor_only"])
+async def test_executor_requests_approval_then_runs_after_consent(
+    monkeypatch, approved, bus_layout
+) -> None:
+    import asyncio
+    from types import SimpleNamespace
+
+    from Sprout.cli.commands import chat
+
     tool = EchoTool(risk_level="high")
-    approvals = ApprovalManager(MemoryOperationalStore())
     events = EventBus()
+    manager_events = {
+        "shared": events, "distinct": EventBus(), "executor_only": None,
+    }[bus_layout]
+    manager_requests = []
+    if manager_events is not None and manager_events is not events:
+        manager_events.subscribe(APPROVAL_REQUESTED, manager_requests.append)
+    approvals = ApprovalManager(MemoryOperationalStore(), events=manager_events)
     seen: list[str] = []
     events.subscribe("*", lambda event: seen.append(event.name))
     executor = ToolExecutor(tools=_registry(tool), approvals=approvals, events=events)
-
-    first = await executor.execute("echo_tool", {"text": "x"})
+    identity = {"task_id": "task", "session_id": "session", "requested_by": "operator"}
+    arguments = {"text": "x"}
+    first, repeat = await asyncio.gather(*(
+        executor.execute("echo_tool", arguments, **identity) for _ in range(2)
+    ))
     assert not first.ok
     assert first.approval_id is not None
+    assert repeat.approval_id == first.approval_id
     assert tool.seen == []
-    assert APPROVAL_REQUESTED in seen
+    assert seen.count(APPROVAL_REQUESTED) == 1
+    assert len(await approvals.pending()) == 1
 
-    pending = await approvals.pending()
-    assert len(pending) == 1
-    await approvals.decide(pending[0].id, True)
+    prompts = []
 
-    second = await executor.execute("echo_tool", {"text": "x"})
-    assert second.ok
-    assert tool.seen == [{"text": "x"}]
-    assert TOOL_EXECUTED in seen
+    async def prompt(record):
+        prompts.append(record.id)
+        return "approve_once" if approved else "deny"
+
+    class Runtime:
+        async def decide_approval(self, approval_id, decision, **kwargs):
+            await approvals.decide(approval_id, decision, decided_by="operator")
+
+        async def resume_pending_task(self, *_args, **_kwargs):
+            result = await executor.execute("echo_tool", arguments, **identity)
+            assert result.ok
+            return SimpleNamespace(
+                content="continued", session_id="session",
+                metadata={"approval_required": True, "approval_ids": [first.approval_id]},
+            )
+
+    runtime = Runtime()
+    runtime.approvals = approvals
+    monkeypatch.setattr(chat, "_prompt_approval_decision", prompt)
+    assert await chat._handle_cli_approval_prompt(
+        runtime, "session",
+        {"approval_required": True, "approval_ids": [first.approval_id, repeat.approval_id]},
+        "operator",
+    )
+    assert prompts == [first.approval_id]
+    assert tool.seen == ([arguments] if approved else [])
+    assert seen.count(TOOL_EXECUTED) == int(approved)
+    assert seen.count(APPROVAL_REQUESTED) == 1
+    assert len(await approvals.pending()) == 0
+    assert len(manager_requests) == int(bus_layout == "distinct")
 
 
 @pytest.mark.asyncio

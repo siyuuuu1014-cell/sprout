@@ -523,8 +523,44 @@ class SqliteMetadataStore:
         # A late timeout must never overwrite a confirmed result.
         await self._db.execute(
             "UPDATE task_submissions SET record_json = ? WHERE id = ? "
-            "AND json_extract(record_json, '$.state') != 'resolved'",
-            (_json_dumps(record), record["id"]),
+            "AND json_extract(record_json, '$.state') != 'resolved' "
+            "AND (COALESCE(json_extract(record_json, '$.accepted'), 0) = 0 OR ?)",
+            (_json_dumps(record), record["id"], bool(record.get("accepted"))),
+        )
+
+    async def confirm_temporal_activity(self, record, run_id) -> bool:
+        """Bind the first observed Run and admit its Task in one transaction."""
+        confirmed, _ = await self._db.execute_batch([
+            ("UPDATE task_submissions SET record_json = json_set(record_json, "
+             "'$.state', 'accepted', '$.accepted', json('true'), '$.run_id', ?) "
+             "WHERE id = ? AND task_id = ? "
+             "AND json_extract(record_json, '$.state') IN ('pending','uncertain','accepted') "
+             "AND COALESCE(json_extract(record_json, '$.run_id'), ?) = ? "
+             "AND json_extract(record_json, '$.namespace') = ? "
+             "AND json_extract(record_json, '$.task_queue') = ? "
+             "AND json_extract(record_json, '$.payload') = json(?) "
+             "AND EXISTS (SELECT 1 FROM tasks WHERE id = ? "
+             "AND status IN ('created','ready','waiting_resource','running'))",
+             (run_id, record["id"], record["task_id"], run_id, run_id,
+              record["namespace"], record["task_queue"], _json_dumps(record["payload"]),
+              record["task_id"])),
+            ("UPDATE tasks SET status = 'running' WHERE id = ? "
+             "AND status IN ('created','ready','waiting_resource') AND changes() = 1 "
+             "AND EXISTS (SELECT 1 FROM task_submissions WHERE id = ? AND task_id = tasks.id "
+             "AND json_extract(record_json, '$.state') = 'accepted' "
+             "AND json_extract(record_json, '$.run_id') = ?)",
+             (record["task_id"], record["id"], run_id)),
+        ])
+        return confirmed == 1
+
+    async def park_unconfirmed_temporal_start(self, task_id, workflow_id):
+        await self._db.execute(
+            "UPDATE tasks SET status = 'waiting_resource' WHERE id = ? "
+            "AND status IN ('created','ready','running','waiting_resource') "
+            "AND EXISTS (SELECT 1 FROM task_submissions WHERE id = ? AND task_id = tasks.id "
+            "AND json_extract(record_json, '$.state') IN ('pending','uncertain') "
+            "AND COALESCE(json_extract(record_json, '$.accepted'), 0) = 0)",
+            (task_id, workflow_id),
         )
 
     async def list_task_submissions(self, task_id: str) -> list[dict[str, Any]]:
@@ -533,6 +569,12 @@ class SqliteMetadataStore:
             (task_id,),
         )
         return [_json_loads(row["record_json"], {}) for row in rows]
+
+    async def get_task_submission(self, workflow_id: str) -> dict[str, Any] | None:
+        row = await self._db.fetchone(
+            "SELECT record_json FROM task_submissions WHERE id = ?", (workflow_id,),
+        )
+        return _json_loads(row["record_json"], {}) if row is not None else None
 
     async def synchronize_task_result(self, expected, result):
         from Sprout.storage.local.sqlite.submission_sync import synchronize_result

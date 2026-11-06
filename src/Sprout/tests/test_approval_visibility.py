@@ -69,10 +69,11 @@ def test_a_non_command_tool_falls_back_to_json() -> None:
 
 
 def test_the_prompt_shows_the_matching_pending_call() -> None:
-    """The tool name alone is shown alongside the action it will take."""
+    """The matching arguments are shown as the action the grant will cover."""
     record = _Record("cli_tool_run")
     pending = [_pending("cli_tool_run", command="sprout", args=["info"])]
 
+    record.arguments_fingerprint = ApprovalManager.fingerprint(pending[0]["arguments"])
     lines = _approval_action_lines(record, pending)
 
     assert lines == ["sprout info"]
@@ -86,6 +87,7 @@ def test_calls_for_other_tools_are_not_shown() -> None:
         _pending("git_inspect", operation="status"),
     ]
 
+    record.arguments_fingerprint = ApprovalManager.fingerprint(pending[0]["arguments"])
     lines = _approval_action_lines(record, pending)
 
     assert lines == ["sprout info"]
@@ -116,6 +118,7 @@ def test_a_token_in_the_arguments_is_masked_on_screen() -> None:
         )
     ]
 
+    record.arguments_fingerprint = ApprovalManager.fingerprint(pending[0]["arguments"])
     rendered = " ".join(_approval_action_lines(record, pending))
 
     assert "sk-live-abcdef1234567890" not in rendered
@@ -334,7 +337,7 @@ def test_cli_approval_resumes_a_session_exactly_once(monkeypatch) -> None:
     monkeypatch.setattr(chat, "current_cli_principal", lambda: principal)
 
     manager = ApprovalManager(MemoryOperationalStore(), policy=ApprovalPolicy())
-    calls = {"resume": 0}
+    calls = {"resume": 0, "prompt": 0}
 
     class _Store:
         async def get_approval(self, approval_id: str):
@@ -353,9 +356,13 @@ def test_cli_approval_resumes_a_session_exactly_once(monkeypatch) -> None:
         async def resume_pending_task(self, *_args, **_kwargs):
             assert _kwargs["principal"] == principal
             calls["resume"] += 1
-            return SimpleNamespace(content="continued", metadata={})
+            return SimpleNamespace(
+                content="continued", session_id="session-1",
+                metadata={"approval_required": True, "approval_ids": [approval_id]},
+            )
 
     async def _approve(_record):
+        calls["prompt"] += 1
         return "approve_once"
 
     monkeypatch.setattr(chat, "_prompt_approval_decision", _approve)
@@ -364,6 +371,7 @@ def test_cli_approval_resumes_a_session_exactly_once(monkeypatch) -> None:
     monkeypatch.setattr(chat, "_print_session_separator", lambda: None)
 
     async def _drive() -> None:
+        nonlocal approval_id
         record = await manager.request(
             "cli_tool_run",
             {"command": "sprout", "args": ["info"]},
@@ -371,15 +379,17 @@ def test_cli_approval_resumes_a_session_exactly_once(monkeypatch) -> None:
             requested_by="cli-user",
             session_id="session-1",
         )
+        approval_id = record.id
         await chat._handle_cli_approval_prompt(
             _Runtime(),
             "session-1",
-            {"approval_required": True, "approval_ids": [record.id]},
+            {"approval_required": True, "approval_ids": [record.id, record.id]},
             "cli-user",
         )
 
+    approval_id = ""
     asyncio.run(_drive())
-    assert calls["resume"] == 1
+    assert calls == {"resume": 1, "prompt": 1}
 
 
 def test_chained_approvals_print_one_session_separator(monkeypatch) -> None:

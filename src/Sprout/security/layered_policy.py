@@ -67,7 +67,11 @@ class PolicyRule:
         if self.path_glob and not fnmatch(path, self.path_glob):
             return False
         return all(
-            _guard_matches(request.arguments.get(name), spec)
+            _guard_matches(
+                request.arguments.get(name), spec,
+                git_force_deny=(name == _COMMAND_ARGUMENT
+                                and self.decision is AccessDecision.DENY),
+            )
             for name, spec in self.argument_guards.items()
         )
 
@@ -77,7 +81,7 @@ def _actor_matches(request: ActionRequest, role: str) -> bool:
     return actor.user_id == role or actor.has_role(role)
 
 
-def _guard_matches(value: object, spec: str) -> bool:
+def _guard_matches(value: object, spec: str, *, git_force_deny: bool = False) -> bool:
     if isinstance(value, (list, tuple)):
         text = " ".join(str(part) for part in value)
     elif isinstance(value, str):
@@ -86,6 +90,12 @@ def _guard_matches(value: object, spec: str) -> bool:
         return False
     kind, _, operand = spec.partition(":")
     if kind == "glob":
+        if (git_force_deny and operand in DEFAULT_ORGANIZATION_DENY
+                and isinstance(value, (list, tuple))):
+            from Sprout.security.commands import git_push_force_options
+
+            return any(fnmatch(f"git push {option}", operand)
+                       for option in git_push_force_options(value))
         return fnmatch(text, operand)
     if kind == "equals":
         return text == operand

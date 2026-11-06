@@ -270,8 +270,14 @@ async def test_real_runtime_read_node_on_dedicated_worker(tmp_path):
             oracle_paths=("tests",), frozen=snapshot(repo, ("tests",)), image=image,
             configuration=configuration_contract(settings), runtime=runtime_snapshot(runtime),
             creator=creator_record(principal), coding=coding_profile(image))
+        from Sprout.task.models import DelegationScope
+
         task = Task(workspace_id=workspace.id, actor=principal, source="cli",
             status=TaskStatus.RUNNING, instruction="Read app.py for a fixed boundary test",
+            delegation_scope=DelegationScope(
+                allowed_paths=(str(repo / "app.py"),),
+                allowed_actions=frozenset({"file.read", "tool.invoke"}),
+            ),
             metadata={"execution_mode": "code", "replay_plan": plan,
                       "replay_source_task_id": "explicit-read-boundary-fixture",
                       "acceptance_spec": spec, "required_paths": ["app.py"],

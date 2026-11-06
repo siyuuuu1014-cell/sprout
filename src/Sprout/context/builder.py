@@ -282,17 +282,31 @@ class ContextBuilder:
                     and payload.get("task_id") == scope.task.id
                     and set(files) <= set(scope.captured_paths)
                     and scope.runtime._node_context_resources(
-                        scope, files, payload.get("resources", ()))
-                    and not payload.get("resume_tool_calls"))
+                        scope, files, payload.get("resources", ())))
+        resume_calls = payload.get("resume_tool_calls")
+        resumed = False
+        if resume_calls and admitted:
+            guard = scope.node.metadata.get("execution_guard", {})
+            waiting = scope.node.metadata.get("output") or {}
+            resumed = bool(
+                guard.get("state") == "active" and guard.get("owner") == scope.guard_owner
+                and guard.get("resume_key") and waiting.get("waiting") is True
+                and waiting.get("pending_approvals")
+                and resume_calls == waiting.get("pending_tool_calls")
+            )
         if ((files or payload.get("resources")) and not admitted
                 or knowledge or memory
                 or set(payload) - {"task_id", "node_id", "task_budget",
                                    "resources", "resume_tool_calls"}
-                or payload.get("resume_tool_calls")
+                or (resume_calls and not resumed)
                 or not isinstance(budget, Mapping)
                 or set(budget) - {"max_model_calls", "max_tool_calls", "max_tokens"}
                 or any(type(value) is not int or value < 0 for value in budget.values())):
             raise PermissionError("node_artifact_provenance_unavailable")
+        if resumed:
+            from copy import deepcopy
+
+            payload["resume_tool_calls"] = deepcopy(resume_calls)
         return AgentContext(
             session=Session(id=f"node-{node_id}", user_id=user_id),
             memory=memory,
@@ -301,5 +315,5 @@ class ContextBuilder:
             skills=dict(skills or {}),
             user={"id": user_id},
             files=files,
-            metadata={"node_id": node_id, **(dict(metadata or {}))},
+            metadata={"node_id": node_id, **payload},
         )

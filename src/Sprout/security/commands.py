@@ -165,6 +165,13 @@ _EXECUTING_FLAGS: frozenset[str] = frozenset(
 )
 
 
+def permits_cli_task_reuse(argv: Sequence[str]) -> bool:
+    """Git task consent covers only fixed information queries."""
+    return CommandRegistry.name_of(argv) != "git" or tuple(argv[1:]) in {
+        ("--version",), ("--exec-path",),
+    }
+
+
 def is_read_only_command(argv: Sequence[str], *, registry: CommandRegistry) -> bool:
     """True when running ``argv`` cannot execute code or write to the workspace.
 
@@ -201,6 +208,29 @@ _GIT_OPTIONS_WITH_VALUES: frozenset[str] = frozenset(
 #: program of the caller's choosing. Any occurrence disqualifies the whole
 #: invocation — there is no safe subcommand underneath ``-c``.
 _GIT_CONFIG_INJECTING_OPTIONS: frozenset[str] = frozenset({"-c", "--config-env"})
+
+
+def git_push_force_options(argv: Sequence[str]) -> tuple[str, ...]:
+    """Find force options on a direct Git push, including after its refspec."""
+    if CommandRegistry.name_of(argv) != "git":
+        return ()
+    args = iter(argv[1:])
+    for arg in args:
+        if arg in _GIT_OPTIONS_WITH_VALUES or arg in _GIT_CONFIG_INJECTING_OPTIONS:
+            next(args, None)
+        elif not arg.startswith("-"):
+            if arg != "push":
+                return ()
+            break
+    else:
+        return ()
+    force = []
+    for arg in args:
+        if arg == "--":
+            break
+        if arg.startswith(("--force", "-f")):
+            force.append(arg)
+    return tuple(force)
 
 
 def _git_subcommand_is_read_only(args: Sequence[str]) -> bool:

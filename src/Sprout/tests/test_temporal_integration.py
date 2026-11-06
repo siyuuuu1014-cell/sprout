@@ -17,12 +17,14 @@ from temporalio.worker import Replayer, Worker
 from temporalio.workflow import NondeterminismError
 
 from Sprout.config.loader import default_settings
+from Sprout.gateway.local_identity import current_cli_principal
 from Sprout.orchestration.temporal_workflows import (
     SproutExecutionWorkflow,
     run_sprout_node,
     set_activity_runtime,
 )
 from Sprout.runtime.factory import create_runtime
+from Sprout.task.models import DelegationScope
 
 
 def _isolated_settings(tmp_path):
@@ -196,14 +198,21 @@ async def test_real_runtime_submission_and_history_replay(tmp_path, monkeypatch,
     child = None
     execution = None
     acknowledged_run = None
+    accepted_handle = None
     start_attempts = []
     try:
         root = tmp_path / "repo"
         root.mkdir()
         (root / "app.py").write_text("value = 1\n", encoding="utf-8")
         workspace = await runtime.open_workspace(root)
+        principal = current_cli_principal()
         task = await runtime.create_task_planned(
-            workspace.id, "Explain app.py without changing files", execution_mode="read_only"
+            workspace.id, "Explain app.py without changing files", execution_mode="read_only",
+            actor=principal, source=principal.source, preparation_paths=("app.py",),
+            delegation_scope=DelegationScope(
+                allowed_paths=(str(root / "app.py"),),
+                allowed_actions=frozenset({"file.read", "tool.invoke"}),
+            ),
         )
         pending_id = None
         if active_outage:
@@ -222,17 +231,38 @@ async def test_real_runtime_submission_and_history_replay(tmp_path, monkeypatch,
 
             monkeypatch.setattr(NodeExecutor, "execute_node", pause_after_read)
         if mode.startswith("ack-lost"):
+            from dataclasses import fields
+
+            from Sprout.runtime.runtime import Runtime
+
+            admit = Runtime._admit_node_products
+
+            async def record_provenance_failure(self, scope, nodes):
+                try:
+                    return await admit(self, scope, nodes)
+                except PermissionError as exc:
+                    if str(exc) == "node_artifact_provenance_unavailable":
+                        with (tmp_path / "provenance.log").open("a", encoding="utf-8") as log:
+                            for node in nodes:
+                                record = self._node_products.get((scope.task.id, node.id))
+                                if record is not None:
+                                    changed = [field.name for field in fields(scope.task)
+                                               if getattr(record[0], field.name)
+                                               != getattr(scope.task, field.name)]
+                                    print(node.id, scope.node.id, changed,
+                                          record[0].status.value, scope.task.status.value, file=log)
+                    raise
+
+            monkeypatch.setattr(Runtime, "_admit_node_products", record_provenance_failure)
             start_workflow = Client.start_workflow
 
             async def lose_first_confirmation(self, *args, **kwargs):
                 start_attempts.append(kwargs["id"])
                 handle = await start_workflow(self, *args, **kwargs)
-                nonlocal acknowledged_run
+                nonlocal acknowledged_run, accepted_handle
                 acknowledged_run = handle.first_execution_run_id
-                if mode == "ack-lost-closed":
-                    assert (await asyncio.wait_for(handle.result(), timeout=20))[
-                        "status"
-                    ] == "completed"
+                accepted_handle = handle
+                (tmp_path / "lost-start-ack").write_text(acknowledged_run, encoding="utf-8")
                 # The real server accepted the request. Drop only the caller's
                 # success acknowledgement, not the request or server history.
                 raise TimeoutError("Injected loss of real start acknowledgement")
@@ -243,8 +273,12 @@ async def test_real_runtime_submission_and_history_replay(tmp_path, monkeypatch,
                 uncertain = await runtime.execute(task)
                 assert uncertain.status == "waiting_resource"
                 records = await runtime.storage.metadata.list_task_submissions(task.id)
-                assert len(records) == 1 and records[0]["state"] == "uncertain"
-                assert records[0]["phase"] == "start" and not records[0].get("accepted")
+                assert len(records) == 1
+                if records[0].get("accepted"):
+                    assert mode == "ack-lost-closed"
+                    assert records[0]["run_id"] == acknowledged_run
+                else:
+                    assert records[0]["state"] == "uncertain" and records[0]["phase"] == "start"
                 assert acknowledged_run
                 return records[0]["id"]
 
@@ -256,6 +290,11 @@ async def test_real_runtime_submission_and_history_replay(tmp_path, monkeypatch,
                     activities=[run_sprout_node],
                 ):
                     pending_id = await submit_without_confirmation()
+                    assert (await asyncio.wait_for(accepted_handle.result(), timeout=20))[
+                        "status"
+                    ] == "completed"
+                    closed = await runtime.storage.metadata.list_task_submissions(task.id)
+                    assert closed[0]["run_id"] == acknowledged_run
             else:
                 pending_id = await submit_without_confirmation()
                 nodes = await runtime.storage.metadata.list_execution_nodes(task.id)
@@ -341,6 +380,12 @@ async def test_real_runtime_submission_and_history_replay(tmp_path, monkeypatch,
                     await asyncio.to_thread(_validation_container, "start")
                     await _wait_for_server(host, namespace)
             result = await asyncio.wait_for(execution or runtime.execute(task), timeout=45)
+            if mode.startswith("ack-lost") and result.status != "completed":
+                records = await runtime.storage.metadata.list_task_submissions(task.id)
+                history = await client.get_workflow_handle(
+                    records[0]["id"], run_id=acknowledged_run,
+                ).fetch_history(rpc_timeout=timedelta(seconds=10))
+                (tmp_path / "failed-history.json").write_text(history.to_json(), encoding="utf-8")
             if crash:
                 assert result.status == "waiting_resource"
                 nodes = await runtime.storage.metadata.list_execution_nodes(task.id)
@@ -402,7 +447,8 @@ async def test_real_runtime_submission_and_history_replay(tmp_path, monkeypatch,
                 assert record["id"] == pending_id
             if acknowledged_run:
                 assert record["run_id"] == acknowledged_run
-                assert start_attempts == [pending_id, pending_id]
+                assert start_attempts == ([pending_id] if mode == "ack-lost-closed"
+                                          else [pending_id, pending_id])
             history = await client.get_workflow_handle(
                 record["id"], run_id=record.get("run_id")
             ).fetch_history(rpc_timeout=timedelta(seconds=10))
