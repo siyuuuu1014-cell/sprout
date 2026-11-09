@@ -5,11 +5,13 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from aiyallm import Aiyallm
 from aiyallm import OpenAICompatibleProvider as AiyallmOpenAICompatibleProvider
 
+from Sprout.llm.diagnostics import record_completion
 from Sprout.llm.messages import (
     LLMMessage,
     LLMResponse,
@@ -34,6 +36,15 @@ class _ToolCompatibleOpenAIProvider(AiyallmOpenAICompatibleProvider):
     def __init__(self, *args, thinking_mode=None, **kwargs):
         super().__init__(*args, **kwargs)
         self._thinking_mode = thinking_mode
+
+    async def _aiter_stream(self, stream, request):
+        async for chunk in super()._aiter_stream(stream, request):
+            if chunk.raw is None and chunk.usage is not None:
+                # aiyallm 0.1.4 consumes this sentinel for its own ledger and
+                # never forwards it. Send the real usage once before preserving
+                # the original sentinel for that ledger; do not invent tokens.
+                yield replace(chunk, raw={"usage_forwarded": True})
+            yield chunk
 
     def _build_chat_kwargs(self, request, *, stream):
         kwargs = super()._build_chat_kwargs(request, stream=stream)
@@ -144,6 +155,9 @@ class AiyallmProvider:
             )
             for call in response.tool_calls
         )
+        self.last_usage = self._decode_usage(response.usage)
+        record_completion(self, response.finish_reason,
+                          self.last_usage if response.usage is not None else None)
         return LLMResponse(
             content=response.content or "",
             tool_calls=tool_calls,
@@ -155,18 +169,8 @@ class AiyallmProvider:
     async def stream(
         self, messages: Sequence[LLMMessage], *, tools: Sequence[ToolSpec] = ()
     ):
-        encoded_messages = [self._encode_message(message) for message in messages]
-        encoded_tools = [self._encode_tool(spec) for spec in tools] if tools else None
-        async for chunk in self._client.astream(
-            messages=encoded_messages,
-            model=self.model,
-            temperature=self.temperature,
-            max_tokens=self.max_output_tokens,
-            tools=encoded_tools,
-        ):
-            if chunk.usage is not None:
-                self.last_usage = self._decode_usage(chunk.usage)
-            yield chunk.content or ""
+        async for event in self.stream_events(messages, tools=tools):
+            yield event.content
 
     async def stream_events(
         self, messages: Sequence[LLMMessage], *, tools: Sequence[ToolSpec] = ()
@@ -174,34 +178,22 @@ class AiyallmProvider:
         """Stream structured events from ``aiyallm`` chat chunks."""
         encoded_messages = [self._encode_message(message) for message in messages]
         encoded_tools = [self._encode_tool(spec) for spec in tools] if tools else None
+        self.last_usage = None
+        finish_reason = None
         async for chunk in self._client.astream(
-            messages=encoded_messages,
-            model=self.model,
-            temperature=self.temperature,
-            max_tokens=self.max_output_tokens,
-            tools=encoded_tools,
+            messages=encoded_messages, model=self.model, temperature=self.temperature,
+            max_tokens=self.max_output_tokens, tools=encoded_tools,
         ):
-            if chunk.usage is not None:
-                self.last_usage = self._decode_usage(chunk.usage)
-            if chunk.content:
-                yield LLMStreamEvent(content=chunk.content)
-            if chunk.tool_calls:
-                yield LLMStreamEvent(
-                    tool_calls=tuple(
-                        ToolCall(
-                            id=call.id,
-                            name=call.name,
-                            arguments=call.arguments_dict,
-                        )
-                        for call in chunk.tool_calls
-                    ),
-                    finish_reason=chunk.finish_reason,
-                    usage=(
-                        self._decode_usage(chunk.usage)
-                        if chunk.usage is not None
-                        else None
-                    ),
-                )
+            usage = self._decode_usage(chunk.usage) if chunk.usage is not None else None
+            if usage is not None:
+                self.last_usage = usage
+            finish_reason = chunk.finish_reason or finish_reason
+            yield LLMStreamEvent(
+                content=chunk.content or "",
+                tool_calls=tuple(ToolCall(id=call.id, name=call.name, arguments=call.arguments_dict)
+                                 for call in chunk.tool_calls or ()),
+                finish_reason=chunk.finish_reason, usage=usage)
+        record_completion(self, finish_reason, self.last_usage)
 
 
     @staticmethod

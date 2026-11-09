@@ -695,7 +695,7 @@ class NodeExecutor:
         agent = self._router.route(message)
         result = await self._publish_node_model(node, workspace, task, agent, message, context)
         return {
-            "content": result.content[:_NODE_OUTPUT_LIMIT],
+            "content": result.content,
             "node_id": node.id,
             "resources": [item["path"] for item in resources],
             "waiting": bool(result.metadata.get("approval_required")),

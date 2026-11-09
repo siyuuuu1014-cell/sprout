@@ -838,6 +838,7 @@ async def _repl(
                 console=console,
                 refresh_per_second=12,
                 vertical_overflow="crop",
+                transient=True,
             ) as live:
                 async for chunk in _cli_turn_stream(
                     runtime, stream_message, principal=principal, foreground=True,
@@ -873,13 +874,12 @@ async def _repl(
                 if chunk.outbound is not None:
                     session = chunk.outbound.session_id
                     reply_metadata = dict(chunk.outbound.metadata)
+        if response_chunks:
+            _render_cli_markdown("".join(response_chunks))
+            console.print()
         if response_error is not None:
             typer.secho(response_error, fg=typer.colors.RED)
-        elif response_chunks:
-            if not console.is_terminal:
-                _render_cli_markdown("".join(response_chunks))
-            console.print()
-        else:
+        elif not response_chunks:
             console.print(
                 Markdown(
                     _L(

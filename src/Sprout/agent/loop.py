@@ -24,6 +24,13 @@ if TYPE_CHECKING:
     from Sprout.message.models import Message
 
 
+def _output_limit_notice(language):
+    return ("\n\n[输出达到模型 token 上限；回答尚未完成。请回复“继续”分段获取后续内容。]"
+            if language.startswith("zh") else
+            "\n\n[Model output token limit reached; this answer is incomplete. "
+            "Reply 'continue' for the next part.]")
+
+
 def _skill_message(context: AgentContext) -> LLMMessage | None:
     """Skill system message, honouring the disclosure mode (design §6.1).
 
@@ -220,8 +227,10 @@ class AgentLoop:
                 break
             if not response.tool_calls:
                 return AgentResult(
-                    content=response.text,
+                    content=response.text + (_output_limit_notice(response_language)
+                                             if response.finish_reason == "length" else ""),
                     metadata={
+                        "truncated": response.finish_reason == "length",
                         "steps": steps,
                         "finish_reason": response.finish_reason,
                         "model": response.model,
@@ -377,9 +386,17 @@ class AgentLoop:
                 if not response.tool_calls:
                     if response.text:
                         yield response.text
-                    if include_result and response.finish_reason in {None, "stop", "end_turn"}:
+                    if response.finish_reason == "length":
+                        yield _output_limit_notice(response_language)
+                    if include_result and response.finish_reason in {
+                            None, "stop", "end_turn", "length"}:
                         yield AgentResult(content="", metadata={
                             "steps": steps, "model_calls": model_calls,
+                            "finish_reason": response.finish_reason,
+                            "truncated": response.finish_reason == "length",
+                            "usage": {"prompt_tokens": response.usage.prompt_tokens,
+                                      "completion_tokens": response.usage.completion_tokens,
+                                      "total_tokens": response.usage.total_tokens},
                             "tool_calls": tool_calls, "plan": self._last_plan,
                         })
                     return
@@ -444,9 +461,15 @@ class AgentLoop:
             self._record_step(context.session.id, steps, "".join(content_parts),
                               final_tool_calls, step_usage)
             if not final_tool_calls:
-                if include_result and finish_reason in {None, "stop", "end_turn"}:
+                if finish_reason == "length":
+                    yield _output_limit_notice(response_language)
+                if include_result and finish_reason in {None, "stop", "end_turn", "length"}:
                     yield AgentResult(content="", metadata={
                         "steps": steps, "model_calls": model_calls,
+                        "finish_reason": finish_reason, "truncated": finish_reason == "length",
+                        "usage": {"prompt_tokens": step_usage.prompt_tokens,
+                                  "completion_tokens": step_usage.completion_tokens,
+                                  "total_tokens": step_usage.total_tokens},
                         "tool_calls": tool_calls, "plan": self._last_plan,
                     })
                 return
