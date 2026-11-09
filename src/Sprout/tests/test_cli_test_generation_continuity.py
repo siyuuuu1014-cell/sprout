@@ -32,6 +32,8 @@ from Sprout.tests.test_r04_b4_cli_auto import (
 
 @pytest.mark.parametrize("text", [
     "为这个项目生成单元测试", "为当前这个项目生成单元测试", "生成单元测试",
+    "为当前这个项目生成单元测试，覆盖 app.py 中的所有函数，并运行测试",
+    "为 app.py 创建单元测试", "补充现有 test_app.py 的测试覆盖",
     "那你帮我补齐一份 README", "为这个项目创建 README.md",
     "给当前项目增加 pyproject.toml", "修改 app.py 中的函数",
     "编写测试", "添加测试", "请为这个项目编写测试文件", "给 app.py 添加单元测试",
@@ -43,6 +45,9 @@ def test_explicit_test_generation_is_task(text):
 @pytest.mark.parametrize("text", [
     "README 应该写什么？", "如何写单元测试？", "解释 pyproject.toml 的作用。",
     "不要修改 README。", "帮我分析 README。",
+    "解释如何为这个项目编写测试", "分析这个项目结构",
+    "讨论为当前项目生成单元测试，覆盖 app.py 中的所有函数，并运行测试",
+    "不要为当前项目生成单元测试，覆盖 app.py 中的所有函数，并运行测试",
     "解释如何生成单元测试", "讨论测试方案", "生成单元测试的原理是什么",
     "不要为这个项目生成单元测试", "为这个项目生成单元测试是否合理？",
     "生成单元测试的方案", "只分析测试覆盖率", "这个项目有哪些函数", "你好",
@@ -53,6 +58,8 @@ def test_test_discussion_is_not_a_write_request(text):
 
 @pytest.mark.parametrize("request_text", [
     "为这个项目生成单元测试", "那你帮我补齐一份 README",
+    "为当前这个项目生成单元测试，覆盖 app.py 中的所有函数，并运行测试",
+    "为 app.py 创建单元测试", "补充现有 test_app.py 的测试覆盖",
 ])
 async def test_analysis_then_generation_keeps_session_workspace_and_original_request(
     automatic, monkeypatch, request_text, capsys,

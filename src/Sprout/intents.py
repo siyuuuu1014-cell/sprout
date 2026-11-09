@@ -187,7 +187,9 @@ def write_intent_disposition(text: str) -> WriteIntentDisposition:
     # "生成测试方案" or "解释如何生成测试" is not a request to write test code.
     if re.fullmatch(
         r"(?:(?:为|给)[^，。！？;\n]{1,100}?)?\s*(?:生成|编写|添加|创建|补写)\s*"
-        r"(?:一(?:个|些|组|份))?(?:单元测试|测试代码|测试文件|测试用例|测试)", body,
+        r"(?:一(?:个|些|组|份))?(?:单元测试|测试代码|测试文件|测试用例|测试)"
+        r"(?:[，,]\s*覆盖\s*[^，,。！？;\n]{1,160})?"
+        r"(?:[，,]\s*(?:并|并且)?\s*(?:运行|执行)测试)?", body,
     ):
         return WriteIntentDisposition.EXPLICIT_WRITE
     if re.match(r"^(?:请)?帮我|^请", lowered) and any(

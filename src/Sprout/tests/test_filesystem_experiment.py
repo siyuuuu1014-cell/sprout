@@ -134,3 +134,22 @@ async def test_completed_filesystem_task_survives_sandbox_cleanup_failure(tmp_pa
     assert result.metrics["sandbox_cleanup"] == "failed"
     store.update_task_status.assert_not_awaited()
     runtime._record_security.assert_called_once()
+
+async def test_filesystem_prepare_rejects_session_workspace_mismatch(tmp_path):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from Sprout.cli.filesystem_task import prepare_filesystem
+    from Sprout.gateway.identity import Principal
+    from Sprout.orchestration.terminal import LocalOrchestratorBackend
+    from Sprout.workspace.models import Workspace
+
+    runtime = SimpleNamespace(_orchestrator_backend=LocalOrchestratorBackend(None),
+                              session_workspace_id=lambda _: "another-workspace",
+                              create_task=AsyncMock())
+    actor = Principal("operator", authenticated=True, source="cli")
+    with pytest.raises(PermissionError, match="filesystem_experiment_local_foreground_required"):
+        await prepare_filesystem(
+            runtime, Workspace("selected", tmp_path), SimpleNamespace(content="生成单元测试"),
+            SimpleNamespace(id="session"), actor)
+    runtime.create_task.assert_not_awaited()
