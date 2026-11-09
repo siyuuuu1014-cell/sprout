@@ -411,3 +411,126 @@ not a second result added to this run. Real DeepSeek/Docker CLI acceptance and
 full CI were **NOT_RUN** during this planner-only correction; the earlier real
 G4 evidence remains recorded above, without claiming it exercised this fix.
 All five cumulative G4 files remain uncommitted; no commit/push/merge was done.
+
+## Existing-test execution route — 2026-11-09
+
+Base: `29cf461a5d337bcabdf1f6f072df2fb700bef727`. An explicit request to run
+existing tests without modifying files is an execution intent, not a write hint.
+Previously `write_intent_disposition` conservatively rejected the no-write clause
+and no execution-only dispatch existed, so the CLI produced conversation text.
+The write-intent contract remains unchanged. A dedicated foreground CLI dispatch
+now uses the existing owned Workspace provider, controlled project analysis,
+filesystem snapshots, Sandbox, NodeExecutionGuard and DockerCodingBackend.
+
+The execution-only graph has READ, SANDBOX and EVALUATION nodes only. It does not
+create ChangeSets, Review, Apply or source-write permissions. The container mounts
+its sanitized input read-only; commands are Host-selected unittest/pytest runner
+commands. Counts, actual argv, image ID, exit code, stdout and stderr are persisted
+in node output and the existing Coding execution ledger. Nonzero exits report
+`tests.status=failed`, even though completion of the execution Task itself means
+its test-running job finished. Missing/zero counts are never reported as passed.
+These project tests are NOT independent acceptance evidence and cannot approve
+an Apply plan (`verified` remains false). Missing test files produce
+`project_tests_not_found` before the execution Task is created.
+
+Real production Windows CLI, current DeepSeek configuration, diagnostic mode:
+
+- Input: `只运行当前项目已有的单元测试，不修改任何文件，使用 Docker 隔离环境，返回真实测试结果。`
+- Workspace `D:/sprout-model-test`; Session
+  `d7b67981-1a6b-4c77-90ae-1046deb96d9d`.
+- Task `20947bdd-2749-484d-82d7-c44af50e9836`: completed; exactly three
+  completed guarded nodes, no Review/Apply nodes.
+- READ `app.py, test_app.py`; WRITE empty; execute existing `test_app.py` using
+  Host unittest discovery (`python -B -c <runner>`; full exact script persisted).
+- Image `sha256:11880faa03b5dda1f3f54a915ad1b0e3d2a97664799d7a9bfcd3790a9dc7a31d`
+  automatically resolved from local cache; one actual Docker run record with
+  `dst=/workspace,readonly`, exit 0.
+- Total 23, passed 23, failed 0, skipped 0. stdout contains the runner's structured
+  count record; stderr contains the 23 actual unittest results and
+  `Ran 23 tests in 0.001s / OK`.
+- Source SHA-256 unchanged: app.py
+  `49b4d3d54ef214ece6873eb97e3334cc79702d04d0d1d508f7f0555b8d0c3bbd`;
+  test_app.py `53508121f845294d91165fc82dfaa55dc92937a67d23b72016ed7befc25ca1f5`.
+  After CLI exit, the experiment Sandbox was absent; SQLite evidence remained.
+
+The first real run reached the new execution node but was denied because its
+Host executor had not entered the existing exact diagnostic isolated-tool
+approval binding. The same binding now explicitly recognizes the registered
+FilesystemTestRun class and validates the owning foreground Session; no global
+approval or host execution exception was added. That failed diagnostic database
+was retained, not reset or reclassified as a pass. Initial regression collection
+also failed before the new module existed; this was not a passing test run.
+
+Validation: 8 dedicated tests passed, including actual Runtime dispatch, no-test
+preparation, and real unittest/pytest success/failure counts in disposable unit
+fixtures (host runner unit tests are not Docker claims). Full related regression:
+289 passed, 1 skipped in 61.88 seconds, with native Windows Git CODE enabled;
+JUnit `.pytest_cache/testonly-final.xml`. Eight changed/new Python files passed
+Ruff; diff check passed. Skip: Windows symlink creation unavailable. Full CI,
+Linux, a new normal-human-approval CLI run and pure-test execution on a Git
+Workspace were NOT_RUN. Real Docker failure acceptance was not performed;
+nonzero-exit behavior was covered by deterministic real-runner tests. Automatic
+remote image provisioning and non-Python runners remain outside this change.
+No commit, push, merge or deployment was performed.
+
+### Runner naming and framework selection follow-up
+
+The uncommitted production module was renamed from `runtime/test_execution.py`
+to `runtime/isolated_test_run.py`. Its helper names are now `execution_request`,
+`execution_report` and `runner_command`; all source/test imports were updated.
+No compatibility shim with a pytest-discoverable filename was left behind.
+The initial negative checks recorded 2 failures and 1 pass: the old production
+filename matched pytest's pattern, and structured framework selection was absent.
+
+Framework choice now uses the already-authorized snapshots: pytest sections in
+pyproject.toml/pytest.ini/setup.cfg/tox.ini, Python AST imports and test functions/
+classes, including alias-aware unittest TestCase recognition. No project code is
+imported on the Host during selection. A plain `def test_*` needs pytest even
+without `import pytest`; mixed unittest/pytest files use pytest to include both.
+A comment merely mentioning pytest does not change runner choice. Required
+runner availability is checked in the actual container before import/execution;
+missing pytest fails explicitly with no unittest fallback. A real zero-test
+unittest run that exits 0 remains a failed test report, never a PASS.
+
+Dedicated regression: 12 passed, including real disposable Host-runner tests
+for mixed test collection and zero-test counts. Full G1–G4/approval/DeepSeek/
+Filesystem Apply/native Git CODE related regression: 293 passed, 1 skipped
+(59.54 seconds); JUnit `.pytest_cache/runner-choice-final.xml`. The skip remains
+Windows symlink creation unavailable. All eight affected Python files passed
+Ruff and `git diff --check` passed.
+
+From repository root, the default `python -m pytest --collect-only -q` exited 0:
+6783 tests collected, zero Sprout production node IDs. This is collection evidence,
+not 6783 executed/passing tests. Log `.pytest_cache/test-runner-root-final.log`.
+
+Real Windows production CLI with current DeepSeek configuration and local Docker:
+Session `8be92511-6375-4baf-a11b-a9dc5074cf85`, Task
+`30ae014a-ff6c-4dcc-b3a1-553e3d57c0c7`, READ app.py/test_app.py, no WRITE,
+framework unittest, 23 passed/0 failed/0 skipped, exit 0, Task completed.
+Only READ/SANDBOX/EVALUATION nodes existed; Sandbox was reclaimed. The two source
+hashes matched the preceding acceptance exactly. Raw persisted report and hashes:
+`.pytest_cache/test-runner-real-final.json`. This real CLI exercised unittest;
+pytest/mixed counts were executed in Host unit fixtures, not claimed as real
+mixed-container acceptance. Linux, hosted/full CI and missing-runner container
+failure acceptance remain NOT_RUN. No Commit, Push or Merge was performed.
+
+### Final pre-commit acceptance
+
+`execution_report()` now requires at least one passed case before returning
+`passed`. A zero-exit run with all cases skipped returns `skipped`, retaining
+its real counts; mixed passed/skipped runs with no failures can still pass.
+Two regression tests failed before the fix; real unittest and pytest all-skipped
+fixtures now confirm the corrected result. The dedicated suite has 15 passing
+tests, including preparation checks proving execution-only Scope excludes
+`file.write`, while ordinary Coding preparation retains `file.write` and its
+exact write-target list. Independent Apply authorization remains unchanged.
+
+Final related regression before submission: **296 passed, 1 skipped** in 65.70
+seconds, native Windows Git CODE enabled. JUnit:
+`.pytest_cache/test-execution-commit-final.xml`. The single skip is Windows
+symlink creation unavailable. Ruff passed all eight affected Python files;
+`git diff --check` passed. Real CLI/Docker and default root collection evidence
+above is retained from its recorded runs, not claimed as rerun in this final
+all-skipped correction. Full CI/Linux/hosted CI remain NOT_RUN. This acceptance
+covers the nine task-owned source/test/document files only; Commit/Push is
+explicitly authorized for the task branch, not Merge or deployment.

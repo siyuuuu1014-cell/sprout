@@ -18,7 +18,7 @@ from Sprout.strategy.acceptance import AcceptanceSpec
 from Sprout.task.models import DelegationScope, TaskExecutionMode
 
 
-async def prepare_filesystem(runtime, workspace, message, owned, principal):
+async def prepare_filesystem(runtime, workspace, message, owned, principal, *, test_only=False):
     if (not isinstance(runtime._orchestrator_backend, LocalOrchestratorBackend)
             or not principal.authenticated or principal.source != "cli"
             or runtime.session_workspace_id(owned) != workspace.id):
@@ -37,9 +37,13 @@ async def prepare_filesystem(runtime, workspace, message, owned, principal):
             typer.echo(f"[Planning] {operation['operation']}: {operation['path']}")
         for execution in plan.get("execution", ()):
             typer.echo(f"[Planning] execute: {execution}")
+        tests = tuple(path for path in reads if path.endswith('.py') and (
+            Path(path).name.startswith('test_') or Path(path).name.endswith('_test.py')))
+        if test_only and not tests:
+            raise PermissionError("project_tests_not_found")
         frozen = None
         raw_spec = os.getenv("SPROUT_FILESYSTEM_VERIFICATION_SPEC", "")
-        if raw_spec:
+        if raw_spec and not test_only:
             if not image or len(raw_spec) > 24 * 1024:
                 raise ValueError("Pinned image and bounded Host verification spec required")
             bundle = json.loads(raw_spec)
@@ -78,7 +82,9 @@ async def prepare_filesystem(runtime, workspace, message, owned, principal):
         raise PermissionError("filesystem_experiment_subject_changed")
     # The source export has its own exact file list, while the ProcessBroker
     # scope admits only this workspace as the host working directory.
-    actions = {"tool.invoke", "file.read", "file.write"}
+    actions = {"tool.invoke", "file.read"}
+    if not test_only:
+        actions.add("file.write")
     if image:
         actions.add("process.run")
     if frozen:
@@ -103,8 +109,13 @@ async def prepare_filesystem(runtime, workspace, message, owned, principal):
     runtime._cli_code_writes[task.id] = (principal, owned.id, workspace.id, writes)
     evidence = evidence_parent / ("filesystem-" + task.id)
     evidence.mkdir(exist_ok=False)
-    experiment = FilesystemExperiment(
+    from Sprout.runtime.isolated_test_run import FilesystemTestRun
+
+    experiment = (FilesystemTestRun if test_only else FilesystemExperiment)(
         runtime, task, workspace, reads, image, evidence, verification=frozen)
+    if test_only:
+        experiment.test_files = tests
+
     async def confirm_apply(arguments, review_text):
         if review_text:
             typer.echo(review_text)

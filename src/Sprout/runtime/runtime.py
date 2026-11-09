@@ -3877,6 +3877,11 @@ class Runtime:
         :meth:`_workspace_request_from_agent`, runs after the agent and handles
         the case this gate cannot see.
         """
+        from Sprout.runtime.isolated_test_run import dispatch, execution_request
+
+        if execution_request(message.content or ""):
+            return await dispatch(self, message, session, principal, foreground,
+                                  code_task_provider), None
         if not detect_task_hint(message.content or ""):
             return None
         if self._asks_for_workspace(message, context, session):
@@ -4255,6 +4260,10 @@ class Runtime:
         self, message: Message, context, *, pending_question: str | None = None,
     ) -> dict[str, Any]:
         from Sprout.intents import capability_question
+        from Sprout.runtime.isolated_test_run import execution_request
+
+        if pending_question is None and execution_request(message.content or ""):
+            return {"intent": "tool", "confidence": 1.0, "reason": "test_execution"}
 
         if pending_question is None and context.metadata.get("session_task_history_query"):
             return {"intent": "conversation", "confidence": 1.0,

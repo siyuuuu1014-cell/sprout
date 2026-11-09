@@ -44,7 +44,8 @@ class FilesystemExperiment:
         if (runtime is not self.runtime or asyncio.current_task() is not self.owner
                 or task != self.task or task.status is not TaskStatus.CREATED
                 or await runtime.get_workspace(task.workspace_id) != self.workspace
-                or (self.workspace.root / ".git").exists()):
+                or ((self.workspace.root / ".git").exists()
+                    and not getattr(self, "test_only", False))):
             raise PermissionError("filesystem_experiment_foreground_required")
         session = await runtime._sessions.require_owner(task.metadata["session_id"], task.actor)
         if (runtime._sessions.frozen_principal(session) != task.actor
@@ -58,6 +59,8 @@ class FilesystemExperiment:
         if self.verification:
             kinds.append(NodeType.EVALUATION)
         kinds.append(NodeType.APPLY)
+        if getattr(self, "test_only", False):
+            kinds = [NodeType.READ, NodeType.SANDBOX, NodeType.EVALUATION]
         for kind in kinds:
             nodes.append(ExecutionNode(
                 id=f"{task.id}:{kind.value}", task_id=task.id, type=kind,

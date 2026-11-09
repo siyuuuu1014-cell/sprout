@@ -28,6 +28,13 @@ async def prepare(runtime, workspace_id, *, message, session, principal):
     owned = await runtime._sessions.require_owner(session.id, principal)
     if runtime._sessions.frozen_principal(owned) != principal:
         raise PermissionError("cli_code_subject_unavailable")
+    from Sprout.runtime.isolated_test_run import execution_request
+
+    if execution_request(message.content):
+        from Sprout.cli.filesystem_task import prepare_filesystem
+
+        return await prepare_filesystem(runtime, workspace, message, owned, principal,
+                                        test_only=True)
     from Sprout.workspace.models import WorkspaceKind
 
     if workspace.kind is WorkspaceKind.LOCAL_DIRECTORY and not (workspace.root / ".git").exists():

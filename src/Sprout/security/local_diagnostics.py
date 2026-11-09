@@ -171,9 +171,10 @@ def coding_approval(manager, tool, scope):
 
     mode = manager.diagnostics
     from Sprout.runtime.filesystem_experiment import FilesystemExperiment
+    from Sprout.runtime.isolated_test_run import FilesystemTestRun
 
     filesystem = (scope is not None and type(tool) is IsolatedCodingCommandTool
-                  and type(tool._handler) is FilesystemExperiment
+                  and type(tool._handler) in {FilesystemExperiment, FilesystemTestRun}
                   and mode.runtime._sandbox_lifecycle.filesystem.get(scope.task.id)
                   is tool._handler and bool(tool._handler.image))
     if (not mode.active() or scope is None or scope.runtime is not mode.runtime

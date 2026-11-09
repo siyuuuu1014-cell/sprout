@@ -33,6 +33,10 @@ def plan_files(paths, instruction):
     if not paths or len(paths) > 64:
         raise PermissionError('filesystem_planning_input_budget')
     result = {'reads': paths, 'writes': (), 'execution': (), 'actions': ()}
+    from Sprout.runtime.isolated_test_run import execution_request
+
+    if execution_request(instruction):
+        return {**result, 'execution': ('run_tests',), 'actions': ('test_execution',)}
     if write_intent_disposition(instruction) is WriteIntentDisposition.KNOWN_NONWRITE:
         return result
     sources = [p for p in paths if p.endswith('.py') and not _test_file(p)
