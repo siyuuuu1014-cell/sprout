@@ -31,6 +31,7 @@ async def test_aiyallm_retains_content_finish_and_usage_without_tool_calls(monke
     assert ''.join(e.content for e in events) == 'firstLAST'
     assert any(e.finish_reason == 'length' for e in events)
     assert events[-1].usage.completion_tokens == 8
+    assert events[-1].model in {"deepseek-flash", provider.model}
 
 
 async def test_agent_node_preserves_summary_beyond_4000_characters(tmp_path):
@@ -93,10 +94,14 @@ async def test_agent_preserves_tool_final_reply_and_marks_length(monkeypatch, st
     text = 'A long complete summary.\n' * 200 + 'FINAL_MARKER'
     class Model:
         calls = 0
+
         async def chat(self, messages, **kwargs):
+            assert "cli_tool_run" not in messages[0].content
+            assert [tool.name for tool in kwargs["tools"]] == ["echo_tool"]
             self.calls += 1
             return (LLMResponse(tool_calls=(ToolCall('call', 'echo_tool', {'text': 'done'}),))
                     if self.calls == 1 else LLMResponse(content=text, finish_reason=finish,
+                                                       model="fixture-model",
                                                        usage=Usage(completion_tokens=128)))
     class Streaming(Model):
         async def stream_events(self, messages, **kwargs):
@@ -106,7 +111,8 @@ async def test_agent_preserves_tool_final_reply_and_marks_length(monkeypatch, st
             else:
                 yield LLMStreamEvent(content=text[:300])
                 yield LLMStreamEvent(content=text[300:])
-                yield LLMStreamEvent(finish_reason=finish, usage=response.usage)
+                yield LLMStreamEvent(finish_reason=finish, usage=response.usage,
+                                     model=response.model)
     registry = ToolRegistry()
     registry.register(EchoTool())
     agent = AgentLoop(Streaming() if streaming else Model(),
@@ -122,6 +128,7 @@ async def test_agent_preserves_tool_final_reply_and_marks_length(monkeypatch, st
         content = result.content
     assert content.startswith(text)
     assert result.metadata['finish_reason'] == finish
+    assert result.metadata['model'] == 'fixture-model'
     assert result.metadata['truncated'] is (finish == 'length')
     if finish == 'length':
         assert 'incomplete' in content or '尚未完成' in content

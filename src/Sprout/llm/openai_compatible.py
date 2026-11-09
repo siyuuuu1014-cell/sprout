@@ -122,6 +122,7 @@ class OpenAICompatibleProvider:
         }
         tool_deltas: dict[int, dict[str, str]] = {}
         finish_reason: str | None = None
+        model = self.model
         usage = Usage()
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
             async with client.stream("POST", url, json=payload, headers=headers) as response:
@@ -141,6 +142,7 @@ class OpenAICompatibleProvider:
                         chunk = json.loads(data)
                     except json.JSONDecodeError:
                         continue
+                    model = chunk.get("model") or model
                     usage_data = chunk.get("usage")
                     if usage_data:
                         usage = Usage(
@@ -186,6 +188,7 @@ class OpenAICompatibleProvider:
             tool_calls=tool_calls,
             finish_reason=finish_reason,
             usage=usage,
+            model=model,
         )
 
     @staticmethod

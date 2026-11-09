@@ -532,7 +532,13 @@ class NodeExecutor:
         result = await self._publish_node_model(
             node, workspace, task, self._router.route(message), message, context,
         )
-        return {"content": result.content, "analysis_ok": admission["analysis_result"] is not None}
+        analysis_ok = admission["analysis_result"] is not None
+        content = result.content
+        if analysis_ok and not paths:
+            from Sprout.workspace.query import WorkspaceQuery
+
+            content = WorkspaceQuery(admission["analysis_data"], captured=True).indexed_report()
+        return {"content": content, "analysis_ok": analysis_ok}
 
     async def _agent(
         self, node: ExecutionNode, workspace: Workspace, task: Task

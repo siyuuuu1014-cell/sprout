@@ -19,7 +19,7 @@ async def test_project_request_defaults_to_root(automatic):
     await cli.run()
     assert cli.create.call_args.kwargs["metadata"]["analysis_directory"] == "."
     assert len(cli.state.prompts) == 1
-    assert any("CLI_PROJECT_MAIN_RESULT" in s for s in cli.state.display)
+    assert any("Indexed counts" in s and "Files: 3" in s for s in cli.state.display)
     assert len([m for m in cli.state.seen if str(m.role) == "tool"]) == 1
 
 

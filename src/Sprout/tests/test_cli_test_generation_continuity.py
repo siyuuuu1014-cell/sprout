@@ -143,12 +143,14 @@ async def test_referential_project_question_uses_verified_analysis_data(automati
     await cli.run()
     runtime = cli.rig.runtime
     session = await runtime.get_session(cli.rig.session.id)
-    assert await project_answer(runtime, session, cli.rig.principal) == "CLI_PROJECT_MAIN_RESULT"
+    answer = await project_answer(runtime, session, cli.rig.principal)
+    assert "Files: 3" in answer and "src/main.py" in answer
+    assert "CLI_PROJECT_MAIN_RESULT" not in answer
     context = await runtime._ordinary_conversation_context(
         Message("这个项目有哪些函数", user_id=cli.rig.principal.user_id,
                 session_id=session.id), session, {}, {})
     assert context.metadata.get("project_analysis_followup")
-    assert any("CLI_PROJECT_MAIN_RESULT" in turn.content for turn in context.memory.working)
+    assert any(answer in turn.content for turn in context.memory.working)
     assert context.tools == {}
 
 

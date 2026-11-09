@@ -893,6 +893,9 @@ async def _repl(
         handled = False
         if await _handle_cli_workspace_consent(runtime, session, reply_metadata, user):
             handled = True
+            if session:
+                owned = await runtime._sessions.require_owner(session, principal)
+                workspace_id = runtime.session_workspace_id(owned)
         elif reply_metadata.get("foreground_task"):
             await _continue_foreground_task(runtime, reply_metadata, user)
             handled = True

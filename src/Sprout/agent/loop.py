@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
 def _output_limit_notice(language):
     return ("\n\n[输出达到模型 token 上限；回答尚未完成。请回复“继续”分段获取后续内容。]"
-            if language.startswith("zh") else
+            if language == "中文" or language.startswith("zh") else
             "\n\n[Model output token limit reached; this answer is incomplete. "
             "Reply 'continue' for the next part.]")
 
@@ -105,9 +105,8 @@ class AgentLoop:
                 "explain, ask for permission, or wait unless the request is truly "
                 "ambiguous. Use available tools when they help complete the requested "
                 "change; system-level safety and approvals are handled outside the model. "
-                "When the user asks to use a Sprout CLI command or perform an operation "
-                "available through the CLI, call cli_tool_run with command 'sprout' and "
-                "the appropriate argument list, then report the real command output. "
+                "Use only the tools supplied for this request. If a requested tool is "
+                "unavailable, explain that without claiming execution. "
                 f"Answer in language '{response_language}'. This is the configured "
                 "response language for this turn, so even progress/status text such as "
                 "'I'll start by analyzing the project structure' must use it. Keep code, "
@@ -233,7 +232,7 @@ class AgentLoop:
                         "truncated": response.finish_reason == "length",
                         "steps": steps,
                         "finish_reason": response.finish_reason,
-                        "model": response.model,
+                        "model": response.model or getattr(self.model, "model", None),
                         "model_calls": model_calls,
                         "tool_calls": tool_calls,
                         "plan": self._last_plan,
@@ -336,9 +335,8 @@ class AgentLoop:
                 "explain, ask for permission, or wait unless the request is truly "
                 "ambiguous. Use available tools when they help complete the requested "
                 "change; system-level safety and approvals are handled outside the model. "
-                "When the user asks to use a Sprout CLI command or perform an operation "
-                "available through the CLI, call cli_tool_run with command 'sprout' and "
-                "the appropriate argument list, then report the real command output. "
+                "Use only the tools supplied for this request. If a requested tool is "
+                "unavailable, explain that without claiming execution. "
                 f"Answer in language '{response_language}'. This is the configured "
                 "response language for this turn, so even progress/status text such as "
                 "'I'll start by analyzing the project structure' must use it. Keep code, "
@@ -393,6 +391,7 @@ class AgentLoop:
                         yield AgentResult(content="", metadata={
                             "steps": steps, "model_calls": model_calls,
                             "finish_reason": response.finish_reason,
+                            "model": response.model or getattr(self.model, "model", None),
                             "truncated": response.finish_reason == "length",
                             "usage": {"prompt_tokens": response.usage.prompt_tokens,
                                       "completion_tokens": response.usage.completion_tokens,
@@ -446,7 +445,9 @@ class AgentLoop:
             final_tool_calls = ()
             finish_reason = None
             step_usage = Usage()
+            model_name = getattr(self.model, "model", None)
             async for event in stream_events(messages, tools=specs):
+                model_name = event.model or model_name
                 if event.usage is not None:
                     step_usage = event.usage
                 if event.finish_reason is not None:
@@ -467,6 +468,7 @@ class AgentLoop:
                     yield AgentResult(content="", metadata={
                         "steps": steps, "model_calls": model_calls,
                         "finish_reason": finish_reason, "truncated": finish_reason == "length",
+                        "model": model_name,
                         "usage": {"prompt_tokens": step_usage.prompt_tokens,
                                   "completion_tokens": step_usage.completion_tokens,
                                   "total_tokens": step_usage.total_tokens},

@@ -192,7 +192,9 @@ class AiyallmProvider:
                 content=chunk.content or "",
                 tool_calls=tuple(ToolCall(id=call.id, name=call.name, arguments=call.arguments_dict)
                                  for call in chunk.tool_calls or ()),
-                finish_reason=chunk.finish_reason, usage=usage)
+                finish_reason=chunk.finish_reason, usage=usage,
+                model=getattr(chunk, "model", None) or self.model,
+            )
         record_completion(self, finish_reason, self.last_usage)
 
 

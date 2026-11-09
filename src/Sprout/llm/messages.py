@@ -86,3 +86,4 @@ class LLMStreamEvent:
     tool_calls: tuple[ToolCall, ...] = ()
     finish_reason: str | None = None
     usage: Usage | None = None
+    model: str | None = None

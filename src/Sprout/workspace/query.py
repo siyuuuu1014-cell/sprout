@@ -101,7 +101,8 @@ class WorkspaceQuery:
         nodes = [
             node
             for node in self._analysis.graph.nodes
-            if node.kind in {"class", "function", "method", "test"}
+            if node.granularity == "symbol"
+            and node.kind in {"class", "function", "method", "test"}
         ]
         if kind:
             nodes = [node for node in nodes if node.kind == kind]
@@ -114,6 +115,59 @@ class WorkspaceQuery:
                 or lowered in node.qualified_name.casefold()
             ]
         return tuple(nodes)
+
+    def indexed_counts(self) -> dict[str, int]:
+        """Count symbols from the same index used by the symbols query."""
+        symbols = self.symbols()
+        test_methods = [
+            node for node in symbols
+            if node.kind == "method" and node.qualified_name.rpartition(".")[2].startswith("test_")
+        ]
+        test_classes = {
+            (node.resource.path, node.qualified_name.rpartition(".")[0])
+            for node in test_methods if node.resource is not None
+        }
+        return {
+            "files": len({node.resource.path for node in self._analysis.graph.nodes
+                          if node.resource is not None}),
+            "functions": sum(node.kind in {"function", "test"} for node in symbols),
+            "test_classes": len(test_classes),
+            "test_methods": len(test_methods),
+            "test_functions": sum(node.kind == "test" for node in symbols),
+        }
+
+    def indexed_report(self) -> str:
+        """Render automatic discovery from the captured index."""
+        counts = self.indexed_counts()
+        manifest = self._analysis.manifest
+        files: dict[str, list[str]] = {
+            node.resource.path: [] for node in self._analysis.graph.nodes
+            if node.resource is not None
+        }
+        for node in self.symbols():
+            if node.resource is not None and node.kind in {"class", "function"}:
+                files[node.resource.path].append(node.qualified_name)
+        lines = [
+            "项目结构 / Project structure",
+            "",
+            "Languages: " + (", ".join(manifest.detected_languages) or "unknown"),
+            "Framework hints: " + (", ".join(manifest.framework_hints) or "none detected"),
+            "",
+            "索引统计 / Indexed counts (partial project coverage, authorized files only)",
+            f"- Files: {counts['files']}",
+            f"- Top-level functions (including test functions): {counts['functions']}",
+            f"- Classes with indexed test methods: {counts['test_classes']}",
+            f"- Test methods: {counts['test_methods']}",
+            f"- Top-level test functions: {counts['test_functions']}",
+            "",
+            "已索引的文件 / Indexed files",
+        ]
+        for path, symbols in sorted(files.items())[:20]:
+            names = ", ".join(symbols[:10])
+            lines.append(f"- {path}" + (f" — {names}" if names else ""))
+        if len(files) > 20:
+            lines.append("- … file list limited to the first 20 paths")
+        return "\n".join(lines)
 
     def dependencies(
         self,

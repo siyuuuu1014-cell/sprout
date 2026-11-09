@@ -188,7 +188,8 @@ async def test_diagnostic_read_analysis_keeps_scope_and_deny(automatic, monkeypa
         records = await manager.store.list_approvals()
         assert not any(record.status == "pending" for record in records)
     success = case in {"directory", "file"}
-    assert any("CLI_PROJECT_MAIN_RESULT" in text for text in cli.state.display) == success
+    marker = "CLI_PROJECT_MAIN_RESULT" if case == "file" else "Indexed counts"
+    assert any(marker in text for text in cli.state.display) == success
     assert bool(cli.captured.opens) == success
     if case == "filesystem":
         assert any("directory_access_denied" in text for text in cli.state.display)

@@ -14,7 +14,7 @@ from Sprout.workspace.intelligence import WorkspaceAnalysis, WorkspaceIntelligen
 
 
 class ProjectAnalyzeTool:
-    """Analyze a project workspace with safe built-in and optional system probes."""
+    """Analyze a project workspace using captured files and the built-in index."""
 
     def __init__(
         self, *, intelligence: WorkspaceIntelligence | None = None,
@@ -39,10 +39,6 @@ class ProjectAnalyzeTool:
                     "instruction": {
                         "type": "string",
                         "description": "Optional analysis focus.",
-                    },
-                    "include_system_tools": {
-                        "type": "boolean",
-                        "description": "Probe safe local analysis tools when present.",
                     },
                 },
                 "required": ["path"],

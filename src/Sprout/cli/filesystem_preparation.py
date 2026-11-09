@@ -25,7 +25,7 @@ def _test_file(path):
             or 'tests' in PurePosixPath(path).parts)
 
 
-def plan_files(paths, instruction):
+def plan_files(paths, instruction, *, symbols=None):
     """Plan distinct effects; names and execution hints never grant authority."""
     from Sprout.intents import WriteIntentDisposition, write_intent_disposition
 
@@ -79,7 +79,23 @@ def plan_files(paths, instruction):
                                         ('tests/' + name if '/' in path else name))
             writes.extend(test_targets)
             actions.append('test_extension' if extending else 'test_generation')
+        elif (creating and not selected
+              and re.search(r"(?:新增|添加|实现)\s*[A-Za-z_]\w*\s*\(", clause)):
+            if len(sources) != 1:
+                raise PermissionError("filesystem_planning_ambiguous_source_target")
+            writes.extend(sources)
+            edited_sources.extend(sources)
+            actions.append("code_modification")
         elif selected and (editing or creating):
+            symbol = re.search(r"\.(?:py)\s*中\s*(?:的\s*)?([A-Za-z_]\w*)\s*函数",
+                               clause)
+            if editing and not creating and symbol and symbols is not None:
+                label = selected[0]
+                name = symbol[1]
+                if (label, name) not in symbols:
+                    raise PermissionError(
+                        f"filesystem_planning_function_not_indexed: {label}:{name}"
+                    )
             writes.extend(selected)
             edited_sources.extend(p for p in selected if p in sources)
             if any(not _test_file(p) for p in selected):
@@ -107,6 +123,15 @@ async def discover_plan(runtime, workspace, message, owned, principal):
     from Sprout.runtime.dialogue import project_answer
 
     report(runtime, 'Planning', 'analyzing project files')
+    symbols = set()
+
+    def capture(analysis):
+        symbols.update(
+            (node.resource.path, node.qualified_name)
+            for node in analysis.graph.nodes
+            if node.resource is not None and node.kind in {"function", "test"}
+        )
+
     async def provider(**request):
         return await _provide_cli_directory_task(runtime, workspace, request['session'],
             request['principal'], request['message'], label='.')
@@ -114,7 +139,7 @@ async def discover_plan(runtime, workspace, message, owned, principal):
     response = await runtime._dispatch_project_analysis(
         replace(message, content='分析这个项目结构', metadata={}), owned,
         principal=principal, analysis_task=None, classification={"intent": "tool"},
-        analysis_task_provider=provider, reply_to=message)
+        analysis_task_provider=provider, reply_to=message, on_capture=capture)
     if response is None or response.metadata.get('analysis_status') != 'ok':
         raise PermissionError('filesystem_planning_analysis_unavailable: ' +
                               (response.content if response else 'no publication'))
@@ -124,7 +149,7 @@ async def discover_plan(runtime, workspace, message, owned, principal):
     ref = fresh.metadata['project_analysis_ref_v1']
     source = await runtime._metadata_or_raise().get_node_result_source(ref['node_id'])
     paths = [item['path'] for item in json.loads(source.resources_json)]
-    plan = plan_files(paths, message.content)
+    plan = plan_files(paths, message.content, symbols=symbols)
     overrides = runtime._file_broker._classify_overrides
     for group in (plan["reads"], plan["writes"]):
         for label in group:

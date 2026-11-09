@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 from Sprout.llm.base import ModelBudgetExhausted, ModelProvider
@@ -124,7 +124,9 @@ class ModelOrchestrator:
             for attempt in range(1, self._policy.max_attempts + 1):
                 started = time.monotonic()
                 try:
-                    return await invoke_model(provider, messages, tools=tools)
+                    response = await invoke_model(provider, messages, tools=tools)
+                    model = response.model or getattr(provider, "model", None)
+                    return replace(response, model=model)
                 except ModelBudgetExhausted:
                     raise
                 except Exception as exc:  # noqa: BLE001 - retry/fallback boundary
@@ -187,6 +189,7 @@ class ModelOrchestrator:
                 tool_calls=response.tool_calls,
                 finish_reason=response.finish_reason,
                 usage=response.usage,
+                model=response.model,
             )
             return
         async for event in stream_events(messages, tools=tools):

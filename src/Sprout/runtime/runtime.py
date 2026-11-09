@@ -3244,7 +3244,7 @@ class Runtime:
     # -- online path ---------------------------------------------------------
     async def _dispatch_project_analysis(
         self, message, session, *, principal, analysis_task, classification,
-        analysis_task_provider=None, reply_to=None,
+        analysis_task_provider=None, reply_to=None, on_capture=None,
     ):
         """Admit an explicit host reference; routing hints confer no authority.
 
@@ -3423,11 +3423,8 @@ class Runtime:
             if not self.session_workspace_id(current_session):
                 current_session.metadata[self.SESSION_WORKSPACE_KEY] = workspace.id
             await self._session_store.save_session(current_session)
-            coverage = admission["analysis_result"].data.get("coverage", {})
-            if coverage.get("mode") == "discovery":
-                content += ("\n\n覆盖范围 / coverage: authorized project files; "
-                            f"{coverage.get('file_count', 0)} files; "
-                            "partial project coverage (policy/scope and supported resource types).")
+            if on_capture is not None:
+                on_capture(admission["analysis_data"])
             reason = ""
         except PermissionError as exc:
             content = reason = str(exc)
