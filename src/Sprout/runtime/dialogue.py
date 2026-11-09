@@ -19,6 +19,13 @@ def analysis_followup(text):
     text = re.sub(r"(?:不要|无需|不必|不)(?:再|重新)?扫描", "", text)
     if re.search(r"重新|扫描|整个项目|当前项目|\b(?:scan|entire|whole)\b", text):
         return False
+    # Existing provenance/Policy validation still decides whether this data
+    # may be shown. A deictic reference never creates a write capability.
+    from Sprout.intents import detect_task_hint
+
+    if (re.match(r"^(?:这个|该|刚才分析的)项目(?:中|里)?(?:有|包含|的)", text)
+            or (detect_task_hint(text) and re.search(r"(?:这个|该)项目", text))):
+        return True
     return bool(re.search(
         r"进一步分析|继续分析|核心模块|模块之间|刚才.*分析|上一轮.*分析|之前.*分析|分析了什么|"
         r"上述.*(?:模块|分析)|(?:刚才|上一轮|之前|上述).*(?:统计|行数|注释|空行)|"

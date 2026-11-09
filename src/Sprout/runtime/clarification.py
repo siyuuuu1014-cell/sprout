@@ -7,6 +7,7 @@ durable Consent claim remains mandatory. Claimed answers are never replayed.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -45,6 +46,11 @@ def _project_offer_request(text: str) -> bool:
     return "".join(text.split()).translate(str.maketrans("", "", "，,。？?")) in {
         "你是谁你能做什么", "你能做什么",
     }
+
+
+def _choice_only(text: str) -> bool:
+    """Model-authored menu labels are never a standalone operation target."""
+    return bool(re.fullmatch(r"[a-z]|[0-9]{1,2}", text.strip().casefold().rstrip("。.!！?？ ")))
 
 
 def clarification_store(runtime: Runtime) -> IntentClarificationStore | None:
@@ -96,6 +102,12 @@ async def route_clarification(
                 or session.metadata.get("entry_principal_v1") != snapshot["principal"]):
             raise PermissionError("Clarification identity unavailable")
         expired = datetime.fromisoformat(record["expires_at"]) <= datetime.now(UTC)
+        if _choice_only(snapshot["request"]):
+            await store.resolve_intent_clarification(
+                session, record["id"], message.id, message.content, "superseded")
+            return await _reply(runtime, message, session,
+                "旧澄清记录只有选项标签，不能恢复任务。请重新发送完整目标。",
+                blocked_reason="operation_target_required")
         if record["question"] == _PROJECT_OFFER and _project_offer_request(snapshot["request"]):
             answer = message.content.strip().rstrip("。！!")
             if expired:
@@ -125,7 +137,8 @@ async def route_clarification(
         # Only a live question interprets ordinary text as a selection. An
         # expired row is retired atomically, then this is a normal chat turn.
         new_write_request = False
-        choice = "expired" if expired else clarification_answer(message.content)
+        choice = ("expired" if expired else "unclear" if _choice_only(message.content)
+                  else clarification_answer(message.content))
         if (not expired and choice is None and (
             needs_intent_clarification(message.content)
             or ("write" not in json.loads(record["choices_json"])
@@ -251,7 +264,7 @@ async def route_clarification(
     # Without a pending question, assent/cancel/read-only words belong to the
     # original chat router. Only object-less write selections need a scope
     # question: they must never reach AgentLoop or reuse a bound workspace.
-    if clarification_answer(message.content) == "write":
+    if _choice_only(message.content) or clarification_answer(message.content) == "write":
         return await _reply(runtime, message, session,
                             "请说明要修改的具体对象和要求；这条短回复不会执行历史请求。",
                             blocked_reason="operation_target_required")
@@ -282,6 +295,10 @@ async def _ask(
     runtime: Runtime, message: Message, session: Session, principal: Principal | None,
     *, allow_write: bool = True, missing_scope: bool = False, project_offer: bool = False,
 ) -> OutboundMessage:
+    if _choice_only(message.content):
+        return await _reply(runtime, message, session,
+            "这只是选项标签，没有可恢复的正式任务。请重新发送完整目标。",
+            blocked_reason="operation_target_required")
     store = clarification_store(runtime)
     if store is None or principal is None or not session.user_id:
         return await _reply(runtime, message, session,
@@ -347,4 +364,6 @@ async def clarified_instruction(
     snapshot = json.loads(record["snapshot_json"])
     if snapshot["principal"] != session.metadata.get("entry_principal_v1"):
         raise PermissionError("Clarified instruction identity unavailable")
+    if _choice_only(snapshot["request"]):
+        raise LookupError("Restore requires a complete original request, not a menu label")
     return "/task " + snapshot["request"]

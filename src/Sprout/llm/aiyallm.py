@@ -23,6 +23,47 @@ if TYPE_CHECKING:
     from Sprout.tools.spec import ToolSpec
 
 
+class _ToolCompatibleOpenAIProvider(AiyallmOpenAICompatibleProvider):
+    """aiyallm 0.1.x provider extension; keep its routing and SDK transport.
+
+    The public aiyallm request has no extra_body option (metadata is NOT an
+    API-body extension). This common builder serves sync and async streams
+    as well as normal calls. No installed dependency is patched.
+    """
+
+    def __init__(self, *args, thinking_mode=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._thinking_mode = thinking_mode
+
+    def _build_chat_kwargs(self, request, *, stream):
+        kwargs = super()._build_chat_kwargs(request, stream=stream)
+        mode = self._thinking_mode
+        if mode is None and request.model.lower().startswith("deepseek-"):
+            # Sprout does not persist/round-trip vendor reasoning. DeepSeek
+            # tool conversations must therefore explicitly use non-thinking.
+            mode = "disabled"
+        if mode is not None:
+            kwargs["extra_body"] = {"thinking": {"type": mode}}
+        return kwargs
+
+
+def _configured_provider(spec, thinking_mode):
+    """Preserve aiyallm's OpenAI provider-spec defaults, names and accounts."""
+    kind = str(spec.get("type") or spec.get("kind") or "openai").lower()
+    if kind not in {"openai", "openai_compatible", "openai-compatible"}:
+        return dict(spec)
+    keys = (
+        "account", "api_key", "api_key_env", "api_key_prompt", "base_url", "models", "timeout",
+        "api_key_required", "organization", "project", "default_headers", "stream_include_usage",
+    )
+    kwargs = {key: spec[key] for key in keys if key in spec}
+    return _ToolCompatibleOpenAIProvider(
+        name=str(spec.get("name") or kind),
+        allow_unknown_models=bool(spec.get("allow_unknown_models", True)),
+        thinking_mode=thinking_mode, **kwargs,
+    )
+
+
 class AiyallmProvider:
     """Adapt the ``aiyallm`` package to the Sprout :class:`ModelProvider` protocol."""
 
@@ -36,8 +77,19 @@ class AiyallmProvider:
         name: str = "aiyallm",
         timeout_seconds: float = 60.0,
         temperature: float | None = None,
+        thinking_mode: str | None = None,
+        max_output_tokens: int | None = None,
         providers: Sequence[Mapping[str, Any]] = (),
     ) -> None:
+        if thinking_mode not in {None, "disabled"}:
+            raise ValueError(
+                "Only disabled thinking mode is supported; reasoning round-trip is absent")
+        if max_output_tokens is not None and (
+            type(max_output_tokens) is not int or max_output_tokens <= 0
+        ):
+            raise ValueError("max_output_tokens must be a positive integer")
+        self.thinking_mode = thinking_mode
+        self.max_output_tokens = max_output_tokens
         self.name = name
         self.model = model
         self.base_url = base_url.rstrip("/")
@@ -53,11 +105,11 @@ class AiyallmProvider:
             # Preserve provider names and model lists for refs such as
             # ``deepseek/deepseek-flash``.
             self._client = Aiyallm(
-                providers=[dict(item) for item in providers],
+                providers=[_configured_provider(item, thinking_mode) for item in providers],
                 default_model=self.model or None,
             )
         else:
-            provider = AiyallmOpenAICompatibleProvider(
+            provider = _ToolCompatibleOpenAIProvider(
                 "aiyallm-openai-compatible",
                 api_key=resolved_key,
                 api_key_required=False,
@@ -65,6 +117,7 @@ class AiyallmProvider:
                 models=[self.model],
                 timeout=self.timeout_seconds,
                 allow_unknown_models=True,
+                thinking_mode=thinking_mode,
             )
             self._client = Aiyallm(providers=[provider], default_model=self.model)
 
@@ -79,6 +132,7 @@ class AiyallmProvider:
             messages=encoded_messages,
             model=self.model,
             temperature=self.temperature,
+            max_tokens=self.max_output_tokens,
             tools=encoded_tools,
         )
 
@@ -107,6 +161,7 @@ class AiyallmProvider:
             messages=encoded_messages,
             model=self.model,
             temperature=self.temperature,
+            max_tokens=self.max_output_tokens,
             tools=encoded_tools,
         ):
             if chunk.usage is not None:
@@ -123,6 +178,7 @@ class AiyallmProvider:
             messages=encoded_messages,
             model=self.model,
             temperature=self.temperature,
+            max_tokens=self.max_output_tokens,
             tools=encoded_tools,
         ):
             if chunk.usage is not None:

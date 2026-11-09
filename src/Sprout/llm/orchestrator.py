@@ -17,6 +17,27 @@ if TYPE_CHECKING:
     from Sprout.tools.spec import ToolSpec
 
 
+def _invalid_request(exc, ancestors=frozenset()):
+    """Recognize structured HTTP 400/422 through aiyallm's error wrappers.
+
+    Do not infer status from arbitrary error text. Mixed transient/terminal
+    failures retain the original retry behavior.
+    """
+    if id(exc) in ancestors:
+        return False
+    ancestors = ancestors | {id(exc)}
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status in {400, 422}:
+        return True
+    errors = getattr(exc, "errors", ())
+    if errors:
+        return all(_invalid_request(error, ancestors) for error in errors)
+    cause = getattr(exc, "cause", None) or getattr(exc, "__cause__", None)
+    return cause is not None and _invalid_request(cause, ancestors)
+
+
 @dataclass(frozen=True, slots=True)
 class RetryPolicy:
     """Provider-level retry and fallback policy."""
@@ -28,6 +49,8 @@ class RetryPolicy:
     non_retryable_exception_types: tuple[type[Exception], ...] = ()
 
     def should_retry(self, exc: Exception) -> bool:
+        if _invalid_request(exc):
+            return False
         if self.non_retryable_exception_types and isinstance(
             exc, self.non_retryable_exception_types
         ):

@@ -77,8 +77,12 @@ class NodeExecutionGuard:
                 raise
             return node_result(waiting)
         is_waiting = isinstance(output, dict) and bool(output.get("waiting"))
+        prewrite = (is_waiting and running.type.value == "apply"
+                    and running.metadata.get("filesystem_apply") is True
+                    and output.get("filesystem_prewrite") is True)
         state = (
-            ("uncertain" if output.get("waiting_kind") == "resource" else "waiting")
+            ("uncertain" if output.get("waiting_kind") == "resource" and not prewrite
+             else "waiting")
             if is_waiting
             else "completed"
         )

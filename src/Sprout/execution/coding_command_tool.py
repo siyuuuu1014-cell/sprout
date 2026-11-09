@@ -21,10 +21,12 @@ class IsolatedCodingCommandTool:
                                      "relative_cwd": {"type": "string", "default": "."}},
                       "required": ["command"]})
 
-    def __init__(self, handler, *, task, node, sandbox):
+    def __init__(self, handler, *, task, node, sandbox, filesystem_root_only=False):
         self._handler, self._task, self._node = handler, task, node
         self._sandbox = sandbox
-        self._guard = IsolatedModelPathGuard(sandbox, task)
+        if filesystem_root_only and sandbox.kind != "filesystem_experiment":
+            raise ValueError("Filesystem experiment sandbox required")
+        self._guard = None if filesystem_root_only else IsolatedModelPathGuard(sandbox, task)
         self._used = False
         self.invocation_context = NodeToolInvocationContext(
             task_id=task.id, source=task.source, requested_by=task.actor.user_id,
@@ -40,7 +42,7 @@ class IsolatedCodingCommandTool:
             return ToolResult.denied("Bounded structured argv required")
         if (not isinstance(relative, str) or not relative or ":" in relative or "\\" in relative
                 or PurePosixPath(relative).is_absolute() or ".." in PurePosixPath(relative).parts
-                or (relative != "." and not self._guard.allows(relative))):
+                or (relative != "." and (self._guard is None or not self._guard.allows(relative)))):
             return ToolResult.denied("Existing public directory inside the node sandbox required")
         if self._used:
             return ToolResult.denied(

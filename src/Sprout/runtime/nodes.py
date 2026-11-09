@@ -64,7 +64,7 @@ from Sprout.execution.verification import (
 )
 from Sprout.llm.language import detect_language
 from Sprout.message.models import Message
-from Sprout.orchestration.models import ExecutionNode, NodeType
+from Sprout.orchestration.models import ExecutionNode, NodeStatus, NodeType
 from Sprout.sandbox.git_worktree import GitWorktreeSandbox
 from Sprout.sandbox.isolated_git_worktree import IsolatedGitWorktreeSandbox
 from Sprout.skills.models import Skill
@@ -249,7 +249,36 @@ class NodeExecutor:
                     paths.append(target.text()[len(root.text().rstrip("/")) + 1:])
                 scope.known_paths = tuple(paths)
             with task_model_budget(self._metadata, task.id, node.id, task.budget.max_model_calls):
-                result = await self._execute_node(node, workspace, read_plan, task)
+                from Sprout.security.local_diagnostics import report
+
+                runtime = scope.runtime if scope is not None else None
+                label = {
+                    NodeType.SANDBOX: "Sandbox", NodeType.AGENT: "Agent",
+                    NodeType.EVALUATION: "Verification", NodeType.APPROVAL: "Review",
+                    NodeType.APPLY: "Apply",
+                }.get(node.type, "Node")
+                report(runtime, label, f"{task.id}/{node.id} {node.type.value}: running")
+                try:
+                    result = await self._execute_node(node, workspace, read_plan, task)
+                except Exception:
+                    report(runtime, label, f"{node.id}: failed")
+                    raise
+                if isinstance(result, dict):
+                    if result.get("waiting") is True:
+                        status = ("WAITING_APPROVAL" if result.get("pending_approvals")
+                                  or (node.type is NodeType.APPROVAL
+                                      and result.get("waiting_kind") != "resource")
+                                  else "WAITING_RESOURCE")
+                        report(runtime, label, f"{node.id}: {status}")
+                    elif node.type is NodeType.EVALUATION:
+                        if result.get("verified") is True:
+                            report(runtime, label, f"{node.id}: passed")
+                        elif result.get("status") == "failed" or result.get("passed") is False:
+                            report(runtime, label, f"{node.id}: failed")
+                        else:
+                            report(runtime, label, f"{node.id}: result recorded")
+                    elif node.type is NodeType.APPLY and result.get("applied") is True:
+                        report(runtime, label, f"{node.id}: applied")
                 if scope is not None:
                     if scope.sandbox_tool_results and isinstance(result, dict):
                         result = {
@@ -283,12 +312,50 @@ class NodeExecutor:
 
             scope = _current_project_node()
             if scope is not None:
+                experiment = scope.runtime._sandbox_lifecycle.filesystem.get(task.id)
+                if experiment is not None:
+                    return await experiment.verify(task, node)
                 return await evaluate(scope.runtime, scope,
                                       lambda: self._evaluation(node, workspace, task))
             return await self._evaluation(node, workspace, task)
         if node.type is NodeType.APPROVAL:
+            from Sprout.tools.context_keys import _current_project_node
+
+            scope = _current_project_node()
+            if scope is not None and task.id in scope.runtime._sandbox_lifecycle.filesystem:
+                return await scope.runtime._sandbox_lifecycle.filesystem[task.id].review(task, node)
             return await self._approval(workspace, task)
         if node.type is NodeType.APPLY:
+            if task.metadata.get("filesystem_experiment"):
+                from Sprout.execution.filesystem_review import apply_gate, verification_status
+
+                review = await self._metadata.get_execution_node(f"{task.id}:approval")
+                evidence = None
+                if (review is not None and review.task_id == task.id
+                        and review.type is NodeType.APPROVAL
+                        and (review.id in node.dependencies
+                             or f"{task.id}:evaluation" in node.dependencies)
+                        and review.status is NodeStatus.COMPLETED
+                        and review.metadata.get("execution_guard", {}).get("state") == "completed"):
+                    evidence = (review.metadata.get("output") or {}).get("filesystem_review")
+                verification = "not_run"
+                evaluation_id = f"{task.id}:evaluation"
+                if evidence and evaluation_id in node.dependencies:
+                    evaluated = await self._metadata.get_execution_node(evaluation_id)
+                    verification = verification_status(evaluated, evidence, task.id, workspace.id)
+                if verification == "passed":
+                    from Sprout.execution.filesystem_apply import execute
+                    from Sprout.execution.filesystem_review import checked_changes
+                    from Sprout.tools.context_keys import _current_project_node
+
+                    scope = _current_project_node()
+                    experiment = (scope.runtime._sandbox_lifecycle.filesystem.get(task.id)
+                                  if scope else None)
+                    payload = checked_changes(evidence, task.id, workspace.id)
+                    if experiment is not None and payload["changes"] and not payload["conflicts"]:
+                        return await execute(experiment, evidence, payload)
+                return apply_gate(evidence, task.id, workspace.id,
+                                  verification_status=verification)
             return await self._apply(workspace, task)
         return None
 
@@ -522,13 +589,27 @@ class NodeExecutor:
                 else list(available_tools.values())
             )
         resources = self._resources(self._output_for(nodes, NodeType.READ), workspace)
-        sandbox_tools, resources = self._model_access(task, sandbox_ref, sandbox_tools, resources)
-        if (self._isolated_coding_required and sandbox_ref is not None
+        from Sprout.tools.context_keys import _current_project_node
+
+        live_scope = _current_project_node()
+        experiment = (live_scope.runtime._sandbox_lifecycle.filesystem.get(task.id)
+                      if live_scope is not None else None)
+        if experiment is None:
+            sandbox_tools, resources = self._model_access(
+                task, sandbox_ref, sandbox_tools, resources)
+        else:
+            if sandbox_ref != experiment.sandbox.ref:
+                raise PermissionError("filesystem_experiment_sandbox_mismatch")
+            resources = tuple(item for item in resources if item["path"] in experiment.reads)
+        if (experiment is None and self._isolated_coding_required and sandbox_ref is not None
                 and callable(getattr(getattr(self, "_coding_commands", None), "execute", None))):
             allowed = set(node.metadata.get("tool_names") or ())
             if not allowed or "isolated_coding_command" in allowed:
                 sandbox_tools.append(IsolatedCodingCommandTool(
                     self._coding_commands, task=task, node=node, sandbox=sandbox_ref))
+        if experiment is not None and experiment.image:
+            sandbox_tools.append(IsolatedCodingCommandTool(
+                experiment, task=task, node=node, sandbox=sandbox_ref, filesystem_root_only=True))
         feedback = self._previous_evaluation_feedback(node, nodes)
         node_skills = {}
         allowed = set(node.metadata.get("tool_names") or ())
@@ -547,6 +628,13 @@ class NodeExecutor:
             if isinstance(plan_output, dict)
             else ""
         )
+        if experiment is not None:
+            plan = ("Filesystem experiment. Use sandbox_write_file or sandbox_edit_file. "
+                    "Write only these exact sandbox-relative paths: "
+                    + json.dumps(task.metadata["cli_write_paths"], ensure_ascii=False))
+            if experiment.image:
+                plan += (" When the change can be checked by a bounded local command, "
+                         "use isolated_coding_command once after editing.")
         findings = self._subtask_findings(nodes)
         design = self._output_for(nodes, NodeType.TEST_DESIGN)
         if isinstance(design, dict):
@@ -706,7 +794,8 @@ class NodeExecutor:
             measured = await session.verify(acceptance_spec=spec.to_payload(),
                                             regression_spec=None, phase="baseline")
             result = {**measured, "isolated_design": True, "acceptance_spec": spec.to_payload(),
-                      "acceptance_fingerprint": fingerprint, "baseline": measured.get("results", []),
+                      "acceptance_fingerprint": fingerprint,
+                      "baseline": measured.get("results", []),
                       "baseline_failed": measured.get("status") == "failed"}
             if scope is not None:
                 scope.isolated_design_result = result
@@ -991,6 +1080,10 @@ class NodeExecutor:
         scope = _current_project_node()
         if scope is not None:
             _, workspace = await scope.runtime._project_analysis_subject(scope)
+        if scope is not None:
+            experiment = scope.runtime._sandbox_lifecycle.filesystem.get(scope.task.id)
+            if experiment is not None:
+                return await experiment.allocate(scope)
         if workspace.kind is not WorkspaceKind.GIT_REPOSITORY:
             return {
                 "status": "not_applicable",

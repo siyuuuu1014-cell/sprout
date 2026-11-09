@@ -183,8 +183,26 @@ def write_intent_disposition(text: str) -> WriteIntentDisposition:
         return WriteIntentDisposition.KNOWN_NONWRITE
     if question:
         return WriteIntentDisposition.UNKNOWN
+    # A bounded action/object grammar, after narration/negation/question guards.
+    # "生成测试方案" or "解释如何生成测试" is not a request to write test code.
+    if re.fullmatch(
+        r"(?:(?:为|给)[^，。！？;\n]{1,100}?)?\s*(?:生成|编写|添加|创建|补写)\s*"
+        r"(?:一(?:个|些|组|份))?(?:单元测试|测试代码|测试文件|测试用例|测试)", body,
+    ):
+        return WriteIntentDisposition.EXPLICIT_WRITE
     if re.match(r"^(?:请)?帮我|^请", lowered) and any(
         keyword in lowered for keyword in TASK_KEYWORDS
+    ):
+        return WriteIntentDisposition.EXPLICIT_WRITE
+    # A bounded imperative with an artifact object. Bare document nouns
+    # require a creation verb; arbitrary filenames must look like paths.
+    if re.fullmatch(
+        r"(?:那(?:你)?)?(?:请(?:帮我)?|帮我)?\s*"
+        r"(?:(?:为|给)(?:当前|这个|当前这个|该|本)?项目\s*)?"
+        r"(?:补齐|创建|生成|增加|添加|编写|补写)\s*"
+        r"(?:一(?:份|个)\s*[a-z][a-z0-9_-]*|(?:一(?:份|个))?\s*"
+        r"(?:[\w/-]+(?:\.[\w-]+)+|测试文件|测试代码|配置文件|文档))",
+        body,
     ):
         return WriteIntentDisposition.EXPLICIT_WRITE
     # Require an imperative, not an arbitrary keyword buried in narration.
@@ -247,7 +265,7 @@ def clarification_answer(text: str) -> str | None:
     choices = {
         "read": {"只分析", "仅分析", "只检查", "只检查bug", "检查bug", "提出优化建议",
                  "只给建议", "analyze only", "analyse only", "inspect only", "read only"},
-        "write": {"直接修改", "修改代码", "直接修改代码", "直接修复", "modify the code",
+        "write": {"直接改", "直接修改", "修改代码", "直接修改代码", "直接修复", "modify the code",
                   "modify directly", "fix it", "make changes"},
         "cancel": {"先别做了", "取消", "不做了", "cancel", "stop", "never mind"},
         "chat": {"我只是问问", "只是问问", "just asking"},

@@ -314,6 +314,16 @@ class ToolExecutor:
                 matched_rules=(*decision.matched_rules, "capability:workspace_query:unavailable"),
             )
 
+        from Sprout.security.local_diagnostics import (
+            DiagnosticApprovals,
+            report,
+            scoped_file_tool,
+            scoped_tool_approval,
+            tool_refusal,
+        )
+
+        diagnostic_runtime = (self.approvals.diagnostics.runtime
+                              if isinstance(self.approvals, DiagnosticApprovals) else None)
         await self._audit(name, task_id, source, decision.decision.value, decision.reason)
 
         if decision.decision not in {AccessDecision.ALLOW, AccessDecision.REQUIRE_APPROVAL}:
@@ -323,9 +333,15 @@ class ToolExecutor:
                                          "binding" if binding_rejected else
                                          "mcp_unclassified" if unclassified_mcp else "policy"),
             })
+            report(diagnostic_runtime, "Tool", f"{name}: DENIED")
             if retired or unclassified_mcp or unavailable or binding_rejected:
                 return ToolResult.denied(decision.reason)
             return ToolResult.denied(f"Tool {name} is denied by the security policy")
+
+        refusal = await tool_refusal(self.approvals, tool, scope)
+        if refusal:
+            report(diagnostic_runtime, "Tool", f"{name}: DENIED")
+            return ToolResult.denied(refusal)
 
         from Sprout.security.approval import _CAPABILITY_TURN
         from Sprout.security.commands import permits_cli_task_reuse
@@ -343,7 +359,8 @@ class ToolExecutor:
             candidate = tool._approval_binding(
                 arguments, turn.id, session_id, "cli", requested_by, turn.resource_scope,
             )
-            if candidate is not None and candidate[1] == str(turn.root) and not arguments.get("env"):
+            if (candidate is not None and candidate[1] == str(turn.root)
+                    and not arguments.get("env")):
                 capability_binding = candidate
                 task_id, source, resource_scope = turn.id, "cli", turn.resource_scope
 
@@ -380,14 +397,18 @@ class ToolExecutor:
                     revalidate = check_capability
             from Sprout.execution.coding_command_tool import IsolatedCodingCommandTool
             from Sprout.execution.coding_commands import PlanBoundCodingCommands
+            from Sprout.runtime.filesystem_experiment import FilesystemExperiment
             from Sprout.security.approval import ApprovalStatus
 
             if (type(tool) is IsolatedCodingCommandTool
-                    and type(tool._handler) is PlanBoundCodingCommands):
+                    and type(tool._handler) in {PlanBoundCodingCommands, FilesystemExperiment}):
                 try:
-                    grant = await tool._handler.approval(
-                        self.approvals, task=tool._task, node=tool._node,
-                    )
+                    from Sprout.security.local_diagnostics import coding_approval
+
+                    with coding_approval(self.approvals, tool, scope):
+                        grant = await tool._handler.approval(
+                            self.approvals, task=tool._task, node=tool._node,
+                        )
                 except (PermissionError, ValueError) as exc:
                     return ToolResult.denied(str(exc))
                 if grant.status is ApprovalStatus.PENDING:
@@ -395,6 +416,13 @@ class ToolExecutor:
                 if grant.status is not ApprovalStatus.APPROVED:
                     return ToolResult.denied("Coding task capability rejected or unavailable")
                 approval_granted = True
+            if not approval_granted:
+                try:
+                    approval_granted = await scoped_tool_approval(
+                        self.approvals, tool, scope, subject, approval_arguments,
+                    )
+                except PermissionError as exc:
+                    return ToolResult.denied(str(exc))
             if not approval_granted:
                 approval_granted = await self.approvals.is_approved(
                     name,
@@ -419,7 +447,21 @@ class ToolExecutor:
                 if (capability_binding is not None and record.expires_at is not None
                         and permits_cli_task_reuse(capability_binding[0])):
                     turn.offer(record.id, capability_binding)
-                return ToolResult.needs_approval(record.id)
+                experiment = (scope.runtime._sandbox_lifecycle.filesystem.get(task_id)
+                              if scope is not None and generic_binding else None)
+                if experiment is None or not scoped_file_tool(tool):
+                    return ToolResult.needs_approval(record.id)
+                approved = await experiment.confirm_tool(record)
+                await experiment._subject(scope.task, scope.node)
+                await self.approvals.decide(
+                    record.id, approved, principal=subject.actor, decided_by=requested_by,
+                    channel="cli")
+                if not approved or not await self.approvals.is_approved(
+                    name, approval_arguments, task_id=task_id, session_id=session_id,
+                    requested_by=requested_by, source=source, resource_scope=resource_scope,
+                ):
+                    return ToolResult.denied("Filesystem tool approval refused or unavailable")
+                approval_granted = True
 
         try:
             contextual = self._with_context(
@@ -461,6 +503,7 @@ class ToolExecutor:
                 # Preserve the negative marker unless an exact admitted READ
                 # is proven below. Exceptions leave the marker set.
                 scope.untracked_tool_use = True
+            report(diagnostic_runtime, "Tool", f"{name}: started")
             with handoff:
                 result = await tool.invoke(contextual)
                 tracked_sandbox = (generic_binding and await scope.runtime._track_sandbox_result(
@@ -479,12 +522,15 @@ class ToolExecutor:
                     "content_sha256": sha256(result.content.encode()).hexdigest(),
                 })
         except ToolExecutionUnconfirmed:
+            report(diagnostic_runtime, "Tool", f"{name}: unconfirmed")
             await self._publish(TOOL_EXECUTED, {"tool": name, "ok": False,
                                                 "execution_unconfirmed": True})
             raise
         except Exception as exc:  # noqa: BLE001 - tool errors must not break the loop
+            report(diagnostic_runtime, "Tool", f"{name}: failed")
             await self._publish(TOOL_EXECUTED, {"tool": name, "ok": False})
             return ToolResult.failure(f"{type(exc).__name__}: {exc}")
+        report(diagnostic_runtime, "Tool", f"{name}: {'success' if result.ok else 'failed'}")
         await self._publish(TOOL_EXECUTED, {"tool": name, "ok": result.ok})
         return result
 

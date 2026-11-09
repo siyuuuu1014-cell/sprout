@@ -1062,6 +1062,12 @@ class ProcessBroker:
             except (OSError, ValueError):
                 return ProcessResult(command=command_tuple, allowed=False, started=False,
                                      error="Frozen execution authority changed before approval")
+        from Sprout.security.local_diagnostics import process_refused
+
+        if (decision.decision in {AccessDecision.ALLOW, AccessDecision.REQUIRE_APPROVAL}
+                and process_refused(self._approvals, task_id, command_tuple)):
+            return ProcessResult(command=command_tuple, allowed=False, started=False,
+                error="Diagnostic mode requires the guarded Coding container route")
         if decision.decision is not AccessDecision.ALLOW:
             # Only the exact plain CLI execution shape can consume a CLI grant;
             # extra secret injection, alternate scope/actor or preflight cannot.

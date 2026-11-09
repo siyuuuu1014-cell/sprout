@@ -216,7 +216,18 @@ def chat(
             )
         )
         raise typer.Exit(code=2)
-    runtime = create_runtime(settings)
+    from Sprout.security.local_diagnostics import prepare
+
+    diagnostics = prepare(settings, message=message, session=session)
+    if diagnostics is not None:
+        settings = diagnostics.settings
+        typer.echo(ui.warning(
+            "LOCAL DIAGNOSTIC: 免人工审批；受控工作区操作与可信隔离 Coding；未隔离宿主命令拒绝。"
+        ))
+        typer.echo(ui.warning(f"独立诊断数据目录：{diagnostics.root}"))
+        runtime = create_runtime(settings, local_diagnostics=diagnostics)
+    else:
+        runtime = create_runtime(settings)
 
     asyncio.run(_chat(runtime, settings, message=message, session=session, user=user))
 
@@ -261,8 +272,17 @@ async def _chat(runtime, settings, *, message: str | None, session: str | None, 
         attach_evolution(runtime, settings)
 
     try:
-        async with managed(runtime):
+        from Sprout.security.local_diagnostics import current, foreground
+
+        async with managed(runtime), foreground(runtime):
             session, workspace_id = await _prepare_cli_context(runtime, session, user)
+            diagnostics = current(runtime)
+            if diagnostics is not None:
+                await diagnostics.bind(runtime, session, current_cli_principal())
+                diagnostics.progress = typer.echo
+                workspace = await runtime.get_workspace(workspace_id) if workspace_id else None
+                if workspace is not None:
+                    typer.echo(f"[Workspace] {workspace.root}")
             gateway = CLIGateway(runtime)
             if message is not None:
                 if _handle_natural_language_request(message):
@@ -403,7 +423,12 @@ async def _provide_cli_analysis_task(runtime, workspace_id, *, message, session,
                 raise PermissionError("analysis_file_selection_invalid")
         typer.echo(_L("本次分析请求：", "Analysis request: ") + message.content)
         typer.echo(_L("只读取所选文件：", "Selected files only: ") + "\n" + "\n".join(paths))
-        confirmed = await questionary.confirm(_L(
+        from Sprout.security.local_diagnostics import current
+
+        diagnostics = current(runtime)
+        if diagnostics is not None:
+            await diagnostics.require()
+        confirmed = diagnostics is not None or await questionary.confirm(_L(
             "确认请求分析以上文件？", "Confirm analysis of these files?",
         ), default=False).ask_async()
         if not confirmed:
@@ -477,7 +502,12 @@ async def _provide_cli_directory_task(
             runtime, workspace, session, principal, target)
         target = Path(arguments['path'])
         typer.echo(_L("自动分析授权范围：", "Automatic analysis scope: ") + str(target))
-        if reusable is None and not await questionary.confirm(_L(
+        from Sprout.security.local_diagnostics import current
+
+        diagnostics = current(runtime)
+        if diagnostics is not None:
+            await diagnostics.require()
+        if reusable is None and diagnostics is None and not await questionary.confirm(_L(
                 "授权列举此目录及子目录，并只读分析 Policy 允许的项目文件？",
                 "Authorize directory/subdirectory listing and analysis of policy-allowed files?"),
                 default=False).ask_async():
@@ -567,6 +597,13 @@ async def _repl(
         if _handle_natural_language_request(content):
             continue
         if content.startswith("/"):
+            from Sprout.security.local_diagnostics import current
+
+            if current(runtime) is not None and content.split()[0] not in {
+                "/", "/help", "/language", "/clear", "/q", "/quit", "/exit", "/permissions",
+            }:
+                typer.echo(ui.warning("Diagnostic mode refuses operational slash commands"))
+                continue
             if content == "/permissions":
                 from Sprout.cli.commands.security import session_permission_inventory
 
@@ -704,6 +741,12 @@ async def _repl(
                 typer.echo(ui.key_value("task", task.id))
                 typer.echo(ui.key_value("status", task.status.value))
                 typer.echo(ui.key_value("instruction", task.instruction[:80]))
+                if task.metadata.get("filesystem_experiment"):
+                    review = await runtime.filesystem_review(
+                        task.id, session, current_cli_principal())
+                    if review is not None:
+                        _render_cli_markdown(review)
+                    continue
                 await _approve_task_gates(runtime, task, user)
                 continue
             if content == "/web":
@@ -762,6 +805,11 @@ async def _repl(
         reply_metadata: dict = {}
         response_error: str | None = None
         console = Console(theme=_CLI_MARKDOWN_THEME)
+        from Sprout.security.local_diagnostics import current
+
+        diagnostics = current(runtime)
+        if diagnostics is not None:
+            diagnostics.progress = lambda line, output=console: output.print(line, markup=False)
         try:
             principal = current_cli_principal()
         except ValueError:
@@ -1499,7 +1547,8 @@ def _print_approval_record(
 ) -> None:
     typer.echo("")
     typer.echo(ui.text(_approval_text("title"), bold=True))
-    scope = ("task_scope" if task_offer else "similar_scope" if getattr(record, "approval_class", "")
+    scope = ("task_scope" if task_offer else
+             "similar_scope" if getattr(record, "approval_class", "")
              and getattr(record, "session_id", "") else "exact_scope")
     rows = _approval_detail_rows(record)
     rows.extend(
@@ -1579,11 +1628,23 @@ def _approval_text(key: str, **values: object) -> str:
 _APPROVAL_TEXT: dict[str, dict[str, str]] = {
     "task_scope": {
         "zh": "仅本次调用，或允许当前任务在同一目录使用该程序。任务授权有期限。",
-        "en": "Approve this invocation or allow this executable in the same directory for this task.",
+        "en": (
+            'Approve this invocation or allow this executable in the same '
+            'directory for this task.'
+        ),
     },
     "yes_task": {
-        "zh": "本任务内允许 {executable} 在 {root} 使用其他参数。程序可间接修改文件或运行 Git，此授权不提供操作系统隔离。Git 仅限版本和执行路径查询。",
-        "en": "Allow other arguments for {executable} in {root} for this task. Programs can modify files or run Git indirectly. This consent provides no OS isolation. Git covers version and exec-path queries only.",
+        "zh": (
+            "本任务内允许 {executable} 在 {root} 使用其他参数。"
+            "程序可间接修改文件或运行 Git，此授权不提供操作系统隔离。"
+            "Git 仅限版本和执行路径查询。"
+        ),
+        "en": (
+            'Allow other arguments for {executable} in {root} for this task. '
+            'Programs can modify files or run Git indirectly. This consent '
+            'provides no OS isolation. Git covers version and exec-path '
+            'queries only.'
+        ),
     },
     "action": {
         "zh": "将执行",

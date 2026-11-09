@@ -27,6 +27,20 @@ class SandboxLifecycleService:
 
     def __init__(self, metadata: MetadataStore | None) -> None:
         self._metadata = metadata
+        self.filesystem = {}
+
+    def close_filesystem(self, task_id):
+        experiment = self.filesystem.get(task_id)
+        if experiment is not None:
+            experiment.sandbox.close()
+            del self.filesystem[task_id]
+
+    def close_filesystem_all(self):
+        for task_id in tuple(self.filesystem):
+            try:
+                self.close_filesystem(task_id)
+            except (OSError, ValueError):
+                logger.exception("Filesystem sandbox cleanup refused for task %s", task_id)
 
     async def finalize(self, task: Task, result: TaskResult) -> None:
         """Clean terminal task sandboxes.
@@ -35,6 +49,9 @@ class SandboxLifecycleService:
         still need the branch and its pending diff.
         """
         if isolated_replay_task(task) or result.status not in _TERMINAL_TASK_STATUSES:
+            return
+        if task.id in self.filesystem:
+            self.close_filesystem(task.id)
             return
         refs = await self._proposal_refs(task.id)
         if not refs:

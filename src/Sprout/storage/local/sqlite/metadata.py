@@ -216,6 +216,11 @@ class SqliteMetadataStore:
 
         return await claim(self._db, record, snapshot)
 
+    async def reconcile_filesystem_apply(self) -> int:
+        from Sprout.storage.local.sqlite.apply_transaction import reconcile_filesystem
+
+        return await reconcile_filesystem(self._db)
+
     async def get_apply_transaction(self, identifier):
         from Sprout.storage.local.sqlite.apply_transaction import observe
 

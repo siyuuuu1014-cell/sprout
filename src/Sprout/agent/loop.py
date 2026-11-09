@@ -155,6 +155,11 @@ class AgentLoop:
             messages.extend(tool_messages)
             if tool_summary.get("workspace_requested"):
                 return AgentResult(content="", metadata={"workspace_requested": True})
+            blocked = _blocked_tool_result(
+                tool_messages, tool_summary, response_language,
+                steps=steps, model_calls=model_calls, tool_calls=tool_calls)
+            if blocked is not None and not approval_ids:
+                return blocked
             if approval_ids:
                 return AgentResult(
                     content=(
@@ -245,6 +250,11 @@ class AgentLoop:
             messages.extend(tool_messages)
             if tool_summary.get("workspace_requested"):
                 return AgentResult(content="", metadata={"workspace_requested": True})
+            blocked = _blocked_tool_result(
+                tool_messages, tool_summary, response_language,
+                steps=steps, model_calls=model_calls, tool_calls=tool_calls)
+            if blocked is not None and not approval_ids:
+                return blocked
             if approval_ids:
                 return AgentResult(
                     content=(
@@ -394,6 +404,12 @@ class AgentLoop:
                 if tool_summary.get("workspace_requested"):
                     yield AgentResult(content="", metadata={"workspace_requested": True})
                     return
+                blocked = _blocked_tool_result(
+                    tool_messages, tool_summary, response_language,
+                    steps=steps, model_calls=model_calls, tool_calls=tool_calls)
+                if blocked is not None and not approval_ids:
+                    yield blocked if include_result else blocked.content
+                    return
                 if approval_ids:
                     yield AgentResult(
                         content="",
@@ -449,6 +465,12 @@ class AgentLoop:
             messages.extend(tool_messages)
             if tool_summary.get("workspace_requested"):
                 yield AgentResult(content="", metadata={"workspace_requested": True})
+                return
+            blocked = _blocked_tool_result(
+                tool_messages, tool_summary, response_language,
+                steps=steps, model_calls=model_calls, tool_calls=tool_calls)
+            if blocked is not None and not approval_ids:
+                yield blocked if include_result else blocked.content
                 return
             if approval_ids:
                 yield AgentResult(
@@ -536,6 +558,11 @@ class AgentLoop:
             outcome.result.approval_id for outcome in outcomes if outcome.requires_approval
         ))
         for outcome in outcomes:
+            error = outcome.result.error or ""
+            if (error.startswith("Diagnostic mode refuses")
+                    or error == "native_project_probe_unavailable"
+                    or error.endswith("is denied by the security policy")):
+                summary["execution_blocked"] = True
             if outcome.result.workspace_request:
                 summary["workspace_requested"] = True
             if outcome.result.ok:
@@ -553,6 +580,20 @@ class AgentLoop:
                 )
             )
         return messages, tool_calls, approval_ids, summary
+
+
+def _blocked_tool_result(messages, summary, language, **metrics):
+    if not summary.get("execution_blocked"):
+        return None
+    header = (
+        "已停止后续工具尝试。以下是本轮工具返回的限制，"
+        "不表示先前的项目分析数据不存在：" if language in {"中文", "繁體中文"} else
+        "Stopped further tool attempts after an execution restriction. "
+        "This does not invalidate earlier project analysis. Tool results:"
+    )
+    details = "\n\n".join(f"[{item.name}] {item.content}" for item in messages[-3:])
+    return AgentResult(header + "\n\n" + details,
+                       metadata={"execution_blocked": True, "tool_summary": summary, **metrics})
 
 
 def _budget_int(budget: object, key: str, default: int) -> int:
