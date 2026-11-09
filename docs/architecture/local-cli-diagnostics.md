@@ -264,3 +264,150 @@ Task to completed, while file hashes and modification times stayed identical.
 A new write start was refused. The targeted suite recorded 151 passed and
 one Windows symlink skip. The final ledger-only suite including explicit
 UNKNOWN coverage recorded 12 passed.
+
+## G4 automatic foreground preparation — 2026-11-09
+
+Current development base: `bbf109984aa23b226bc4865f80019bef13ee5069`.
+The earlier manual READ/WRITE preparation instructions describe the historical
+G1–G3 flow. Foreground non-Git CODE now performs Docker preflight, obtains a fresh
+publication from the existing controlled project analyzer, and plans file inputs
+and outputs without asking for READ paths, WRITE paths or an image string.
+Diagnostic mode also skips the preparation confirmation; normal mode retains
+explicit directory, plan, tool and Apply confirmations. Workspace selection,
+Policy, private-resource rejection, file snapshots, independent Verification and
+FileBroker conditional Apply remain in force. Git CODE preparation is unchanged.
+
+### Implemented scope
+
+- Small authorized Python projects (at most 64 captured inputs): derive module
+  and test filenames from the real analysis inventory. Existing matching test
+  files are updated; missing test files become creation candidates. Explicit
+  file requests and README creation also have deterministic planning rules.
+  Ambiguous, private, escaping or unresolved selections fail rather than grant
+  authority. `filesystem_plan_v1` in Task metadata is planning data, not a
+  credential; Sandbox capture reopens and validates inputs before execution.
+- Inspect the actual Docker engine through ProcessBroker before creating the
+  Coding Task. Prefer `SPROUT_FILESYSTEM_CODING_IMAGE` when pinned; otherwise
+  inspect locally cached images bearing the existing isolated-coding role/schema
+  labels and pin the selected image ID. Missing engines or compatible images
+  return an early preparation error. Exact Host Docker inspections have their
+  own short-lived approval records; no general host-command grant is installed.
+- Existing CodingNodeSession and DockerCodingBackend still launch and settle
+  real commands, import artifacts, and run independent Verification in separate
+  containers. No execution or cleanup framework was replaced.
+- Diagnostic `/status [task-id-prefix]` is read-only and limited to the owning
+  Session and Workspace. It lists persisted node/Verification/Apply results and
+  Coding execution settlement. It does not approve, resume, reconcile or retry.
+  `live_container_state: NOT_QUERIED` means no live Docker state was queried;
+  a persisted completed execution is not presented as a running-container probe.
+
+### Actual Windows acceptance
+
+Real production CLI, DeepSeek `deepseek/deepseek-flash`, `D:/sprout-model-test`,
+fresh diagnostic SQLite data, no file-path or image input:
+
+- Session `6ca2ec3d-b218-4052-9a51-eb8e54888eb6`.
+- Engine available; local image automatically selected without setting the
+  image environment variable:
+  `sha256:11880faa03b5dda1f3f54a915ad1b0e3d2a97664799d7a9bfcd3790a9dc7a31d`.
+- Initial test-generation Task `0f90d0dd-c41a-443b-a3c4-6579ab7e434f`
+  ran Coding and found no content changes. Completed as `no_changes`;
+  independent Verification was correctly `NOT_RUN` for that empty ChangeSet.
+- Follow-up request explicitly added `test_add_complex_g4` to existing tests.
+  Task `6548d9ff-ffe2-4937-ac62-b0bb689f23a5` selected `app.py, test_app.py`
+  for reads and `test_app.py` for update. DeepSeek edited the Sandbox; one real
+  Coding container and three separate acceptance/regression/demo containers
+  exited 0. Independent outputs were `5`, `"Hello, Ada!"`, `5`.
+- ChangeSet `e4b19c40511e074feabba3efe1103be3a12574aa5fb65cd80e636a158a57dc2b`;
+  exact diagnostic Apply transaction `504b55bc-53e5-579f-a1a0-1f01bb0410d5`
+  settled `COMPLETED`, file `WRITTEN`, all six guarded nodes and Task completed.
+  `test_app.py` changed from
+  `115e5ff758b3612fb2385446f6b451f48b7f8eadc50fd49420199fcf2b5cc380` to
+  `53508121f845294d91165fc82dfaa55dc92937a67d23b72016ed7befc25ca1f5`.
+  Unchanged `app.py` SHA-256:
+  `49b4d3d54ef214ece6873eb97e3334cc79702d04d0d1d508f7f0555b8d0c3bbd`.
+  SQLite was inspected read-only after CLI exit; Sandbox no longer existed.
+- A subsequent real CLI Session verified `/status 816f6542` against its own
+  completed Task after fixing list-valued node outputs. No approval or execution
+  was triggered by the query. The persisted-Coding projection was added afterward
+  and covered by deterministic query tests.
+
+Development failures were retained as evidence: the first new test collection
+failed because the preparation module did not yet exist. Initial real acceptance
+exposed missing dispatch keyword arguments; a real-Runtime dispatch regression
+now covers that call. `/status` initially crashed on list-valued READ output;
+its regression now covers that representation. An incorrectly named regression
+file caused one no-tests-run invocation and was corrected; it is not a PASS.
+
+### Validation and remaining work
+
+Final affected regression set: **265 passed, 1 skipped** (64.12 seconds), including
+explicitly enabled Windows native Git CODE tests. JUnit:
+`.pytest_cache/g4-final.xml` (local artifact, not committed). The single skip was
+Windows symlink creation unavailable. Ruff subsequently passed all four changed
+Python files after a test-only line wrap; `git diff --check` passed.
+Full CI, Linux and hosted CI: **NOT_RUN**. New normal-mode interactive end-to-end
+acceptance was not repeated; existing approval/Apply regressions passed.
+
+G4 is **partial**, not general environment provisioning: automatic remote image
+pull/build and arbitrary-language dependency resolution are not implemented.
+There is no existing trusted registry/pull profile in Settings; missing images
+fail early rather than downloading an unknown image or bypassing Broker/network
+policy. A compatible local image must already contain required dependencies.
+Larger/ambiguous projects still require a separate bounded planner extension.
+Independent acceptance/regression specifications must still be frozen by Host
+using `SPROUT_FILESYSTEM_VERIFICATION_SPEC` before Coding; model-written tests
+never become an independent oracle. The acceptance above used the preconfigured
+Host add/greet specifications. No general automatic trusted-spec generator is
+claimed. Foreground `/status` is entered between turns, not concurrently with a
+blocking foreground turn. Background Worker recovery remains outside this change.
+
+Rollback: reverse only the G4 working-tree diff (including the two new modules)
+after review; do not reset the branch or discard earlier committed G1–G3 results.
+No Git commit, push, merge or deployment was performed for G4.
+
+### G4 planner correction — pre-commit review follow-up
+
+The pre-commit review reproduced a real planning defect: `修改 app.py 中的函数，
+并运行测试` selected only `test_app.py` for writing. The previous test-word check
+conflated source modification, test generation/extension and test execution.
+
+`plan_files` now reuses the existing nonwrite/negation disposition and plans
+clause-level effects separately. Explicit modification targets remain write
+targets; generating/extending tests adds the corresponding test targets.
+Running tests alone does not add any write path. A missing explicit source or
+existing-test reference raises `filesystem_planning_file_unavailable` rather than
+falling back to unrelated files; explicit creation can still plan a new file.
+Unique basename resolution is permitted, ambiguous basenames are rejected.
+
+The plan retains `reads` and `writes` and adds ordinary `actions` and `execution`
+data. The CLI displays requested execution separately and saves those fields
+inside the existing `filesystem_plan_v1` Task metadata. These are planning hints,
+not execution evidence or authorization; no executor, Verification, Apply,
+Policy/Scope, Git CODE or persistent database schema was changed. In particular,
+`execution: [run_tests]` means tests were requested, not that they passed.
+
+Representative actual plan assertions:
+
+| Request | WRITE | Execution |
+|---|---|---|
+| 修改 app.py 中的函数，并运行测试 | app.py | run_tests |
+| 修改 app.py 并补充对应测试 | app.py, test_app.py | none requested |
+| 为 app.py 生成单元测试 | test_app.py | none requested |
+| 补充现有 test_app.py 的覆盖率 | test_app.py | none requested |
+| 只运行当前项目测试 | empty | run_tests |
+| 修改 app.py 和 utils.py 并运行测试 | app.py, utils.py | run_tests |
+| 只讨论如何编写测试 | empty | none requested |
+
+TDD evidence: 15 new parametrized checks failed against the old planner after
+correcting a pytest reserved parameter name in the test setup. The complete
+G4 preparation module now has **31 passing tests**, including real Runtime
+analysis dispatch and CLI plan persistence/display checks. The full directly
+related set passed **281 tests, 1 skipped** in 63.36 seconds, with native Windows
+Git CODE integration enabled; JUnit `.pytest_cache/g4-actions-final.xml`.
+The skip is Windows symlink creation unavailable. Four G4 Python files passed
+Ruff and `git diff --check` passed. The earlier 265/1 result remains historical,
+not a second result added to this run. Real DeepSeek/Docker CLI acceptance and
+full CI were **NOT_RUN** during this planner-only correction; the earlier real
+G4 evidence remains recorded above, without claiming it exercised this fix.
+All five cumulative G4 files remain uncommitted; no commit/push/merge was done.

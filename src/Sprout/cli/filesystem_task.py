@@ -11,10 +11,9 @@ from pathlib import Path
 import questionary
 import typer
 
-from Sprout.execution.docker_verification import safe_path, validate_image
+from Sprout.execution.docker_verification import safe_path
 from Sprout.orchestration.terminal import LocalOrchestratorBackend
 from Sprout.runtime.filesystem_experiment import FilesystemExperiment
-from Sprout.sandbox.filesystem import checked_label
 from Sprout.strategy.acceptance import AcceptanceSpec
 from Sprout.task.models import DelegationScope, TaskExecutionMode
 
@@ -25,21 +24,19 @@ async def prepare_filesystem(runtime, workspace, message, owned, principal):
             or runtime.session_workspace_id(owned) != workspace.id):
         raise PermissionError("filesystem_experiment_local_foreground_required")
     try:
-        reads = await questionary.text("Experiment READ files (comma-separated relative paths):"
-                                       ).ask_async()
-        writes = await questionary.text("Experiment WRITE files (comma-separated relative paths):"
-                                        ).ask_async()
-        if not reads or not writes:
-            return None
-        overrides = runtime._file_broker._classify_overrides
-        reads, writes = (tuple(dict.fromkeys(checked_label(
-            item.strip(), workspace.root, overrides) for item in value.split(",")))
-            for value in (reads, writes))
-        if max(len(reads), len(writes)) > 64:
-            raise ValueError("At most 64 explicit inputs and outputs are supported")
-        image = os.getenv("SPROUT_FILESYSTEM_CODING_IMAGE", "").strip()
-        if image:
-            validate_image(image)
+        from Sprout.cli.filesystem_preparation import discover_plan, preflight
+        from Sprout.security.local_diagnostics import current
+
+        image = await preflight(runtime, workspace, owned, principal)
+        plan = await discover_plan(runtime, workspace, message, owned, principal)
+        reads, writes = plan["reads"], plan["writes"]
+        typer.echo("[Planning] read: " + ", ".join(reads))
+        operations = [{"path": path, "operation": "update" if path in reads else "create"}
+                      for path in writes]
+        for operation in operations:
+            typer.echo(f"[Planning] {operation['operation']}: {operation['path']}")
+        for execution in plan.get("execution", ()):
+            typer.echo(f"[Planning] execute: {execution}")
         frozen = None
         raw_spec = os.getenv("SPROUT_FILESYSTEM_VERIFICATION_SPEC", "")
         if raw_spec:
@@ -61,14 +58,16 @@ async def prepare_filesystem(runtime, workspace, message, owned, principal):
             "Passing verification enables exact Apply to the original workspace. "
             if frozen else ""
         )
-        if not await questionary.confirm(
-                f"Experiment only. Read {reads}; edit {writes}; "
+        if current(runtime) is None and not await questionary.confirm(
+                f"Confirm file operation plan. Read {reads}; edit {writes}; "
                 "output paths are checked in the original for conflicts; "
                 f"Docker image {image or 'not configured'}. {confirmation}Confirm?",
                 default=False).ask_async():
             return None
     except (EOFError, KeyboardInterrupt):
         return None
+    except PermissionError:
+        raise
     except (OSError, ValueError) as exc:
         raise PermissionError("filesystem_experiment_selection_invalid") from exc
 
@@ -94,7 +93,10 @@ async def prepare_filesystem(runtime, workspace, message, owned, principal):
         delegation_scope=scope, execution_mode=TaskExecutionMode.CODE,
         _filesystem_foreground=True,
         metadata={"session_id": owned.id, "filesystem_experiment": True,
-                  "cli_write_paths": list(writes)},
+                  "cli_write_paths": list(writes),
+                  "filesystem_plan_v1": {"reads": list(reads), "operations": operations,
+                      "execution": list(plan.get("execution", ())),
+                      "actions": list(plan.get("actions", ()))}},
     )
     task = replace(task, budget=replace(task.budget, max_model_calls=24))
     await runtime._metadata_or_raise().save_task(task)

@@ -601,6 +601,7 @@ async def _repl(
 
             if current(runtime) is not None and content.split()[0] not in {
                 "/", "/help", "/language", "/clear", "/q", "/quit", "/exit", "/permissions",
+                "/status",
             }:
                 typer.echo(ui.warning("Diagnostic mode refuses operational slash commands"))
                 continue
@@ -714,6 +715,16 @@ async def _repl(
                 await _continue_foreground_task(runtime, {"task_id": task.id}, user)
                 continue
             if content == "/status" or content.startswith("/status "):
+                if current(runtime) is not None:
+                    from Sprout.cli.filesystem_preparation import readonly_status
+
+                    try:
+                        typer.echo(await readonly_status(
+                            runtime, session, current_cli_principal(),
+                            content.removeprefix("/status").strip()))
+                    except (PermissionError, LookupError) as exc:
+                        typer.echo(ui.warning(str(exc)))
+                    continue
                 task_id = content.removeprefix("/status").strip()
                 if not task_id:
                     typer.echo(
