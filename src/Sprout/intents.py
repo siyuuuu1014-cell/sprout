@@ -7,6 +7,7 @@ and the event catalog. They live here once; callers derive their tables from
 
 from __future__ import annotations
 
+import json
 import re
 from enum import StrEnum
 
@@ -108,13 +109,38 @@ class WriteIntentDisposition(StrEnum):
     UNKNOWN = "unknown"
 
 
+def project_request_text(text: str) -> str:
+    """Keep literal data out of operation classification; preserve the original request."""
+    decoder = json.JSONDecoder()
+    pieces = []
+    end = 0
+    for match in re.finditer(r"[\[{]", text):
+        if match.start() < end:
+            continue
+        try:
+            value, length = decoder.raw_decode(text[match.start():])
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(value, (dict, list)):
+            pieces.extend((text[end:match.start()], " input_data "))
+            end = match.start() + length
+    pieces.append(text[end:])
+    normalized = "".join(pieces)
+    # Quoted filenames identify artifacts; quoted sentences remain quotations.
+    return re.sub(
+        r'["“‘`]([A-Za-z0-9_./\\:-]+\.[A-Za-z][\w-]*)["”’`]',
+        lambda match: match[1] if normalized[:match.start()].strip() else match[0],
+        normalized,
+    )
+
+
 def write_intent_disposition(text: str) -> WriteIntentDisposition:
     """Pure, conservative text judgment; UNKNOWN needs explicit human confirmation.
 
     No metadata, model labels or workspace signals can turn a known non-command
     into a write instruction. Unfamiliar wording is not a negative judgment.
     """
-    stripped = text.strip()
+    stripped = project_request_text(text).strip()
     if not stripped:
         return WriteIntentDisposition.KNOWN_NONWRITE
     if stripped == "/task" or stripped.startswith("/task "):
@@ -223,7 +249,9 @@ def project_clauses(text: str) -> tuple[str, ...]:
     """Separate operation clauses from list markers and dependent clauses."""
     return tuple(
         re.sub(r"^\d+[.、]\s*", "", part.strip())
-        for part in re.split(r"[。；;\n，,]|并且?(?!不)|然后|同时|最后", text)
+        for part in re.split(
+            r"[。；;\n，,]|并且?(?!不)|然后|同时|最后", project_request_text(text),
+        )
         if part.strip()
     )
 
@@ -243,15 +271,21 @@ def project_feature_edit(clause: str) -> bool:
 
 def detect_task_hint(text: str) -> bool:
     """Compatible bool fast path; UNKNOWN is not permission to create a Task."""
+    text = project_request_text(text)
     if write_intent_disposition(text) is WriteIntentDisposition.EXPLICIT_WRITE:
         return True
     if any(mark in text for mark in ('"', '“', '”', '‘', '’', chr(96), '?', '？')):
         return False
     clauses = project_clauses(text)
     feature_edit = any(project_feature_edit(c) for c in clauses)
+    leading_write = (
+        bool(clauses)
+        and write_intent_disposition(clauses[0]) is WriteIntentDisposition.EXPLICIT_WRITE
+    )
     if not clauses or any(c.startswith(("或者", "还是", "只分析", "仅分析"))
                           or (c.startswith("如果") and not (
-                              feature_edit and c in {"如果发现失败", "如果测试失败"}))
+                              (feature_edit or leading_write)
+                              and c in {"如果发现失败", "如果测试失败"}))
                           or (c.startswith("不要") and not (
                               c.startswith("不要修改其他") or (
                                   feature_edit and re.fullmatch(
@@ -262,8 +296,11 @@ def detect_task_hint(text: str) -> bool:
     first = clauses[0]
     if feature_edit or conditional_test_extension(text):
         return True
+    if first.startswith(("参考", "依据", "按照", "严格依据")):
+        return any(write_intent_disposition(c) is WriteIntentDisposition.EXPLICIT_WRITE
+                   for c in clauses[1:])
     if not first.startswith(("分析", "检查", "请分析", "请检查")):
-        return write_intent_disposition(first) is WriteIntentDisposition.EXPLICIT_WRITE
+        return leading_write
     return any(c.startswith(("补充缺失的测试", "补充测试", "生成单元测试", "修改代码",
                              "修复失败的测试"))
                and write_intent_disposition(c) is WriteIntentDisposition.EXPLICIT_WRITE

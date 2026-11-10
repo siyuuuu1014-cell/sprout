@@ -100,6 +100,11 @@ class ToolExecutor:
         except LookupError as exc:
             return ToolResult.failure(str(exc))
 
+        if set(arguments) == {"_raw"}:
+            return ToolResult.failure(
+                "Incomplete tool arguments. Retry with valid JSON and a smaller payload."
+            )
+
         if isinstance(tool, (ProjectAnalyzeTool, WorkspaceQueryTool)):
             # Policy, approval and invoke must see the same caller-independent
             # probe flag and payload, including across audit/approval awaits.
@@ -316,9 +321,10 @@ class ToolExecutor:
 
         from Sprout.security.local_diagnostics import (
             DiagnosticApprovals,
+            foreground_authorized,
+            node_authorized,
             report,
             scoped_file_tool,
-            scoped_tool_approval,
             tool_refusal,
         )
 
@@ -343,11 +349,6 @@ class ToolExecutor:
                 return ToolResult.denied(decision.reason)
             return ToolResult.denied(f"Tool {name} is denied by the security policy")
 
-        refusal = await tool_refusal(self.approvals, tool, scope)
-        if refusal:
-            report(diagnostic_runtime, "Tool", f"{name}: DENIED")
-            return ToolResult.denied(refusal)
-
         from Sprout.security.approval import _CAPABILITY_TURN
         from Sprout.security.commands import permits_cli_task_reuse
         from Sprout.tools.system_tools import CliRunTool
@@ -369,11 +370,31 @@ class ToolExecutor:
                 capability_binding = candidate
                 task_id, source, resource_scope = turn.id, "cli", turn.resource_scope
 
-        approval_granted = False
-        revalidate = None
+        async def check_foreground():
+            return await foreground_authorized(
+                self.approvals, turn, session_id, requested_by, source,
+            )
+
+        local = (scope is None and not generic_binding and not is_mcp
+                 and (type(tool) is not CliRunTool or capability_binding is not None)
+                 and await check_foreground())
+        local_node = await node_authorized(self.approvals, scope, subject)
+        refusal = "" if local or local_node else await tool_refusal(self.approvals, tool, scope)
+        if refusal:
+            report(diagnostic_runtime, "Tool", f"{name}: DENIED")
+            return ToolResult.denied(refusal)
+
+        if local and decision.decision is AccessDecision.REQUIRE_APPROVAL:
+            await self._audit(
+                name, task_id, source, "allow", "Local foreground launch authorization",
+            )
+            report(diagnostic_runtime, "Authorization", f"LOCAL-EXECUTION: {name}")
+
+        approval_granted = local
+        revalidate = check_foreground if local else None
         approval_arguments = ({"mcp_classification_v1": mcp_binding, "arguments": arguments}
                               if is_mcp else arguments)
-        if decision.decision is AccessDecision.REQUIRE_APPROVAL:
+        if decision.decision is AccessDecision.REQUIRE_APPROVAL and not local:
             if self.approvals is None:
                 await self._publish(TOOL_DENIED, {"tool": name, "reason": "no-approval-manager"})
                 return ToolResult.denied(
@@ -422,12 +443,12 @@ class ToolExecutor:
                     return ToolResult.denied("Coding task capability rejected or unavailable")
                 approval_granted = True
             if not approval_granted:
-                try:
-                    approval_granted = await scoped_tool_approval(
-                        self.approvals, tool, scope, subject, approval_arguments,
+                if local_node:
+                    approval_granted = True
+                    await self._audit(
+                        name, task_id, source, "allow", "Local node launch authorization",
                     )
-                except PermissionError as exc:
-                    return ToolResult.denied(str(exc))
+                    report(diagnostic_runtime, "Authorization", f"LOCAL-EXECUTION: {name}")
             if not approval_granted:
                 approval_granted = await self.approvals.is_approved(
                     name,

@@ -134,6 +134,7 @@ class AgentLoop:
         specs = [tool.spec for tool in context.tools.values()]
         requested_by = str(context.user.get("id", "unknown"))
         usage = Usage()
+        response = None
         steps = 0
         model_calls = 0
         tool_calls = 0
@@ -309,7 +310,11 @@ class AgentLoop:
                 "model_calls": model_calls,
                 "tool_calls": tool_calls,
                 "plan": self._last_plan,
-                "usage": {"total_tokens": usage.total_tokens},
+                "model": response.model if response is not None else None,
+                "finish_reason": response.finish_reason if response is not None else None,
+                "usage": {"prompt_tokens": usage.prompt_tokens,
+                          "completion_tokens": usage.completion_tokens,
+                          "total_tokens": usage.total_tokens},
             },
         )
 

@@ -68,8 +68,10 @@ class FilesystemExperiment:
                 id=f"{task.id}:{kind.value}", task_id=task.id, type=kind,
                 dependencies=(nodes[-1].id,) if nodes else (),
                 budget=NodeBudget(max_attempts=1),
-                metadata={"tool_names": ["sandbox_read_file", "sandbox_write_file",
-                                         "sandbox_edit_file", "isolated_coding_command"]}
+                metadata={"filesystem_test_loop": bool(task.metadata.get(
+                    "filesystem_plan_v1", {}).get("host_test")),
+                    "tool_names": ["sandbox_read_file", "sandbox_write_file",
+                                   "sandbox_edit_file", "isolated_coding_command"]}
                 if kind is NodeType.AGENT else {"filesystem_apply": True}
                 if kind is NodeType.APPLY else {},
             ))
@@ -159,7 +161,7 @@ class FilesystemExperiment:
             raise PermissionError("filesystem_review_agent_evidence_unavailable")
         plan = current.metadata.get("filesystem_plan_v1", {})
         slot = "evaluation-0"
-        if "test_repair" in plan.get("actions", ()):
+        if plan.get("host_test") or "test_repair" in plan.get("actions", ()):
             retry_id = str(uuid5(NAMESPACE_URL, agent.id + ":coding:evaluation-1"))
             if await store.get_coding_execution(retry_id) is not None:
                 slot = "evaluation-1"

@@ -39,6 +39,18 @@ async def prepare_filesystem(runtime, workspace, message, owned, principal, *, t
             Path(path).name.startswith('test_') or Path(path).name.endswith('_test.py')))
         if test_only and not tests:
             raise PermissionError("project_tests_not_found")
+        from Sprout.security.local_diagnostics import current
+
+        test_run = None
+        if (not test_only and "run_tests" in plan.get("execution", ())
+                and current(runtime) is not None):
+            targets = (*tests, *(path for path in writes if Path(path).name.startswith("test_")
+                                 or Path(path).name.endswith("_test.py")))
+            if not image or not targets:
+                raise PermissionError("filesystem_test_plan_unavailable")
+            framework = "unittest" if "unittest" in message.content.casefold() else "pytest"
+            test_run = {"argv": ["python", "-m", framework, "-q"], "cwd": ".",
+                        "workspace_id": workspace.id, "image": image, "repair_attempts": 1}
         frozen = None
         raw_spec = os.getenv("SPROUT_FILESYSTEM_VERIFICATION_SPEC", "")
         if raw_spec and not test_only:
@@ -89,7 +101,8 @@ async def prepare_filesystem(runtime, workspace, message, owned, principal, *, t
                   "cli_write_paths": list(writes),
                   "filesystem_plan_v1": {"reads": list(reads), "operations": operations,
                       "execution": list(plan.get("execution", ())),
-                      "actions": list(plan.get("actions", ()))}},
+                      "actions": list(plan.get("actions", ())),
+                      **({"host_test": test_run} if test_run is not None else {})}},
     )
     task = replace(task, budget=replace(task.budget, max_model_calls=24))
     await runtime._metadata_or_raise().save_task(task)

@@ -107,6 +107,37 @@ async def test_diagnostic_host_command_denied_before_spawn_or_pending(diagnostic
         spawn.assert_not_awaited()
 
 
+async def test_bound_diagnostic_runs_host_command_without_approval(
+    diagnostic, tmp_path, monkeypatch,
+):
+    from Sprout.message.models import Message
+    from Sprout.security.approval import _CAPABILITY_TURN
+
+    monkeypatch.chdir(tmp_path)
+    async with diagnostic() as (_, runtime, session, principal):
+        workspace = await runtime.open_workspace(tmp_path)
+        await runtime._remember_session_workspace(session.id, workspace.id)
+        owned = await runtime._sessions.require_owner(session.id, principal)
+        turn = await runtime._start_capability_turn(owned, principal)
+        token = _CAPABILITY_TURN.set(turn)
+        try:
+            executor = runtime._router.route(Message("hi")).executor._tools
+            result = await executor.execute(
+                "cli_tool_run",
+                {"command": sys.executable, "args": [
+                    "-c", "from pathlib import Path; "
+                    "Path('probe.txt').write_text('ok'); print('done')",
+                ]},
+                requested_by=principal.user_id, session_id=session.id,
+            )
+            assert result.ok, result.to_text()
+            assert "done" in result.to_text()
+            assert (tmp_path / "probe.txt").read_text() == "ok"
+            assert not await runtime.approvals.store.list_approvals()
+        finally:
+            _CAPABILITY_TURN.reset(token)
+
+
 async def test_diagnostic_direct_broker_host_command_is_denied(diagnostic, tmp_path, monkeypatch):
     import asyncio
     from unittest.mock import AsyncMock
@@ -257,7 +288,7 @@ async def test_workspace_request_uses_existing_policy_and_progress(diagnostic, d
 
 
 @pytest.mark.parametrize("outcome", ["success", "directory", "deny", "outside"])
-async def test_scoped_read_approval_and_file_broker_result_are_separate(rig, outcome):
+async def test_scoped_read_authorization_and_file_broker_result_are_separate(rig, outcome):
     from Sprout.execution.models import SandboxRef
     from Sprout.execution.sandbox_tool import SandboxReadTool
     from Sprout.orchestration.models import ExecutionNode, NodeStatus, NodeType
@@ -305,8 +336,9 @@ async def test_scoped_read_approval_and_file_broker_result_are_separate(rig, out
             assert not await manager.store.list_approvals()
         else:
             assert result.ok is (outcome == "success")
-            assert lines == [f"[Approval] AUTO-APPROVED: {name}", f"[Tool] {name}: started",
+            assert lines == [f"[Authorization] LOCAL-EXECUTION: {name}", f"[Tool] {name}: started",
                              f"[Tool] {name}: {outcome if result.ok else 'failed'}"]
+            assert not await manager.store.list_approvals()
             if result.ok:
                 assert result.content == "diagnostic file probe"
 

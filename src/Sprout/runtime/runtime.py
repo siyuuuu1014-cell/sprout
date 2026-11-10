@@ -3771,6 +3771,8 @@ class Runtime:
                     verification_status=verification_status(
                         evaluated, review, task.id, task.workspace_id),
                 )
+            elif (result.error or "").startswith("filesystem_test_"):
+                content += f" ({result.error.split(':', 1)[0]})"
             elif (result.error or "").startswith("filesystem_"):
                 report(self, "Apply", f"BLOCKED: {result.error}")
                 content += f" ({result.error})"
@@ -3925,6 +3927,18 @@ class Runtime:
             return await dispatch(self, message, session, principal, foreground,
                                   code_task_provider), None
         if not detect_task_hint(message.content or ""):
+            from Sprout.intents import project_request_text
+
+            request = project_request_text(message.content or "")
+            quoted = re.search(r'["“‘`]', request)
+            explicit_prefix = quoted is not None and detect_task_hint(request[:quoted.start()])
+            if str(context.metadata.get("intent") or "") == "task" and explicit_prefix:
+                return OutboundMessage(
+                    "编码请求未通过操作与目标判定。请明确要修改的文件，并检查输入示例是否完整。",
+                    message.channel, session.id, message.id,
+                    {"intent": "task", "blocked_reason": "coding_request_not_admitted",
+                     "reason": "unresolved_literal"},
+                ), message
             return None
         if self._asks_for_workspace(message, context, session):
             held, outbound = await self._request_workspace(message, session)

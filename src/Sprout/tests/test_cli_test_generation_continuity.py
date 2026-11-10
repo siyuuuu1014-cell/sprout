@@ -32,6 +32,8 @@ from Sprout.tests.test_r04_b4_cli_auto import (
 
 @pytest.mark.parametrize("text", [
     "为这个项目生成单元测试", "为当前这个项目生成单元测试", "生成单元测试",
+    ("修改 order_total.py 中的 calculate_order_total 函数，运行全部测试，"
+     "如果测试失败，根据真实错误修复。完成独立 Verification 和 Review 后写回项目。"),
     "为当前这个项目生成单元测试，覆盖 app.py 中的所有函数，并运行测试",
     "为 app.py 创建单元测试", "补充现有 test_app.py 的测试覆盖",
     "那你帮我补齐一份 README", "为这个项目创建 README.md",
@@ -60,6 +62,18 @@ def test_test_discussion_is_not_a_write_request(text):
     "为这个项目生成单元测试", "那你帮我补齐一份 README",
     "为当前这个项目生成单元测试，覆盖 app.py 中的所有函数，并运行测试",
     "为 app.py 创建单元测试", "补充现有 test_app.py 的测试覆盖",
+    ('补充现有 tests/test_order_total.py 的测试覆盖，并运行完整 pytest 测试。'
+     '严格依据 SPEC.md，追加两个独立回归：'
+     '零价格商品 items=[{"unit_price":0,"quantity":1}] 合法且返回 0.00；'
+     '非整数数量 items=[{"unit_price":10,"quantity":1.5}] 必须抛出 ValueError，不能取整。'
+     '数量仍为正整数且 bool 无效。保留原有全部20项测试及断言，SPEC.md保持原样，'
+     '源码已有正确行为时保持原样。测试命令必须是 python -m pytest -q；'
+     '遇到失败自动修复并重测。完成独立 Verification、Review、Apply、写回后只读复测。'),
+    ('补充现有 tests/test_order_total.py 的测试覆盖，并运行测试。'
+     '零价格商品 unit_price为0且quantity为1时应返回0.00。'),
+    '修改 "src/main.py" 中的函数，并运行测试。输入示例为 {"text":"讨论方案，不要修改secret.py"}。',
+    '修改 src/main.py 中的函数，并运行测试。参考 SPEC.md 和 README.md，保留规格原样。',
+    '参考 SPEC.md 和 README.md，修改 "src/main.py" 中的函数，并运行测试。',
 ])
 async def test_analysis_then_generation_keeps_session_workspace_and_original_request(
     automatic, monkeypatch, request_text, capsys,
@@ -260,3 +274,60 @@ async def test_legacy_resolved_option_cannot_restore_task_A(clarification_runtim
     held = Turn(session.id, "user", answer.content, metadata={"message_id": answer.id})
     with pytest.raises(LookupError, match="complete original request"):
         await clarified_instruction(runtime, session, held, {CLARIFICATION_KEY: record["id"]})
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_identified_coding_with_unresolved_literal_never_falls_back(
+    clarification_runtime, monkeypatch, stream,
+):
+    runtime, tasks, _, agent = clarification_runtime
+    monkeypatch.setattr(runtime, "_classify_intent_with_llm", AsyncMock(return_value={
+        "intent": "task", "confidence": 1.0,
+    }))
+    request = '修改 app.py，输入示例为 {"amount":'
+    reply = await deliver(runtime, request, stream=stream, channel="cli")
+    assert reply.metadata["blocked_reason"] == "coding_request_not_admitted"
+    agent.run.assert_not_awaited()
+    assert not tasks
+
+
+@pytest.mark.parametrize("text", [
+    '讨论如何修改 app.py，输入是 {"name":"修改文件"}。',
+    '不要修改 app.py，输入是 {"name":"修改文件"}。',
+    '分析 "app.py"，数据是 {"instruction":"删除文件"}。',
+    '"修改 app.py 并运行测试"',
+    '"fix.py"', '"修改app.py"', '"不要修改app.py"',
+    '{"instruction":"修改 app.py"}',
+    '参考 SPEC.md，讨论如何修改 app.py。',
+    '参考 SPEC.md，输入示例为 {"instruction":"修改 app.py"}。',
+])
+def test_literal_data_cannot_supply_write_instruction(text):
+    assert not detect_task_hint(text)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_json_task_dispatch_matches_handle_and_stream(
+    clarification_runtime, stream,
+):
+    runtime, tasks, _, agent = clarification_runtime
+    request = '修改 "app.py" 中的函数，并运行测试。输入为 {"value":1}。'
+    reply = await deliver(runtime, request, stream=stream, channel="cli")
+    assert reply.metadata.get("workspace_consent_required") is True
+    assert not tasks
+    agent.run.assert_not_awaited()
+    history = await runtime.history(reply.session_id)
+    assert next(t.content for t in history if t.role == "user") == request
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_status_question_keeps_conversation_if_classifier_labels_task(
+    clarification_runtime, monkeypatch, stream,
+):
+    runtime, tasks, _, agent = clarification_runtime
+    monkeypatch.setattr(runtime, "_classify_intent_with_llm", AsyncMock(return_value={
+        "intent": "task", "confidence": 1.0,
+    }))
+    reply = await deliver(runtime, "好了吗", stream=stream, channel="cli")
+    assert not reply.metadata.get("blocked_reason")
+    agent.run.assert_awaited_once()
+    assert not tasks

@@ -32,9 +32,11 @@ def plan_files(paths, instruction, *, symbols=None, imports=()):
         detect_task_hint,
         project_clauses,
         project_feature_edit,
+        project_request_text,
         write_intent_disposition,
     )
 
+    instruction = project_request_text(instruction)
     paths = tuple(sorted(set(paths)))
     if not paths or len(paths) > 64:
         raise PermissionError('filesystem_planning_input_budget')
@@ -48,7 +50,10 @@ def plan_files(paths, instruction, *, symbols=None, imports=()):
         return result
     sources = [p for p in paths if p.endswith('.py') and not _test_file(p)
                and PurePosixPath(p).name != '__init__.py']
-    run_pattern = r'(?:运行|执行|\brun\b|\bexecute\b)[^，,。;；！？\n]*?(?:测试|\btests?\b)'
+    run_pattern = (
+        r'(?:运行|执行|\brun\b|\bexecute\b)[^，,。;；！？\n]*?'
+        r'(?:测试|\b(?:pytest|unittest|tests?)\b)'
+    )
     run_tests = bool(re.search(run_pattern, instruction, re.I))
     # Execution is orthogonal to file writes. Remove only the execution clause
     # before classifying file operations, so "add logging then run tests" does
@@ -67,6 +72,11 @@ def plan_files(paths, instruction, *, symbols=None, imports=()):
         clause = re.sub(r"^\s*\d+[.、]\s*", "", clause).strip()
         if clause.startswith(("不要", "不修改", "不改动", "不写入", "保留")):
             continue
+        # A reference names an input, not an edit target.
+        clause = re.sub(
+            r"^(?:严格\s*)?(?:按照|按|参考|依据)\s*[A-Za-z0-9_./-]+\.[A-Za-z][A-Za-z0-9_]*",
+            "", clause,
+        ).strip()
         mentioned = re.findall(r'[A-Za-z0-9_./-]+\.[A-Za-z][A-Za-z0-9_]*', clause)
         creating = bool(re.search(r'生成|创建|新增|添加|增加|编写|补写|补齐|'
                                   r'\b(?:generate|create|add|write)\b', clause, re.I))
@@ -162,7 +172,8 @@ def plan_files(paths, instruction, *, symbols=None, imports=()):
     if run_tests:
         actions.append('test_execution')
         clauses = project_clauses(instruction)
-        if (any(clause.startswith("修复失败的测试") for clause in clauses)
+        if (any(clause.startswith(("修复失败的测试", "遇到失败自动修复"))
+                for clause in clauses)
                 or any(a in {"如果发现失败", "如果测试失败"} and b == "根据真实错误修复"
                        for a, b in zip(clauses, clauses[1:], strict=False))):
             actions.append("test_repair")

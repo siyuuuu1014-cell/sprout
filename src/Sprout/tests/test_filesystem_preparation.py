@@ -175,9 +175,9 @@ async def test_plan_does_not_admit_unapproved_or_private_targets(automatic, path
                     user_id=principal.user_id), session, principal)
 
 
-@pytest.mark.parametrize("diagnostic", [False, True])
+@pytest.mark.parametrize(("diagnostic", "has_tests"), [(False, True), (True, True), (True, False)])
 async def test_foreground_preparation_never_prompts_for_paths_or_image(
-    tmp_path, monkeypatch, capsys, diagnostic,
+    tmp_path, monkeypatch, capsys, diagnostic, has_tests,
 ):
     from Sprout.cli.filesystem_task import prepare_filesystem
     from Sprout.gateway.identity import Principal
@@ -200,7 +200,8 @@ async def test_foreground_preparation_never_prompts_for_paths_or_image(
     monkeypatch.setattr('Sprout.cli.filesystem_preparation.preflight',
                         AsyncMock(return_value='sha256:' + 'a' * 64))
     monkeypatch.setattr('Sprout.cli.filesystem_preparation.discover_plan', AsyncMock(
-        return_value={'reads': ('app.py', 'test_app.py'), 'writes': ('test_app.py',),
+        return_value={'reads': ('app.py', 'test_app.py') if has_tests else ('app.py',),
+                      'writes': ('test_app.py',) if has_tests else ('app.py',),
                       'execution': ('run_tests',),
                       'actions': ('test_extension', 'test_execution')}))
     monkeypatch.setattr('Sprout.security.local_diagnostics.current',
@@ -209,13 +210,25 @@ async def test_foreground_preparation_never_prompts_for_paths_or_image(
     monkeypatch.setattr('questionary.text', prompt)
     monkeypatch.setattr('questionary.confirm', prompt)
     monkeypatch.delenv('SPROUT_FILESYSTEM_VERIFICATION_SPEC', raising=False)
-    result = await prepare_filesystem(runtime, workspace, SimpleNamespace(content='生成测试'),
-                                      session, actor)
+    message = SimpleNamespace(content='生成测试')
+    if not has_tests:
+        with pytest.raises(PermissionError, match="filesystem_test_plan_unavailable"):
+            await prepare_filesystem(runtime, workspace, message, session, actor)
+        runtime.create_task.assert_not_awaited()
+        return
+    result = await prepare_filesystem(runtime, workspace, message, session, actor)
     assert result.id == task.id
     plan = runtime.create_task.call_args.kwargs['metadata']['filesystem_plan_v1']
     assert plan['operations'] == [{'path': 'test_app.py', 'operation': 'update'}]
     assert plan['execution'] == ['run_tests']
     assert plan['actions'] == ['test_extension', 'test_execution']
+    if diagnostic:
+        assert plan["host_test"] == {
+            "argv": ["python", "-m", "pytest", "-q"], "cwd": ".",
+            "workspace_id": workspace.id, "image": "sha256:" + "a" * 64, "repair_attempts": 1,
+        }
+    else:
+        assert "host_test" not in plan
     assert '[Planning] execute: run_tests' in capsys.readouterr().out
     assert runtime._cli_code_writes[task.id][3] == ('test_app.py',)
     prompt.assert_not_called()
@@ -290,3 +303,47 @@ def test_compound_data_task_keeps_analysis_and_coding():
     with pytest.raises(PermissionError, match="ambiguous_source_target"):
         plan_files(paths | {"unrelated.py"}, instruction, imports=imports)
     assert not detect_task_hint("分析当前项目，如果发现失败，根据真实错误修复。")
+
+
+def test_order_task_plans_pytest_and_keeps_spec_read_only():
+    request = (
+        "修复 order_total.py 中的 calculate_order_total 函数，"
+        "严格按照 SPEC.md 实现折扣、税率、商品数据校验和异常处理，"
+        "运行完整 pytest 测试，遇到失败自动修复并重新测试，"
+        "验证通过后完成 Review、Apply 和写回后的只读复测。"
+    )
+    from Sprout.intents import detect_task_hint
+
+    assert detect_task_hint(request)
+    plan = plan_files(
+        ("order_total.py", "SPEC.md", "README.md", "tests/test_order_total.py"), request,
+    )
+    assert "SPEC.md" in plan["reads"]
+    assert plan["writes"] == ("order_total.py",)
+    assert plan["execution"] == ("run_tests",)
+    assert "test_repair" in plan["actions"]
+
+
+def test_repair_against_spec_does_not_authorize_spec_write():
+    plan = plan_files(
+        ("order_total.py", "SPEC.md", "README.md"),
+        "修复 order_total.py，按 SPEC.md 修复折扣，参考 README.md。",
+    )
+    assert plan["writes"] == ("order_total.py",)
+
+
+def test_json_data_and_quoted_paths_do_not_change_operation_plan():
+    text = ('修改 "app.py" 中的函数，并运行测试。'
+            '参考 SPEC.md，输入示例为 {"path":"nonexistent.py","note":"不要修改源码"}。')
+    plan = plan_files(("app.py", "test_app.py", "SPEC.md"), text)
+    assert plan["writes"] == ("app.py",)
+    assert plan["execution"] == ("run_tests",)
+
+
+def test_readonly_reference_before_explicit_write_keeps_same_plan():
+    plan = plan_files(
+        ("app.py", "test_app.py", "SPEC.md"),
+        '参考 SPEC.md，修改 "app.py" 中的函数，并运行测试。',
+    )
+    assert plan["writes"] == ("app.py",)
+    assert plan["execution"] == ("run_tests",)

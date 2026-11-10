@@ -77,6 +77,9 @@ class NodeExecutionGuard:
                 raise
             return node_result(waiting)
         is_waiting = isinstance(output, dict) and bool(output.get("waiting"))
+        failed = (not is_waiting and running.type.value == "agent"
+                  and running.metadata.get("filesystem_test_loop") is True
+                  and isinstance(output, dict) and output.get("filesystem_tests_failed") is True)
         prewrite = (is_waiting and running.type.value == "apply"
                     and running.metadata.get("filesystem_apply") is True
                     and output.get("filesystem_prewrite") is True)
@@ -84,11 +87,12 @@ class NodeExecutionGuard:
             ("uncertain" if output.get("waiting_kind") == "resource" and not prewrite
              else "waiting")
             if is_waiting
-            else "completed"
+            else "failed" if failed else "completed"
         )
         settled = replace(
             running,
-            status=NodeStatus.WAITING if is_waiting else NodeStatus.COMPLETED,
+            status=(NodeStatus.WAITING if is_waiting else
+                    NodeStatus.FAILED if failed else NodeStatus.COMPLETED),
             metadata={**running.metadata, "output": output},
         )
         if not await self._metadata.finish_execution_node(settled, owner, state):
@@ -108,6 +112,8 @@ class NodeExecutionGuard:
         if current.status in {NodeStatus.COMPLETED, NodeStatus.SKIPPED, NodeStatus.CANCELLED}:
             return node_result(current)
         guard = current.metadata.get("execution_guard", {})
+        if current.status is NodeStatus.FAILED and guard.get("state") == "failed":
+            return node_result(current)
         if current.status in {NodeStatus.RUNNING, NodeStatus.FAILED} or guard.get("state") in {
             "active",
             "uncertain",

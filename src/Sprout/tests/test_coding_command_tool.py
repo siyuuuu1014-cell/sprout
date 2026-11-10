@@ -172,7 +172,10 @@ async def test_foreground_test_repair_allows_one_exact_rerun(tmp_path, first_exi
     handler = SimpleNamespace(execute=AsyncMock(return_value=output))
     tool = IsolatedCodingCommandTool(handler, task=task, node=ExecutionNode(task_id=task.id),
         sandbox=replace(sandbox, kind="filesystem_experiment"), filesystem_root_only=True,
-        retry_failed_tests=True)
+        retry_failed_tests=True, require_test_command=True)
+    probe = await tool.invoke({"command": ["python", "-c", "print('ready')"]})
+    assert not probe.ok and "test slot" in probe.to_text()
+    handler.execute.assert_not_awaited()
     await tool.invoke({"command": list(command)})
     assert not (await tool.invoke({"command": ["python", "unrelated.py"]})).ok
     handler.execute.return_value = {
@@ -182,3 +185,85 @@ async def test_foreground_test_repair_allows_one_exact_rerun(tmp_path, first_exi
     assert not (await tool.invoke({"command": list(command)})).ok
     expected = ["evaluation-0", "evaluation-1"] if first_exit == 1 else ["evaluation-0"]
     assert [call.kwargs["command_slot"] for call in handler.execute.await_args_list] == expected
+
+
+async def test_incomplete_model_arguments_report_input_error_before_binding(tmp_path):
+    tool, handler = configured(tmp_path)
+    executor = ToolExecutor(tools=ToolRegistry()).with_scoped_tools(
+        {tool.spec.name: tool}, strict=True,
+    )
+    result = await executor.execute(tool.spec.name, {"_raw": '{"command": ['})
+    assert not result.ok and "Incomplete tool arguments" in result.to_text()
+    handler.execute.assert_not_awaited()
+
+
+@pytest.mark.parametrize(("exits", "changed"), [
+    ((0,), False), ((1, 0), True), ((1, 0), False), ((1, 1), True), ((1, 1), False),
+    ((2,), False), ((2, 0), True),
+])
+async def test_runtime_runs_frozen_tests_and_repairs_without_model_command(
+    tmp_path, exits, changed,
+):
+    from dataclasses import replace
+
+    from Sprout.message.models import Message
+    from Sprout.runtime.nodes import NodeExecutor
+
+    sandbox, task, _ = fixture(tmp_path)
+    node = ExecutionNode(task_id=task.id)
+    argv = ("python", "-m", "pytest", "-q")
+    stdout = ("ERROR collecting: assert price during collection" if exits == (2, 0)
+              else "assert price")
+    handler = SimpleNamespace(execute=AsyncMock(side_effect=[
+        {"process": ProcessResult(argv, exit_code=code, started=True,
+                                  stdout=stdout, stderr="test diagnostic"),
+         "imported": code == 0}
+        for code in exits
+    ]))
+    tool = IsolatedCodingCommandTool(
+        handler, task=task, node=node, sandbox=replace(sandbox, kind="filesystem_experiment"),
+        filesystem_root_only=True, retry_failed_tests=True, require_test_command=True,
+    )
+    executor = Mock()
+    executor.with_scoped_tools.return_value.run_call = (
+        lambda call, **kwargs: tool.invoke(call.arguments)
+    )
+    repair = AsyncMock(return_value=SimpleNamespace(metadata={}))
+    scheduler = SimpleNamespace(_publish_node_model=repair, _repair_inputs=AsyncMock(
+        side_effect=[({"order_total.py": "before"}, {"order_total.py": "current candidate"}),
+                     ({"order_total.py": "after" if changed else "before"}, {})]))
+    runtime = SimpleNamespace(_node_tool_scopes={}, _record_security=Mock())
+    scope = SimpleNamespace(runtime=runtime, session_id="session")
+    workspace = SimpleNamespace(id=task.workspace_id)
+    plan = {"argv": list(argv), "cwd": ".", "image": "pinned", "repair_attempts": 1,
+            "workspace_id": task.workspace_id}
+    result = SimpleNamespace(metadata={})
+    _, error = await NodeExecutor._run_filesystem_tests(
+        scheduler, node, workspace, task, SimpleNamespace(executor=executor),
+        Message("implement the fix"), object(), result, tool, plan, scope, "pinned",
+    )
+    assert (error is None) is (exits[-1] == 0)
+    commands = [call.kwargs["command"] for call in handler.execute.await_args_list]
+    assert commands == [argv] * len(exits)
+    assert all(call.kwargs["task"] is task and call.kwargs["node"] is node
+               and call.kwargs["cwd"] == sandbox.root for call in handler.execute.await_args_list)
+    assert repair.await_count == (len(exits) - 1)
+    if len(exits) == 2:
+        feedback = repair.call_args.args[4].content
+        expected = (f"exit_code={exits[0]}", "assert price", "test diagnostic")
+        assert all(value in feedback for value in (*expected, "current candidate", "SPEC.md"))
+        audit = runtime._record_security.call_args.args[1]
+        expected_verdict = ("repair_passed" if exits[-1] == 0 else
+                            "repair_failed" if changed else "repair_no_effect")
+        assert audit["verdict"] == expected_verdict
+
+
+def test_long_pytest_feedback_retains_middle_assertion_and_summary():
+    from Sprout.execution.coding_feedback import command_feedback
+
+    process = ProcessResult(("python", "-m", "pytest"), exit_code=1,
+        stdout="padding\n" * 1000 + "E   AssertionError: expected 99.0, got 109.89\n"
+        + "padding\n" * 1000 + "FAILED tests/test_order.py::test_discount\n1 failed\n")
+    output = command_feedback(process)["output"]
+    assert "expected 99.0, got 109.89" in output
+    assert "FAILED tests/test_order.py::test_discount" in output

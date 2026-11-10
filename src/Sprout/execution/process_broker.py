@@ -1067,26 +1067,31 @@ class ProcessBroker:
                                      error="Frozen execution authority changed before approval")
         from Sprout.security.local_diagnostics import process_refused
 
+        cli_binding = None
+        if (not secret_names and not required_env and scope is None and actor is None
+                and not known_command and command_origin == "caller"
+                and not preflight_only and max_output_bytes is None
+                and Path(workspace.root).resolve() == cwd_path.resolve()):
+            cli_binding = _cli_process_binding(
+                command_tuple, cwd_path, env, timeout_seconds,
+                task_id, session_id, source, requested_by, resource_scope,
+                workspace.id, workspace.kind.value,
+            )
+        foreground_handoff = False
         if (decision.decision in {AccessDecision.ALLOW, AccessDecision.REQUIRE_APPROVAL}
                 and process_refused(
                     self._approvals, task_id, command_tuple,
                     frozen_scope=dispatch.record["scope"] if dispatch is not None else None,
                 )):
-            return ProcessResult(command=command_tuple, allowed=False, started=False,
-                error="Diagnostic mode requires the guarded Coding container route")
-        if decision.decision is not AccessDecision.ALLOW:
-            # Only the exact plain CLI execution shape can consume a CLI grant;
-            # extra secret injection, alternate scope/actor or preflight cannot.
-            cli_binding = None
-            if (not secret_names and not required_env and scope is None and actor is None
-                    and not known_command and command_origin == "caller"
-                    and not preflight_only and max_output_bytes is None
-                    and Path(workspace.root).resolve() == cwd_path.resolve()):
-                cli_binding = _cli_process_binding(
-                    command_tuple, cwd_path, env, timeout_seconds,
-                    task_id, session_id, source, requested_by, resource_scope,
-                    workspace.id, workspace.kind.value,
-                )
+            try:
+                foreground_handoff = await _consume_cli_approval(self, self._approvals, cli_binding)
+            except PermissionError as exc:
+                return ProcessResult(command=command_tuple, allowed=False, started=False,
+                                     error=str(exc))
+            if not foreground_handoff:
+                return ProcessResult(command=command_tuple, allowed=False, started=False,
+                    error="Diagnostic mode requires a foreground CLI handoff or Coding container")
+        if decision.decision is not AccessDecision.ALLOW and not foreground_handoff:
             blocked = await self._withheld(
                 command_tuple,
                 decision,

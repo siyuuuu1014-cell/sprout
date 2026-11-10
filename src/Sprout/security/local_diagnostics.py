@@ -232,29 +232,38 @@ def scoped_file_tool(tool):
     return type(tool) in {SandboxReadTool, SandboxWriteTool, SandboxEditTool}
 
 
-async def scoped_tool_approval(manager, tool, scope, subject, arguments):
-    """Only the live node's existing FileBroker contract can confine this effect."""
-    if not isinstance(manager, DiagnosticApprovals) or not scoped_file_tool(tool):
+async def node_authorized(manager, scope, subject):
+    """Check the live Host-issued node against the current CLI session."""
+    from Sprout.tools.context_keys import _current_project_node
+
+    if not isinstance(manager, DiagnosticApprovals) or scope is None or subject is None:
         return False
     mode = manager.diagnostics
+    if (not mode.active() or _current_project_node() is not scope
+            or scope.runtime is not mode.runtime or scope.session_id != mode.session_id
+            or scope.task.actor != mode.principal or subject.actor != mode.principal
+            or subject.task_id != scope.task.id or scope.task.workspace_id != scope.workspace.id):
+        return False
     await mode.require()
     owned = await mode.runtime._sessions.require_owner(mode.session_id, mode.principal)
-    if (scope is None or subject is None or scope.runtime is not mode.runtime
-            or scope.session_id != mode.session_id or subject.actor != mode.principal
-            or scope.workspace.id != mode.runtime.session_workspace_id(owned)
-            or tool._broker is not mode.runtime._file_broker):
-        raise PermissionError("Diagnostic scoped file authority unavailable")
-    record = await super(DiagnosticApprovals, manager).request(
-        tool.spec.name, arguments, task_id=subject.task_id, requested_by=subject.actor.user_id,
-        session_id=mode.session_id, source="cli", resource_scope=scope.workspace.id,
-        ttl_seconds=60, request_approval=False,
-    )
-    mode.records.add(record.id)
-    await manager.decide(record.id, True, decided_by=subject.actor.user_id)
-    return await manager.is_approved(
-        tool.spec.name, arguments, task_id=subject.task_id, requested_by=subject.actor.user_id,
-        session_id=mode.session_id, source="cli", resource_scope=scope.workspace.id,
-    )
+    return mode.runtime.session_workspace_id(owned) == scope.workspace.id
+
+
+async def foreground_authorized(manager, turn, session_id, requested_by, source):
+    if not isinstance(manager, DiagnosticApprovals) or turn is None or not turn.active:
+        return False
+    mode = manager.diagnostics
+    if (not mode.active() or mode.principal is None or source not in {"cli", "interactive"}
+            or session_id != mode.session_id or turn.session_id != session_id
+            or requested_by != mode.principal.user_id or turn.user_id != requested_by
+            or mode.runtime._capability_turns.get(session_id) is not turn):
+        return False
+    await mode.require()
+    owned = await mode.runtime._sessions.require_owner(session_id, mode.principal)
+    workspace_id = mode.runtime.session_workspace_id(owned)
+    workspace = await mode.runtime.get_workspace(workspace_id) if workspace_id else None
+    return (workspace is not None and workspace.id == turn.workspace_id
+            and workspace.root.is_dir() and workspace.root.resolve() == turn.root)
 
 
 async def tool_refusal(manager, tool, scope):
@@ -271,18 +280,6 @@ async def tool_refusal(manager, tool, scope):
         return ""  # Existing scoped analysis admission remains mandatory.
     if type(tool) is IsolatedCodingCommandTool and scope is not None:
         return ""  # coding_approval and the real Docker backend still validate.
-    if scope is not None and scoped_file_tool(tool):
-        mode = manager.diagnostics
-        try:
-            await mode.require()
-        except PermissionError:
-            return "Diagnostic mode refuses an unowned file operation"
-        owned = await mode.runtime._sessions.require_owner(mode.session_id, mode.principal)
-        if (scope.runtime is mode.runtime and scope.session_id == mode.session_id
-                and scope.task.actor == mode.principal
-                and scope.workspace.id == mode.runtime.session_workspace_id(owned)
-                and tool._broker is mode.runtime._file_broker):
-            return ""
     return "Diagnostic mode refuses effects without a bound workspace or isolated executor"
 
 

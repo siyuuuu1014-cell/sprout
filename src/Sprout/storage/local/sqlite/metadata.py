@@ -899,6 +899,7 @@ class SqliteMetadataStore:
         """Publish status/output together, only while the same owner holds the node."""
         expected = {
             "completed": NodeStatus.COMPLETED,
+            "failed": NodeStatus.FAILED,
             "waiting": NodeStatus.WAITING,
             "uncertain": NodeStatus.WAITING,
         }

@@ -22,7 +22,7 @@ class IsolatedCodingCommandTool:
                       "required": ["command"]})
 
     def __init__(self, handler, *, task, node, sandbox, filesystem_root_only=False,
-                 retry_failed_tests=False):
+                 retry_failed_tests=False, require_test_command=False):
         self._handler, self._task, self._node = handler, task, node
         self._sandbox = sandbox
         if filesystem_root_only and sandbox.kind != "filesystem_experiment":
@@ -31,6 +31,7 @@ class IsolatedCodingCommandTool:
         self._used = False
         self._retry_enabled = filesystem_root_only and retry_failed_tests
         self._retry_command = None
+        self._require_test_command = filesystem_root_only and require_test_command
         if self._retry_enabled:
             from dataclasses import replace
 
@@ -42,6 +43,10 @@ class IsolatedCodingCommandTool:
         self.invocation_context = NodeToolInvocationContext(
             task_id=task.id, source=task.source, requested_by=task.actor.user_id,
             resource_scope=task.workspace_id)
+
+    @property
+    def failed_tests_can_retry(self):
+        return self._retry_command is not None
 
     async def invoke(self, arguments):
         if not isinstance(arguments, dict) or set(arguments) - {"command", "relative_cwd"}:
@@ -56,6 +61,10 @@ class IsolatedCodingCommandTool:
                 or (relative != "." and (self._guard is None or not self._guard.allows(relative)))):
             return ToolResult.denied("Existing public directory inside the node sandbox required")
         argv = tuple(command)
+        if self._require_test_command and argv[:3] not in {
+            ("python", "-m", "unittest"), ("python", "-m", "pytest"),
+        }:
+            return ToolResult.denied("Use python -m pytest or python -m unittest for the test slot")
         if self._used and argv != self._retry_command:
             return ToolResult.denied(
                 "Node command already attempted; no new slot or automatic rerun")
@@ -80,11 +89,15 @@ class IsolatedCodingCommandTool:
         if imported.get("approval_id"):
             return ToolResult.needs_approval(imported["approval_id"])
         feedback = command_feedback(process)
+        pytest_command = argv[0] == "pytest" or argv[:3] == ("python", "-m", "pytest")
+        collection_error = (
+            pytest_command and process.exit_code == 2
+            and "ERROR collecting" in process.stdout and "during collection" in process.stdout
+        )
         if (self._retry_enabled and not retry and process.started is True and process.allowed
-                and process.exit_code == 1 and not process.error and not process.redactions
-                and (argv[0] == "pytest" or argv[:3] in {
-                    ("python", "-m", "unittest"), ("python", "-m", "pytest")
-                })):
+                and not process.error and not process.redactions
+                and (process.exit_code == 1 or collection_error)
+                and (pytest_command or argv[:3] == ("python", "-m", "unittest"))):
             self._retry_command = argv
         if not process.allowed or process.exit_code != 0 or process.error or process.redactions:
             return ToolResult.failure(

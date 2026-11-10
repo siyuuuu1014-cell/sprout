@@ -222,7 +222,7 @@ def chat(
     if diagnostics is not None:
         settings = diagnostics.settings
         typer.echo(ui.warning(
-            "LOCAL DIAGNOSTIC: 免人工审批；受控工作区操作与可信隔离 Coding；未隔离宿主命令拒绝。"
+            "LOCAL DIAGNOSTIC: 免人工审批；前台工具可执行宿主命令；Coding 使用隔离后端。"
         ))
         typer.echo(ui.warning(f"独立诊断数据目录：{diagnostics.root}"))
         runtime = create_runtime(settings, local_diagnostics=diagnostics)
@@ -1419,7 +1419,12 @@ async def _prepare_cli_context(runtime: Any, session_id: str | None, user: str):
             if workspace is None or not workspace.root.is_dir():
                 raise PermissionError("cli_session_workspace_unavailable")
             return session.id, workspace_id
-    workspace_id = await _confirm_cli_workspace(runtime)
+    from Sprout.security.local_diagnostics import current
+
+    if current(runtime) is not None:
+        workspace_id = (await runtime.open_workspace(Path.cwd().resolve())).id
+    else:
+        workspace_id = await _confirm_cli_workspace(runtime)
     session = await runtime._sessions.resolve(
         Message("", channel="cli", user_id=user, session_id=session_id), principal=principal)
     # Confirmation yielded to terminal input. Recheck ownership before binding.
