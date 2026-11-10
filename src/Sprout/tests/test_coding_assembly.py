@@ -93,3 +93,28 @@ async def test_foreign_task_callback_is_rejected(tmp_path, monkeypatch):
             factory(task=replace(task, id="other"), node=node, sandbox=sandbox)
     finally:
         store.close()
+
+
+
+async def test_bound_session_dispatch_preserves_original_export_and_rejects_repair(
+    tmp_path, monkeypatch,
+):
+    from Sprout.execution.models import ProcessResult
+
+    store, runtime, task, node, sandbox = await fixture(tmp_path, monkeypatch)
+    execute = AsyncMock(return_value=ProcessResult(("python",), exit_code=1, started=True))
+    monkeypatch.setattr("Sprout.execution.coding_dispatch.DockerCodingBackend.execute", execute)
+    try:
+        session = build_coding_session_factory(runtime, task)(task=task, node=node, sandbox=sandbox)
+        output = await session.execute_command(("python",), cwd=sandbox.root,
+                                               command_slot="evaluation-0")
+        assert output["process"].exit_code == 1 and not output["imported"]
+        execute.assert_awaited_once()
+        request = execute.call_args.args[0]
+        assert (request.exported / "app.py").is_file()
+        assert not request.evidence.name.endswith("-repair")
+        with pytest.raises(ValueError, match="requires a filesystem experiment"):
+            await session.prepare(repair=True)
+        execute.assert_awaited_once()
+    finally:
+        store.close()

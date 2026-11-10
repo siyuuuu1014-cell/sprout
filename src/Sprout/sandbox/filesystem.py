@@ -103,6 +103,11 @@ class FilesystemSandbox:
 
     def close(self):
         if self.ref is not None:
+            try:
+                self.ref.root.lstat()
+            except FileNotFoundError:
+                self.ref = None
+                return
             self.check()
             shutil.rmtree(self.ref.root)
             self.ref = None

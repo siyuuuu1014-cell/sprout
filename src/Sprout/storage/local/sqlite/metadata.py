@@ -50,6 +50,11 @@ from Sprout.workspace.models import (
 )
 
 SCHEMA = MODEL_BUDGET_SCHEMA + """
+CREATE TABLE IF NOT EXISTS sandbox_markerless_diagnostics_v1 (
+    root TEXT PRIMARY KEY,
+    directory_fingerprint TEXT NOT NULL,
+    observed_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS node_result_sources_v1 (
     node_id TEXT PRIMARY KEY,
     source_json TEXT NOT NULL
@@ -1201,6 +1206,37 @@ class SqliteMetadataStore:
                 _json_dumps(dict(proposal.metadata)),
                 proposal.created_at.isoformat(),
             ),
+        )
+
+    async def record_markerless_sandbox(self, root: Path, fingerprint: str) -> bool:
+        """Record a new observation; this row grants no cleanup authority."""
+        key = str(root)
+        row = await self._db.fetchone(
+            "SELECT directory_fingerprint FROM sandbox_markerless_diagnostics_v1 WHERE root = ?",
+            (key,),
+        )
+        if row is not None and row["directory_fingerprint"] == fingerprint:
+            return False
+        return bool(await self._db.execute(
+            "INSERT INTO sandbox_markerless_diagnostics_v1 "
+            "(root, directory_fingerprint, observed_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(root) DO UPDATE SET directory_fingerprint=excluded.directory_fingerprint, "
+            "observed_at=excluded.observed_at "
+            "WHERE directory_fingerprint != excluded.directory_fingerprint",
+            (key, fingerprint, datetime.now(UTC).isoformat()),
+        ))
+
+    async def clear_cleaned_sandbox(self, proposal: ChangeProposal) -> None:
+        """Retire only the same terminal proposal's live sandbox pointer."""
+        row = await self._db.fetchone(
+            "SELECT * FROM change_proposals WHERE id = ?", (proposal.id,))
+        if row is None or self._row_to_change_proposal(row).sandbox_ref != proposal.sandbox_ref:
+            return
+        await self._db.execute(
+            "UPDATE change_proposals SET sandbox_json = NULL WHERE id = ? AND task_id = ? "
+            "AND sandbox_json = ? AND status = ? "
+            "AND status IN ('applied', 'rejected', 'rolled_back')",
+            (proposal.id, proposal.task_id, row["sandbox_json"], proposal.status.value),
         )
 
     async def get_change_proposal(self, proposal_id: str) -> ChangeProposal | None:
