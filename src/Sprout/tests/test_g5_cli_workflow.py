@@ -138,3 +138,114 @@ async def test_code_preparation_uses_owned_session_workspace(tmp_path, monkeypat
         prepare_fs.assert_not_awaited()
         if case == "mismatch":
             runtime.get_workspace.assert_not_awaited()
+
+
+def test_analysis_and_test_execution_has_an_isolated_route():
+    assert execution_request("分析项目并运行全部测试。")
+    assert not execution_request("分析项目，不做任何修改。")
+    assert not execution_request("分析项目并修改 app.py 后运行测试。")
+
+
+def test_conditional_test_addition_is_a_coding_request():
+    assert detect_task_hint("检查现有测试是否充分，不足时补充。")
+
+
+def test_coverage_check_is_explicit_read_only_analysis():
+    from Sprout.runtime.analysis_consent import explicit_request
+
+    assert explicit_request("检查 greet 和 add 的测试覆盖。")
+    assert not detect_task_hint("检查 greet 和 add 的测试覆盖。")
+
+
+SQLITE_PROJECT_REQUESTS = {
+    17: (
+        '只运行当前项目已有的全部单元测试。\n'
+        '\n'
+        '要求：\n'
+        '1. 自动发现测试文件。\n'
+        '2. 自动识别测试框架。\n'
+        '3. 自动检查 Docker 环境。\n'
+        '4. 使用 Docker 隔离执行。\n'
+        '5. 返回实际执行的命令。\n'
+        '6. 返回通过、失败、跳过数量。\n'
+        '7. 不修改任何项目文件。'
+    ),
+    19: (
+        '请在当前项目的 app.py 中新增一个 subtract(a, b) 函数，实现两个数字相减。\n'
+        '\n'
+        '要求：\n'
+        '1. 添加类型标注。\n'
+        '2. 补充清晰的函数文档。\n'
+        '3. 在 test_app.py 中增加对应单元测试。\n'
+        '4. 覆盖正数、负数、零和混合符号。\n'
+        '5. 运行项目全部测试。\n'
+        '6. 确保原有 greet 和 add 函数行为不变。\n'
+        '7. 测试全部通过后，展示实际代码 diff。\n'
+        '8. 完成独立 Verification 和 Review。\n'
+        '9. 最后将修改写回当前项目。'
+    ),
+    21: (
+        '请修改 app.py 中 subtract 函数的文档字符串，使其明确说明参数、返回值和使用示例。\n'
+        '\n'
+        '不要修改其他函数。\n'
+        '运行现有全部测试，确认没有回归。'
+    ),
+    23: (
+        '检查当前项目的 greet 和 add 函数，判断现有单元测试是否已经覆盖主要行为。\n'
+        '\n'
+        '如果已经覆盖，不要修改任何文件，直接给出分析结果。'
+    ),
+}
+
+
+def test_complete_sqlite_requests_keep_the_primary_operation():
+    assert execution_request(SQLITE_PROJECT_REQUESTS[17])
+    assert detect_task_hint(SQLITE_PROJECT_REQUESTS[19])
+    assert detect_task_hint(SQLITE_PROJECT_REQUESTS[21])
+    assert not detect_task_hint(SQLITE_PROJECT_REQUESTS[23])
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("sequence", [17, 19, 21])
+async def test_original_project_requests_dispatch_before_analysis(automatic, stream, sequence):
+    from unittest.mock import AsyncMock
+
+    from Sprout.message.models import Message
+
+    runtime, session = automatic.rig.runtime, automatic.rig.session
+    workspace, principal = automatic.rig.workspace, automatic.rig.principal
+    await runtime._remember_session_workspace(session.id, workspace.id)
+    analyze, prepare = AsyncMock(return_value=None), AsyncMock(return_value=None)
+    request = Message(SQLITE_PROJECT_REQUESTS[sequence], session_id=session.id, channel="cli")
+    options = dict(principal=principal, foreground=True,
+                   analysis_task_provider=analyze, code_task_provider=prepare)
+    if stream:
+        reply = next(c.outbound for c in [
+            c async for c in runtime.handle_stream(request, **options)
+        ] if c.outbound)
+    else:
+        reply = await runtime.handle(request, **options)
+    assert reply.content == ("test_execution_cancelled" if sequence == 17
+                             else "code_task_cancelled")
+    analyze.assert_not_awaited()
+    prepare.assert_awaited_once()
+    assert runtime.session_workspace_id(prepare.call_args.kwargs["session"]) == workspace.id
+
+
+def test_composite_plan_preserves_edit_and_test_targets():
+    plan = plan_files(("app.py", "test_app.py"),
+                      "修改代码、补充测试、运行测试、修复失败的测试，最后 Review。")
+    assert plan["writes"] == ("app.py", "test_app.py")
+    assert plan["execution"] == ("run_tests",)
+    assert "test_extension" in plan["actions"]
+
+
+def test_source_review_routes_without_writes():
+    from Sprout.message.models import Message
+    from Sprout.runtime.analysis_consent import explicit_request
+    from Sprout.runtime.runtime import _project_analyze_tool_call
+
+    text = "检查代码并 Review。"
+    assert explicit_request(text)
+    assert not detect_task_hint(text)
+    assert _project_analyze_tool_call(Message(text), "workspace") is not None

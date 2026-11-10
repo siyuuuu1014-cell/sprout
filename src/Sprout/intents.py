@@ -219,9 +219,44 @@ def write_intent_disposition(text: str) -> WriteIntentDisposition:
             else WriteIntentDisposition.UNKNOWN)
 
 
+def project_clauses(text: str) -> tuple[str, ...]:
+    """Separate operation clauses from list markers and dependent clauses."""
+    return tuple(
+        re.sub(r"^\d+[.、]\s*", "", part.strip())
+        for part in re.split(r"[。；;\n，,]|并且?(?!不)|然后|同时|最后", text)
+        if part.strip()
+    )
+
+
+def conditional_test_extension(text: str) -> bool:
+    clauses = project_clauses(text)
+    return (bool(clauses) and clauses[0].startswith(("检查", "请检查"))
+            and "测试" in clauses[0]
+            and any(c.startswith(("不足时补充", "不足时添加")) for c in clauses[1:])
+            and not any(c.startswith(("不要", "只分析", "不修改")) for c in clauses))
+
+
 def detect_task_hint(text: str) -> bool:
     """Compatible bool fast path; UNKNOWN is not permission to create a Task."""
-    return write_intent_disposition(text) is WriteIntentDisposition.EXPLICIT_WRITE
+    if write_intent_disposition(text) is WriteIntentDisposition.EXPLICIT_WRITE:
+        return True
+    if any(mark in text for mark in ('"', '“', '”', '‘', '’', chr(96), '?', '？')):
+        return False
+    clauses = project_clauses(text)
+    if not clauses or any(c.startswith(("或者", "还是", "只分析", "仅分析", "如果"))
+                          or ("不修改" in c and "其他" not in c)
+                          or (c.startswith("不要") and not c.startswith("不要修改其他"))
+                          for c in clauses):
+        return False
+    first = clauses[0]
+    if conditional_test_extension(text):
+        return True
+    if not first.startswith(("分析", "检查", "请分析", "请检查")):
+        return write_intent_disposition(first) is WriteIntentDisposition.EXPLICIT_WRITE
+    return any(c.startswith(("补充缺失的测试", "补充测试", "生成单元测试", "修改代码",
+                             "修复失败的测试"))
+               and write_intent_disposition(c) is WriteIntentDisposition.EXPLICIT_WRITE
+               for c in clauses[1:])
 
 
 def needs_intent_clarification(text: str) -> bool:

@@ -27,7 +27,13 @@ def _test_file(path):
 
 def plan_files(paths, instruction, *, symbols=None):
     """Plan distinct effects; names and execution hints never grant authority."""
-    from Sprout.intents import WriteIntentDisposition, write_intent_disposition
+    from Sprout.intents import (
+        WriteIntentDisposition,
+        conditional_test_extension,
+        detect_task_hint,
+        project_clauses,
+        write_intent_disposition,
+    )
 
     paths = tuple(sorted(set(paths)))
     if not paths or len(paths) > 64:
@@ -37,7 +43,8 @@ def plan_files(paths, instruction, *, symbols=None):
 
     if execution_request(instruction):
         return {**result, 'execution': ('run_tests',), 'actions': ('test_execution',)}
-    if write_intent_disposition(instruction) is WriteIntentDisposition.KNOWN_NONWRITE:
+    if (not detect_task_hint(instruction)
+            and write_intent_disposition(instruction) is WriteIntentDisposition.KNOWN_NONWRITE):
         return result
     sources = [p for p in paths if p.endswith('.py') and not _test_file(p)
                and PurePosixPath(p).name != '__init__.py']
@@ -47,14 +54,19 @@ def plan_files(paths, instruction, *, symbols=None):
     # before classifying file operations, so "add logging then run tests" does
     # not become "add tests".
     body = re.sub(run_pattern, '', instruction, flags=re.I)
+    if conditional_test_extension(instruction):
+        body += "。补充缺失的测试"
     writes, actions, edited_sources = [], [], []
-    for clause in re.split(r'[，,。;；\n]|并且|并|同时|然后|以及', body):
+    for clause in re.split(r'[，,、。;；\n]|并且|并|同时|然后|以及|最后', body):
+        clause = re.sub(r"^\s*\d+[.、]\s*", "", clause).strip()
+        if clause.startswith(("不要", "不修改", "不改动", "不写入", "保留")):
+            continue
         mentioned = re.findall(r'[A-Za-z0-9_./-]+\.[A-Za-z][A-Za-z0-9_]*', clause)
         creating = bool(re.search(r'生成|创建|新增|添加|增加|编写|补写|补齐|'
                                   r'\b(?:generate|create|add|write)\b', clause, re.I))
         editing = bool(re.search(r'修改|编辑|修复|重构|调整|更新|补充|完善|'
                                  r'\b(?:modify|edit|fix|refactor|update|extend)\b', clause, re.I))
-        extending = bool(re.search(r'补充|完善|\bextend\b', clause, re.I))
+        extending = bool(re.search(r'补充|完善|修复失败的测试|\bextend\b', clause, re.I))
         test_change = (creating or extending) and bool(re.search(
             r'测试|覆盖率|覆盖|\btests?\b|test_[\w.-]+|[\w.-]+_test\.py', clause, re.I))
         selected = []
@@ -86,6 +98,19 @@ def plan_files(paths, instruction, *, symbols=None):
             writes.extend(sources)
             edited_sources.extend(sources)
             actions.append("code_modification")
+        elif editing and not selected and not test_change:
+            function = re.search(r"(?:修改|修复|重构)\s*([A-Za-z_]\w*)\s*函数", clause)
+            if function and symbols is not None:
+                targets = sorted({path for path, name in symbols if name == function[1]})
+                if len(targets) != 1:
+                    raise PermissionError("filesystem_planning_function_target_unresolved")
+                writes.extend(targets)
+                edited_sources.extend(targets)
+                actions.append("code_modification")
+            elif clause.startswith(("修改代码", "修改源码")) and len(sources) == 1:
+                writes.extend(sources)
+                edited_sources.extend(sources)
+                actions.append("code_modification")
         elif selected and (editing or creating):
             symbol = re.search(r"\.(?:py)\s*中\s*(?:的\s*)?([A-Za-z_]\w*)\s*函数",
                                clause)
@@ -112,6 +137,8 @@ def plan_files(paths, instruction, *, symbols=None):
         raise PermissionError('filesystem_planning_input_budget')
     if run_tests:
         actions.append('test_execution')
+        if any(clause.startswith("修复失败的测试") for clause in project_clauses(instruction)):
+            actions.append("test_repair")
     return {**result, 'writes': tuple(dict.fromkeys(writes)),
             'execution': ('run_tests',) if run_tests else (),
             'actions': tuple(dict.fromkeys(actions))}
@@ -155,6 +182,12 @@ async def discover_plan(runtime, workspace, message, owned, principal):
         for label in group:
             checked_label(label, workspace.root, overrides)
     report(runtime, 'Analysis', 'completed')
+    from Sprout.intents import project_clauses
+    from Sprout.runtime.isolated_test_run import execution_request
+
+    clauses = project_clauses(message.content)
+    if clauses and clauses[0].startswith(("分析", "请分析")) and execution_request(message.content):
+        typer.echo(response.content)
     return plan
 
 

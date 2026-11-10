@@ -159,3 +159,26 @@ async def test_bound_command_cannot_be_dispatched_from_global_registry(tmp_path)
     result = await ToolExecutor(tools=registry).execute(tool.spec.name, {"command": ["python"]})
     assert not result.ok and "strict node-local" in result.error
     handler.execute.assert_not_called()
+
+
+@pytest.mark.parametrize("first_exit", [1, None, 0])
+async def test_foreground_test_repair_allows_one_exact_rerun(tmp_path, first_exit):
+    from dataclasses import replace
+
+    sandbox, task, _ = fixture(tmp_path)
+    command = ("python", "-m", "unittest", "-v")
+    process = ProcessResult(command, exit_code=first_exit, started=True)
+    output = {"process": process, "imported": first_exit == 0}
+    handler = SimpleNamespace(execute=AsyncMock(return_value=output))
+    tool = IsolatedCodingCommandTool(handler, task=task, node=ExecutionNode(task_id=task.id),
+        sandbox=replace(sandbox, kind="filesystem_experiment"), filesystem_root_only=True,
+        retry_failed_tests=True)
+    await tool.invoke({"command": list(command)})
+    assert not (await tool.invoke({"command": ["python", "unrelated.py"]})).ok
+    handler.execute.return_value = {
+        "process": ProcessResult(command, exit_code=0, started=True), "imported": True,
+    }
+    assert (await tool.invoke({"command": list(command)})).ok is (first_exit == 1)
+    assert not (await tool.invoke({"command": list(command)})).ok
+    expected = ["evaluation-0", "evaluation-1"] if first_exit == 1 else ["evaluation-0"]
+    assert [call.kwargs["command_slot"] for call in handler.execute.await_args_list] == expected

@@ -235,10 +235,15 @@ def _project_analyze_tool_call(message: Message, intent: str) -> dict[str, Any] 
         re.search(r"分析|扫描|\b(?:analy[sz]e|inspect|scan)\b", text)
         and any(term in text for term in ("项目", "project", "目录", "directory", "folder"))
     )
-    from Sprout.runtime.analysis_consent import code_metrics_request
+    from Sprout.runtime.analysis_consent import (
+        code_metrics_request,
+        coverage_request,
+        source_review_request,
+    )
 
-    if not (code_metrics_request(text) or explicit_analysis or project_analysis or any(
-            term.casefold() in text for term in _PROJECT_ANALYZE_TERMS)):
+    if not (source_review_request(text) or coverage_request(text)
+            or code_metrics_request(text) or explicit_analysis
+            or project_analysis or any(term.casefold() in text for term in _PROJECT_ANALYZE_TERMS)):
         return None
     metadata = dict(message.metadata)
     raw_path = (
@@ -2256,6 +2261,9 @@ class Runtime:
                 admission["projected_data"] = projector(analysis, view)
                 if admission.get("code_metrics"):
                     return admission["projected_data"]
+                if admission.get("source_review"):
+                    return ToolResult.success(result.content + admission["projected_data"],
+                                              data=result.data)
             return result
 
         result = await self._capture_project_selection(
@@ -3251,7 +3259,18 @@ class Runtime:
         This local-only lane does not select Tasks by Session, create a Scope,
         or reinterpret old/running graphs. The existing guard owns execution.
         """
-        from Sprout.runtime.analysis_consent import code_metrics_request, explicit_request
+        from Sprout.runtime.analysis_consent import (
+            code_metrics_request,
+            coverage_request,
+            explicit_request,
+            source_review_request,
+        )
+        from Sprout.runtime.isolated_test_run import execution_request
+
+        if (analysis_task is None and analysis_task_provider is not None
+                and principal is not None and principal.authenticated and principal.source == "cli"
+                and (execution_request(message.content) or detect_task_hint(message.content))):
+            return None
         from Sprout.runtime.dialogue import (
             analysis_followup,
             code_status,
@@ -3385,6 +3404,13 @@ class Runtime:
             node = ExecutionNode(task_id=task.id, type=NodeType.AGENT)
             admission = {"task": task, "workspace": workspace, "paths": paths,
                          "target": target, "message": message, "analysis_result": None}
+            if cli_request and (coverage_request(message.content)
+                                or source_review_request(message.content)):
+                from Sprout.runtime.analysis_consent import coverage_evidence
+
+                admission["source_review"] = True
+                admission["coverage_review"] = coverage_request(message.content)
+                admission["content_project"] = coverage_evidence
             if cli_request and code_metrics_request(message.content):
                 if len(paths) != 1 or not paths[0].casefold().endswith(".py"):
                     raise PermissionError("code_metrics_requires_one_python_file")
@@ -3884,9 +3910,18 @@ class Runtime:
         if self._asks_for_workspace(message, context, session):
             held, outbound = await self._request_workspace(message, session)
             return outbound, held
-        if str(context.metadata.get("intent") or "") != "task":
+        cli = (foreground and code_task_provider is not None and principal is not None
+               and principal.authenticated and principal.source == message.channel == "cli")
+        if not cli and str(context.metadata.get("intent") or "") != "task":
             return None
         explicit = str(message.metadata.get("workspace_id") or "")
+        if cli:
+            session = await self._sessions.require_owner(session.id, principal)
+            explicit = self.session_workspace_id(session)
+            if not explicit:
+                held, outbound = await self._request_workspace(message, session)
+                return outbound, held
+            message = replace(message, metadata={**message.metadata, "workspace_id": explicit})
         if explicit:
             # The message names its workspace: the resume from a consent grant,
             # or a caller that bound one deliberately. Already an instruction.
@@ -3941,6 +3976,12 @@ class Runtime:
         """
         if not result.metadata.get(WORKSPACE_REQUESTED_KEY):
             return None
+        if self.session_workspace_id(session) and message.channel == "cli":
+            reason = "当前会话已绑定工作区，但此请求没有进入项目工作流。请明确操作和目标。"
+            return message, OutboundMessage(
+                reason, message.channel, session.id, message.id,
+                {"blocked_reason": "project_operation_unresolved"},
+            )
         if write_intent_disposition(message.content) is WriteIntentDisposition.KNOWN_NONWRITE:
             return None
         if str(message.metadata.get("workspace_id") or ""):

@@ -155,7 +155,13 @@ class FilesystemExperiment:
         if (agent is None or agent.task_id != current.id or agent.type is not NodeType.AGENT
                 or agent.status is not NodeStatus.COMPLETED or guard.get("state") != "completed"):
             raise PermissionError("filesystem_review_agent_evidence_unavailable")
-        execution_id = str(uuid5(NAMESPACE_URL, agent.id + ":coding:evaluation-0"))
+        plan = current.metadata.get("filesystem_plan_v1", {})
+        slot = "evaluation-0"
+        if "test_repair" in plan.get("actions", ()):
+            retry_id = str(uuid5(NAMESPACE_URL, agent.id + ":coding:evaluation-1"))
+            if await store.get_coding_execution(retry_id) is not None:
+                slot = "evaluation-1"
+        execution_id = str(uuid5(NAMESPACE_URL, agent.id + ":coding:" + slot))
         execution = await store.get_coding_execution(execution_id)
         command = None
         if execution:
@@ -165,7 +171,10 @@ class FilesystemExperiment:
             result = execution.get("result") or {}
             command = {"id": execution_id, "status": execution["state"],
                        "signature": execution["signature"], "exit_code": result.get("exit_code")}
-            import_id = str(uuid5(NAMESPACE_URL, agent.id + ":coding-import:evaluation-0-import"))
+            if ("run_tests" in plan.get("execution", ())
+                    and (execution["state"] != "completed" or result.get("exit_code") != 0)):
+                raise PermissionError("filesystem_requested_test_command_failed")
+            import_id = str(uuid5(NAMESPACE_URL, agent.id + f":coding-import:{slot}-import"))
             imported = await store.get_coding_execution(import_id)
             if imported:
                 if (imported.get("task_id"), imported.get("node_id"), imported.get("owner")) != (
@@ -175,6 +184,8 @@ class FilesystemExperiment:
                 command["import"] = {"id": import_id, "signature": imported["signature"],
                                      "status": imported["state"],
                                      "changed_paths": import_result.get("changed_paths", [])}
+        if execution is None and "run_tests" in plan.get("execution", ()):
+            raise PermissionError("filesystem_requested_test_command_missing")
         report(self.runtime, "ChangeSet", "capturing...")
         review = capture_changes(
             self.sandbox, self.before, current.id, current.workspace_id,

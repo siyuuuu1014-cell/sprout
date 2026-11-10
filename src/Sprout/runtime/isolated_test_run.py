@@ -11,12 +11,21 @@ from Sprout.security.local_diagnostics import report
 
 
 def execution_request(text):
+    from Sprout.intents import detect_task_hint, project_clauses
+
     text = text.strip().casefold()
-    text = re.sub(r'(?:不修改|不改动|不写入)(?:任何)?文件', '', text)
-    if re.search(r'不要|别运行|不运行|不执行|取消|讨论|解释|如何|方案|是否|[？?]|'
-                 r'修改|生成|创建|补充|添加|编写', text):
+    excluded = r"不要|别运行|不运行|不执行|取消|讨论|解释|如何|方案|是否|[？?]"
+    if detect_task_hint(text) or re.search(excluded, text):
         return False
-    return bool(re.match(r'^(?:请|帮我)?\s*(?:只|仅)?(?:运行|执行)[^。！？\n]{0,180}测试', text))
+    clauses = tuple(c for c in project_clauses(text)
+                    if not re.fullmatch(r"(?:不修改|不改动|不写入)(?:任何)?(?:项目)?文件", c))
+    if not clauses:
+        return False
+    first = clauses[0]
+    if first.startswith(("分析", "请分析")) and len(clauses) > 1:
+        first = clauses[1]
+    return bool(re.match(r"^(?:请|帮我)?\s*(?:只|仅)?(?:运行|执行).{0,180}测试", first)
+                and not re.search(r"修改|生成|创建|补充|添加|编写", " ".join(clauses)))
 
 
 def execution_report(command, image, exit_code, stdout, stderr):

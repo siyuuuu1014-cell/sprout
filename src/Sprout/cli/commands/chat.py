@@ -371,9 +371,14 @@ async def _provide_cli_analysis_task(runtime, workspace_id, *, message, session,
 
     if not principal.authenticated or principal.source != "cli":
         raise PermissionError("cli_analysis_identity_unavailable")
-    workspace = await runtime.get_workspace(workspace_id) if workspace_id else None
-    if workspace is None:
+    owned = await runtime._sessions.require_owner(session.id, principal)
+    bound = runtime.session_workspace_id(owned)
+    workspace_id = bound or workspace_id
+    if not workspace_id:
         raise PermissionError("cli_analysis_workspace_required")
+    workspace = await runtime.get_workspace(workspace_id)
+    if workspace is None or not workspace.root.is_dir():
+        raise PermissionError("cli_session_workspace_unavailable")
     if not sys.stdin.isatty():
         raise PermissionError("cli_analysis_interactive_confirmation_required")
     typer.echo(_L("本次只读分析工作区：", "Read-only analysis workspace: ")
@@ -381,9 +386,16 @@ async def _provide_cli_analysis_task(runtime, workspace_id, *, message, session,
     typer.echo(_L(
         "选择范围不替代 Policy/Scope 授权。", "Selection does not override Policy/Scope.",
     ))
-    from Sprout.runtime.analysis_consent import code_metrics_request
+    from Sprout.runtime.analysis_consent import (
+        code_metrics_request,
+        coverage_request,
+        source_review_request,
+    )
 
     selection = _analysis_selection(message.content)
+    if ((coverage_request(message.content) and (not selection or selection[0] == "file"))
+            or (source_review_request(message.content) and not selection)):
+        selection = ("directory", ".")
     if code_metrics_request(message.content) and selection and selection[0] != "file":
         selection = None
     if selection and selection[0] == "directory":

@@ -527,14 +527,26 @@ class NodeExecutor:
             "arguments": {"path": admission["target"],
                           "instruction": admission["message"].content},
         }]})
-        message = Message(content=admission["message"].content, channel="task",
-                          user_id=task.actor.user_id)
+        instruction = admission["message"].content
+        if admission.get("coverage_review"):
+            instruction += (
+                "\nUse the captured Python source and tests to map each requested function "
+                "to named tests and their assertions. Identify normal, boundary and error cases, "
+                "return-value checks and gaps. Never infer a coverage percentage from source. "
+                "Report missing evidence explicitly and do not modify anything."
+            )
+        elif admission.get("source_review"):
+            instruction += (
+                "\nReview the captured source. Cite files and findings, label uncertain evidence, "
+                "and do not modify anything or claim tests ran."
+            )
+        message = Message(content=instruction, channel="task", user_id=task.actor.user_id)
         result = await self._publish_node_model(
             node, workspace, task, self._router.route(message), message, context,
         )
         analysis_ok = admission["analysis_result"] is not None
         content = result.content
-        if analysis_ok and not paths:
+        if analysis_ok and not paths and not admission.get("source_review"):
             from Sprout.workspace.query import WorkspaceQuery
 
             content = WorkspaceQuery(admission["analysis_data"], captured=True).indexed_report()
@@ -615,7 +627,9 @@ class NodeExecutor:
                     self._coding_commands, task=task, node=node, sandbox=sandbox_ref))
         if experiment is not None and experiment.image:
             sandbox_tools.append(IsolatedCodingCommandTool(
-                experiment, task=task, node=node, sandbox=sandbox_ref, filesystem_root_only=True))
+                experiment, task=task, node=node, sandbox=sandbox_ref, filesystem_root_only=True,
+                retry_failed_tests="test_repair" in task.metadata.get(
+                    "filesystem_plan_v1", {}).get("actions", ())))
         feedback = self._previous_evaluation_feedback(node, nodes)
         node_skills = {}
         allowed = set(node.metadata.get("tool_names") or ())

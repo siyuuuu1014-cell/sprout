@@ -39,8 +39,14 @@ class CodingNodeSession:
         self.regression_spec = (AcceptanceSpec.from_payload(regression_spec).to_payload()
                                 if regression_spec is not None else None)
 
-    async def prepare(self):
+    async def prepare(self, *, repair=False):
         node_directory = coding_node_directory_name(self.node.id)
+        export_id = self.node.id + ":export"
+        if repair:
+            if self.sandbox.kind != "filesystem_experiment":
+                raise ValueError("Repair export requires a filesystem experiment")
+            node_directory += "-repair"
+            export_id += ":repair"
         evidence, target = safe_path(self.evidence), safe_path(self.sandbox.root)
         original = safe_path(self.original)
         if any(evidence.is_relative_to(root) or root.is_relative_to(evidence)
@@ -57,7 +63,7 @@ class CodingNodeSession:
                     "oracle_paths": list(self.oracle_paths)}
         owner = self.node.metadata.get("execution_guard", {}).get("owner")
         await self.metadata.ensure_coding_intent({
-            "id": self.node.id + ":export", "node_id": self.node.id, "task_id": self.task.id,
+            "id": export_id, "node_id": self.node.id, "task_id": self.task.id,
             "owner": owner, "signature": hashlib.sha256(
                 json.dumps(contract, sort_keys=True).encode()).hexdigest(), "contract": contract})
         directory.mkdir(exist_ok=True)
@@ -80,7 +86,8 @@ class CodingNodeSession:
         return context, manifest
 
     async def execute_command(self, command, *, cwd, command_slot):
-        context, baseline = await self.prepare()
+        repair = self.sandbox.kind == "filesystem_experiment" and command_slot == "evaluation-1"
+        context, baseline = await self.prepare(repair=repair)
         relative = safe_path(cwd).relative_to(safe_path(self.sandbox.root)).as_posix()
         request = replace(context, command=tuple(command), relative_cwd=relative)
         dispatch = IsolatedNodeDispatcher(self.metadata, self.runner,
