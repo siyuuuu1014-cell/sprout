@@ -118,7 +118,7 @@ async def context(runtime, workspace, session, principal, target):
     return owned, scope, arguments, reusable
 
 
-async def bind(runtime, task, workspace, owned, principal, arguments):
+async def bind(runtime, task, workspace, owned, principal, arguments, *, automatic=False):
     """Called only after the foreground CLI confirmed this exact directory."""
     from Sprout.task.models import TaskExecutionMode, TaskStatus
 
@@ -137,9 +137,10 @@ async def bind(runtime, task, workspace, owned, principal, arguments):
             resource_scope=arguments['path']):
         record = await runtime.approvals.request('directory.list', arguments, task_id=task.id,
             session_id=owned.id, requested_by=principal.user_id, source=principal.source,
-            single_use=False, resource_scope=arguments['path'])
+            single_use=False, resource_scope=arguments['path'], request_approval=not automatic)
         await runtime.approvals.decide(record.id, True, decided_by=principal.user_id,
-            channel='cli', reason='Foreground CLI confirmed this exact read-only directory')
+            channel='cli', reason=('Foreground Filesystem discovery' if automatic
+                                   else 'Foreground CLI confirmed this exact read-only directory'))
     record = await runtime.approvals._usable_record('directory.list', arguments,
         task_id=task.id, session_id=owned.id, requested_by=principal.user_id,
         source=principal.source,

@@ -42,10 +42,19 @@ async def _request_approval(experiment, task, arguments, identity, *, review_tex
         mode.records.add(approval.id)
         approved = True
     else:
-        approval = await manager.request("filesystem.apply", arguments, **identity)
-        approved = await experiment.confirm_apply(arguments, review_text)
-    return await manager.decide(approval.id, approved, principal=task.actor,
-                                decided_by=task.actor.user_id, channel="cli")
+        automatic = getattr(experiment, "automatic", False)
+        approval = await manager.request(
+            "filesystem.apply", arguments, request_approval=not automatic, **identity)
+        approved = automatic or await experiment.confirm_apply(arguments, review_text)
+    result = await manager.decide(
+        approval.id, approved, principal=task.actor, decided_by=task.actor.user_id, channel="cli",
+        reason="Foreground Filesystem exact Apply plan" if getattr(experiment, "automatic", False)
+        else None,
+    )
+    if (getattr(experiment, "automatic", False) and not isinstance(manager, DiagnosticApprovals)
+            and result.status is ApprovalStatus.APPROVED):
+        report(runtime, "Approval", "AUTO-APPROVED: filesystem.apply")
+    return result
 
 
 async def execute(experiment, evidence, payload):

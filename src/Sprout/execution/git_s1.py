@@ -665,7 +665,7 @@ async def _run_review(binding, issuer, frame, broker):
                 or getattr(issuer, "_verification_stopping", False)):
             raise PermissionError("git_authority_expired")
         active["authorization_callbacks"] += 1
-        broker._check_review_policy(frame.task, paths, binding.sandbox.root)
+        broker._check_review_policy(frame.task, paths, binding.sandbox.root, recheck=True)
     def authorize():
         check_selected(binding.paths)
     object_resource = None
@@ -721,6 +721,7 @@ async def _run_review(binding, issuer, frame, broker):
         if (meta_pin.identity != binding.metadata_identity
                 or common_pin.identity != binding.common_identity):
             raise PermissionError("git_metadata_root_changed")
+        _review_trace(frame, "source_snapshot", "begin")
         index, metadata, reader = _source(binding, authorize)
         objects = _LooseObjects(binding, reader)
         base = {path: selected_object(path, objects.file, path) for path in binding.paths}
@@ -735,6 +736,7 @@ async def _run_review(binding, issuer, frame, broker):
                 "identity": asdict(value.identity)})
         if sum(len(v) for v in (*base.values(), *current.values()) if v is not None) > 2_000_000:
             raise PermissionError("git_content_budget")
+        _review_trace(frame, "source_snapshot", "end")
         parent.check()
         view = binding.parent / ("git-review-" + uuid4().hex)
         view.mkdir()  # Exclusive, under the pinned Host output parent.
@@ -749,7 +751,12 @@ async def _run_review(binding, issuer, frame, broker):
                    "control/git/info/attributes": b"* -filter !diff !text !working-tree-encoding\n"}
         for name, data in payload.items():
             _write_view_file(view, name, data)
-        await _check_review_files(view, payload, refresh, authorize)
+        async def check_view():
+            _review_trace(frame, "view_check", "begin")
+            await _check_review_files(view, payload, refresh, authorize)
+            _review_trace(frame, "view_check", "end")
+
+        await check_view()
         _, listing = await _review_command(binding, view,
             ("ls-files", "--stage", "-z", "--", *binding.paths), refresh,
             issuer=issuer, frame=frame, broker=broker)
@@ -780,7 +787,7 @@ async def _run_review(binding, issuer, frame, broker):
             pin.check()
             parent.check()
             await refresh()
-            await _check_review_files(view, payload, refresh, authorize)
+            await check_view()
         for key, left, right in (("tracked", "base", "current"), ("staged", "base", "index"),
                                  ("unstaged", "index", "current"), ("untracked", "empty", "new")):
             # ready() is the command's mandatory pre/post View check. Scanning
@@ -795,6 +802,7 @@ async def _run_review(binding, issuer, frame, broker):
         # Re-read exact original resources before publishing, not just export bytes.
         # The final ready() below checks the complete View after these source
         # reads; none of them consumes exported View contents or executes Git.
+        _review_trace(frame, "source_revalidation", "begin")
         _source(binding, authorize)  # Recheck pairing/HEAD as well as the exact source bytes.
         for name, expected in metadata.items():
             path = Path(name)
@@ -811,6 +819,7 @@ async def _run_review(binding, issuer, frame, broker):
                 "size": len(value.data), "identity": asdict(value.identity)}
             if actual != expected:
                 raise PermissionError("git_worktree_content_changed")
+        _review_trace(frame, "source_revalidation", "end")
         await ready()
         if sum(len(x["stdout"].encode()) for x in logs) > MAX_OUTPUT_BYTES:
             raise PermissionError("git_total_output_budget")
@@ -852,7 +861,7 @@ async def validate_review(binding, issuer, frame, broker, evidence):
     await issuer._git_review_record(binding, broker, frame)
     await broker._authorize_review(frame, binding.paths, binding.sandbox.root)
     def authorize():
-        broker._check_review_policy(frame.task, binding.paths, binding.sandbox.root)
+        broker._check_review_policy(frame.task, binding.paths, binding.sandbox.root, recheck=True)
     with pin_execution_directory(binding.sandbox.root) as pin:
         if pin.identity != binding.root_identity or evidence["baseline"] != binding.baseline:
             raise PermissionError("git_review_publication_root_changed")

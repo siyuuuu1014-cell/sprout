@@ -309,3 +309,35 @@ async def test_scoped_read_approval_and_file_broker_result_are_separate(rig, out
                              f"[Tool] {name}: {outcome if result.ok else 'failed'}"]
             if result.ok:
                 assert result.content == "diagnostic file probe"
+
+
+
+@pytest.mark.parametrize("tool", ["process_run", "file.apply"])
+async def test_diagnostic_exact_git_approval_is_bound(diagnostic, monkeypatch, tool):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from Sprout.security.approval import ApprovalStatus
+    from Sprout.security.local_diagnostics import exact_approval
+
+    async with diagnostic() as (mode, runtime, session, principal):
+        task = SimpleNamespace(id="git-task", actor=principal, source="cli",
+                               metadata={"session_id": session.id})
+        monkeypatch.setattr(runtime, "get_task", AsyncMock(return_value=task))
+        progress = []
+        mode.progress = progress.append
+        manager = runtime.approvals
+        identity = dict(task_id=task.id, requested_by=principal.user_id,
+                        session_id=session.id, source="cli", resource_scope="scope")
+        args = {"fingerprint": "exact"}
+        with pytest.raises(PermissionError, match="refuses this effect"):
+            await manager.request(tool, args, **identity)
+        with exact_approval(manager, task.id, tool, args, "scope"):
+            with pytest.raises(PermissionError, match="refuses this effect"):
+                await manager.request(tool, {"fingerprint": "changed"}, **identity)
+            record = await manager.request(tool, args, **identity)
+        if tool == "file.apply":
+            assert record.status is ApprovalStatus.PENDING
+            record = await manager.decide(record.id, True, principal=principal)
+        assert record.status is ApprovalStatus.APPROVED
+        assert progress == [f"[Approval] AUTO-APPROVED: {tool}"]

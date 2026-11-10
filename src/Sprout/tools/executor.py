@@ -324,6 +324,11 @@ class ToolExecutor:
 
         diagnostic_runtime = (self.approvals.diagnostics.runtime
                               if isinstance(self.approvals, DiagnosticApprovals) else None)
+        experiment = (scope.runtime._sandbox_lifecycle.filesystem.get(task_id)
+                      if scope is not None and generic_binding else None)
+        automatic = experiment is not None and getattr(experiment, "automatic", False)
+        if automatic:
+            diagnostic_runtime = scope.runtime
         await self._audit(name, task_id, source, decision.decision.value, decision.reason)
 
         if decision.decision not in {AccessDecision.ALLOW, AccessDecision.REQUIRE_APPROVAL}:
@@ -434,6 +439,9 @@ class ToolExecutor:
                     resource_scope=resource_scope,
                 )
             if not approval_granted:
+                scoped = experiment is not None and scoped_file_tool(tool)
+                if scoped and automatic:
+                    await experiment._subject(scope.task, scope.node)
                 record = await self.approvals.request(
                     name,
                     approval_arguments,
@@ -443,24 +451,25 @@ class ToolExecutor:
                     source=source,
                     session_id=session_id,
                     additional_events=self.events,
+                    request_approval=not (scoped and automatic),
                 )
                 if (capability_binding is not None and record.expires_at is not None
                         and permits_cli_task_reuse(capability_binding[0])):
                     turn.offer(record.id, capability_binding)
-                experiment = (scope.runtime._sandbox_lifecycle.filesystem.get(task_id)
-                              if scope is not None and generic_binding else None)
-                if experiment is None or not scoped_file_tool(tool):
+                if not scoped:
                     return ToolResult.needs_approval(record.id)
-                approved = await experiment.confirm_tool(record)
+                approved = automatic or await experiment.confirm_tool(record)
                 await experiment._subject(scope.task, scope.node)
                 await self.approvals.decide(
                     record.id, approved, principal=subject.actor, decided_by=requested_by,
-                    channel="cli")
+                    channel="cli", reason="Foreground Filesystem tool" if automatic else None)
                 if not approved or not await self.approvals.is_approved(
                     name, approval_arguments, task_id=task_id, session_id=session_id,
                     requested_by=requested_by, source=source, resource_scope=resource_scope,
                 ):
                     return ToolResult.denied("Filesystem tool approval refused or unavailable")
+                if automatic:
+                    report(scope.runtime, "Approval", f"AUTO-APPROVED: {name}")
                 approval_granted = True
 
         try:

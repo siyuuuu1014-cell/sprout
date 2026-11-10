@@ -440,16 +440,22 @@ async def _approve(runtime, proposal_id, principal):
     if proposal.status is not ChangeProposalStatus.PENDING:
         raise PermissionError("local_apply_proposal_not_pending")
     if not plan["approval_id"]:
-        request = await runtime._approvals.request(
-            "file.apply",
-            arguments(plan),
-            task_id=proposal.task_id,
-            requested_by=principal.user_id,
-            source=principal.source,
-            session_id=plan["body"]["session_id"],
-            resource_scope=proposal.id,
-            single_use=True,
-        )
+        from Sprout.security.local_diagnostics import exact_approval
+
+        payload = arguments(plan)
+        with exact_approval(
+            runtime._approvals, proposal.task_id, "file.apply", payload, proposal.id
+        ):
+            request = await runtime._approvals.request(
+                "file.apply",
+                payload,
+                task_id=proposal.task_id,
+                requested_by=principal.user_id,
+                source=principal.source,
+                session_id=plan["body"]["session_id"],
+                resource_scope=proposal.id,
+                single_use=True,
+            )
         plan["approval_id"] = request.id
     record = await runtime._approvals.store.get_approval(plan["approval_id"])
     if (

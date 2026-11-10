@@ -23,6 +23,8 @@ from Sprout.security.approval import (
 )
 
 _CODING_REQUEST = ContextVar("local_cli_diagnostic_coding", default=None)
+_EXACT_REQUEST = ContextVar("local_cli_diagnostic_exact", default=None)
+foreground_progress = ContextVar("local_cli_foreground_progress", default=None)
 
 
 def prepare(settings, *, message, session):
@@ -131,6 +133,12 @@ class DiagnosticApprovals(ApprovalManager):
             approve = False
         elif tool == CODING_TASK_CAPABILITY and _CODING_REQUEST.get() == (self, task.id):
             approve = True
+        elif tool in {"process_run", "file.apply"} and _EXACT_REQUEST.get() == (
+            self, task.id, tool, self.fingerprint(arguments), kwargs.get("resource_scope")
+        ) and kwargs.get("session_id") == mode.session_id:
+            # Frozen process permits consume the approved record on their second
+            # pass. Exact Apply creates and decides its own plan record.
+            approve = tool == "process_run"
         else:
             raise PermissionError("Diagnostic mode refuses this effect; human approval disabled")
         kwargs["request_approval"] = False
@@ -140,7 +148,7 @@ class DiagnosticApprovals(ApprovalManager):
         if approve:
             await self.decide(record.id, True, principal=mode.principal,
                               decided_by=mode.principal.user_id, channel="cli",
-                              reason="LOCAL DIAGNOSTIC: isolated coding only")
+                              reason="Foreground diagnostic operation")
             record = await self.store.get_approval(record.id)
         return record
 
@@ -192,10 +200,30 @@ def coding_approval(manager, tool, scope):
         _CODING_REQUEST.reset(token)
 
 
+@contextmanager
+def exact_approval(manager, task_id, tool, arguments, resource_scope):
+    """Bind an already-validated Broker request to this foreground call."""
+    if not isinstance(manager, DiagnosticApprovals):
+        yield
+        return
+    token = _EXACT_REQUEST.set((
+        manager, task_id, tool, manager.fingerprint(arguments), resource_scope
+    ))
+    try:
+        yield
+    finally:
+        _EXACT_REQUEST.reset(token)
+
+
 def report(runtime, stage, detail):
     mode = current(runtime)
     if mode is not None and mode.progress is not None:
         mode.progress(f"[{stage}] {detail}")
+        return
+    progress = foreground_progress.get()
+    if runtime is not None and progress is not None and progress[:2] == (
+            runtime, asyncio.current_task()):
+        progress[2](f"[{stage}] {detail}")
 
 
 def scoped_file_tool(tool):
@@ -258,12 +286,20 @@ async def tool_refusal(manager, tool, scope):
     return "Diagnostic mode refuses effects without a bound workspace or isolated executor"
 
 
-def process_refused(manager, task_id, command):
+def process_refused(manager, task_id, command, *, frozen_scope=None):
     if not isinstance(manager, DiagnosticApprovals):
         return False
     from Sprout.execution.coding_backend import _CODING_PROCESS
 
+    mode = manager.diagnostics
+    if not mode.active():
+        return True
+    if frozen_scope is not None:
+        return not (frozen_scope.runtime is mode.runtime
+                    and frozen_scope.task.id == task_id
+                    and frozen_scope.task.actor == mode.principal
+                    and frozen_scope.session_id == mode.session_id)
     coding = _CODING_PROCESS.get()
-    return not (manager.diagnostics.active() and coding is not None
+    return not (coding is not None
                 and coding[:3] == (asyncio.current_task(), task_id, tuple(command))
                 and coding[3] is not None)

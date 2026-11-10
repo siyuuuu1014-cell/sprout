@@ -236,6 +236,11 @@ def conditional_test_extension(text: str) -> bool:
             and not any(c.startswith(("不要", "只分析", "不修改")) for c in clauses))
 
 
+def project_feature_edit(clause: str) -> bool:
+    """A direct feature edit, including one without a named file."""
+    return re.fullmatch(r"(?:请)?完善[^，。；！？]{1,60}功能", clause) is not None
+
+
 def detect_task_hint(text: str) -> bool:
     """Compatible bool fast path; UNKNOWN is not permission to create a Task."""
     if write_intent_disposition(text) is WriteIntentDisposition.EXPLICIT_WRITE:
@@ -243,13 +248,19 @@ def detect_task_hint(text: str) -> bool:
     if any(mark in text for mark in ('"', '“', '”', '‘', '’', chr(96), '?', '？')):
         return False
     clauses = project_clauses(text)
-    if not clauses or any(c.startswith(("或者", "还是", "只分析", "仅分析", "如果"))
+    feature_edit = any(project_feature_edit(c) for c in clauses)
+    if not clauses or any(c.startswith(("或者", "还是", "只分析", "仅分析"))
+                          or (c.startswith("如果") and not (
+                              feature_edit and c in {"如果发现失败", "如果测试失败"}))
+                          or (c.startswith("不要") and not (
+                              c.startswith("不要修改其他") or (
+                                  feature_edit and re.fullmatch(
+                                      r"不要修改\s+[\w./-]+\.\w+", c))))
                           or ("不修改" in c and "其他" not in c)
-                          or (c.startswith("不要") and not c.startswith("不要修改其他"))
                           for c in clauses):
         return False
     first = clauses[0]
-    if conditional_test_extension(text):
+    if feature_edit or conditional_test_extension(text):
         return True
     if not first.startswith(("分析", "检查", "请分析", "请检查")):
         return write_intent_disposition(first) is WriteIntentDisposition.EXPLICIT_WRITE

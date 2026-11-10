@@ -111,7 +111,9 @@ async def test_publication_metadata_origin(tmp_path, monkeypatch, case):
         values[root, "src/app.py"] = b"changed-source"
     issuer = SimpleNamespace(_git_review_record=AsyncMock())
     frame = SimpleNamespace(task=SimpleNamespace())
-    broker = SimpleNamespace(_authorize_review=AsyncMock(), _check_review_policy=lambda *a: None)
+    broker = SimpleNamespace(
+        _authorize_review=AsyncMock(), _check_review_policy=lambda *a, **kw: None
+    )
     if case in {"linked", "ordinary"}:
         await s.validate_review(binding, issuer, frame, broker, evidence)
     else:

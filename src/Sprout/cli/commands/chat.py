@@ -490,7 +490,7 @@ def _analysis_selection(content: str) -> tuple[str, str] | None:
 
 
 async def _provide_cli_directory_task(
-    runtime, workspace, session, principal, message, *, label=None,
+    runtime, workspace, session, principal, message, *, label=None, filesystem_preflight=False,
 ):
     """Confirm an exact read-only scope through Runtime's existing approvals."""
     from Sprout.runtime.analysis_consent import bind, context
@@ -519,10 +519,11 @@ async def _provide_cli_directory_task(
         diagnostics = current(runtime)
         if diagnostics is not None:
             await diagnostics.require()
-        if reusable is None and diagnostics is None and not await questionary.confirm(_L(
+        if (reusable is None and diagnostics is None and not filesystem_preflight
+                and not await questionary.confirm(_L(
                 "授权列举此目录及子目录，并只读分析 Policy 允许的项目文件？",
                 "Authorize directory/subdirectory listing and analysis of policy-allowed files?"),
-                default=False).ask_async():
+                default=False).ask_async()):
             return None
     except (EOFError, KeyboardInterrupt):
         return None
@@ -540,7 +541,10 @@ async def _provide_cli_directory_task(
         execution_mode=TaskExecutionMode.READ_ONLY, delegation_scope=scope,
         metadata={"session_id": owned.id, "analysis_directory": label},
     )
-    await bind(runtime, task, workspace, owned, principal, arguments)
+    await bind(runtime, task, workspace, owned, principal, arguments,
+               automatic=filesystem_preflight)
+    if filesystem_preflight and diagnostics is None:
+        typer.echo("[Approval] AUTO-APPROVED: directory.list")
     return task
 
 
@@ -558,13 +562,62 @@ def _cli_analysis_task_provider(runtime, workspace_id, live=None):
     return provide
 
 
-async def _cli_turn_stream(runtime, message, **kwargs):
-    """Display a denied turn without granting, retrying or settling its effects."""
-    try:
-        async for chunk in runtime.handle_stream(message, **kwargs):
+async def _cli_turn_stream(runtime, message, *, live=None, progress=None, **kwargs):
+    """Render a foreground node's exact approval before its wait can proceed."""
+    from Sprout.execution.process_broker import foreground_frozen_approval
+    from Sprout.security.local_diagnostics import foreground_progress
+
+    principal = kwargs.get("principal")
+    owner = asyncio.current_task()
+
+    async def prompt(source_runtime, record):
+        if (source_runtime is not runtime or asyncio.current_task() is not owner
+                or record.session_id != message.session_id
+                or record.source != "cli" or record.requested_by != principal.user_id):
+            return
+        session = await runtime._sessions.require_owner(record.session_id, principal)
+        if runtime._sessions.frozen_principal(session) != principal:
+            raise PermissionError("cli_frozen_approval_subject_changed")
+        if live is not None:
+            live.stop()
+        try:
+            _print_approval_record(record)
+            choice = await _prompt_task_gate_choice(
+                _L("允许执行这条沙箱验证命令？", "Allow this sandbox verification command?")
+            )
+            await runtime.approvals.decide(
+                record.id, choice == "approve", decided_by=principal.user_id,
+                channel="cli", principal=principal,
+            )
+        finally:
+            if live is not None:
+                live.start()
+
+    interactive = (kwargs.get("foreground") and message.session_id and principal is not None
+                   and principal.authenticated and principal.source == "cli")
+    stream = runtime.handle_stream(message, **kwargs)
+    from contextlib import aclosing
+
+    async with aclosing(stream):
+        while True:
+            token = foreground_frozen_approval.set(prompt) if interactive else None
+            progress_token = foreground_progress.set(
+                (runtime, owner, progress or typer.echo)
+            ) if interactive else None
+            try:
+                chunk = await anext(stream)
+            except StopAsyncIteration:
+                return
+            except PermissionError as exc:
+                chunk = StreamChunk(error=str(exc))
+            finally:
+                if token is not None:
+                    foreground_frozen_approval.reset(token)
+                if progress_token is not None:
+                    foreground_progress.reset(progress_token)
             yield chunk
-    except PermissionError as exc:
-        yield StreamChunk(error=str(exc))
+            if chunk.error is not None:
+                return
 
 
 async def _repl(
@@ -853,7 +906,8 @@ async def _repl(
                 transient=True,
             ) as live:
                 async for chunk in _cli_turn_stream(
-                    runtime, stream_message, principal=principal, foreground=True,
+                    runtime, stream_message, principal=principal, foreground=True, live=live,
+                    progress=lambda line, output=console: output.print(line, markup=False),
                     analysis_task_provider=_cli_analysis_task_provider(runtime, workspace_id, live),
                     code_task_provider=_cli_code_task_provider(runtime, workspace_id, live),
                 ):
@@ -928,6 +982,10 @@ async def _repl(
 
 async def _approve_task_gates(runtime: Any, task: Any, user: str) -> None:
     """Handle each distinct gate in one /status interaction."""
+    from Sprout.security.local_diagnostics import current as current_diagnostics
+    from Sprout.security.local_diagnostics import report
+
+    diagnostics = current_diagnostics(runtime)
     parked = {"waiting_approval", "waiting_resource", "ready_to_apply"}
     while True:
         current = await runtime.get_task(task.id) or task
@@ -937,6 +995,9 @@ async def _approve_task_gates(runtime: Any, task: Any, user: str) -> None:
 
         kind, handle = await runtime.task_progress(current)
         if kind == "approval" and handle:
+            if diagnostics is not None:
+                typer.echo(ui.warning("Diagnostic mode cannot approve this pending operation."))
+                return
             record = await runtime.approvals.store.get_approval(handle)
             if record is None:
                 typer.echo(
@@ -989,7 +1050,7 @@ async def _approve_task_gates(runtime: Any, task: Any, user: str) -> None:
                     typer.echo("Exact Workspace replacement (content snapshots; not Git output):")
                     render_diff("workspace_replacement", content["text"])
                 plan_sha256 = proposal.metadata["apply_plan_sha256"]
-                if not await _confirm_exact_apply_plan(plan_sha256):
+                if diagnostics is None and not await _confirm_exact_apply_plan(plan_sha256):
                     typer.echo(ui.warning("Not confirmed; no Apply write."))
                     return
                 current_proposal = await runtime.find_change_proposal(proposal.id)
@@ -997,10 +1058,18 @@ async def _approve_task_gates(runtime: Any, task: Any, user: str) -> None:
                         current_proposal.metadata.get("apply_plan_sha256") != plan_sha256):
                     typer.echo(ui.warning("Apply Plan changed; review it again before confirming."))
                     return
+                report(runtime, "Review", f"completed: {proposal.id}")
+                report(runtime, "Apply", "starting exact plan")
                 await runtime.approve_change_proposal(proposal.id, decided_by="cli",
                                                      principal=current_cli_principal())
+                result = await runtime.find_change_proposal(proposal.id)
+                if result is not None:
+                    report(runtime, "Apply", result.status.value)
                 typer.echo(ui.success("Exact Apply Plan approved; checking persisted result."))
                 continue
+            if diagnostics is not None:
+                typer.echo(ui.warning("Diagnostic mode requires an exact Apply Plan."))
+                return
             has_failures = any(item.failed for item in proposal.test_results)
             if has_failures:
                 typer.echo(

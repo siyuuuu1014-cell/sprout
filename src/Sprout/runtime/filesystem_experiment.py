@@ -33,6 +33,8 @@ from Sprout.workspace.models import ReadPlan, ResourceRef
 
 
 class FilesystemExperiment:
+    automatic = False
+
     def __init__(self, runtime, task, workspace, reads, image, evidence, *, verification=None):
         self.runtime, self.task, self.workspace = runtime, task, workspace
         self.reads, self.image, self.evidence = reads, image, evidence
@@ -263,12 +265,19 @@ class FilesystemExperiment:
         current = await self._subject(task, node)
         if not self.image or manager is not self.runtime.approvals:
             raise PermissionError("filesystem_experiment_container_unavailable")
-        grant = await manager.coding_task_capability(current, self.sandbox.ref.id)
+        automatic = getattr(self, "automatic", False)
+        grant = await manager.coding_task_capability(
+            current, self.sandbox.ref.id, **({"request_approval": False} if automatic else {})
+        )
         if grant.status is ApprovalStatus.PENDING:
-            approved = await self.confirm_tool(grant)
+            approved = automatic or await self.confirm_tool(grant)
             await self._subject(task, node)
-            return await manager.decide(grant.id, approved, principal=current.actor,
-                                        decided_by=current.actor.user_id, channel="cli")
+            grant = await manager.decide(
+                grant.id, approved, principal=current.actor, decided_by=current.actor.user_id,
+                channel="cli", reason="Foreground Filesystem Coding" if automatic else None,
+            )
+            if automatic and grant.status is ApprovalStatus.APPROVED:
+                report(self.runtime, "Approval", f"AUTO-APPROVED: {grant.tool}")
         return grant
 
     async def run_task_process(self, task_id, command, **kwargs):

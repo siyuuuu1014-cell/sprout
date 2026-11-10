@@ -382,7 +382,9 @@ class ApprovalManager:
             )
         return record
 
-    async def coding_task_capability(self, task, binding: str) -> ApprovalRecord:
+    async def coding_task_capability(
+        self, task, binding: str, *, request_approval: bool = True,
+    ) -> ApprovalRecord:
         """Read or request the durable isolated coding command category."""
         if (
             task.status is not TaskStatus.RUNNING or not task.workspace_id
@@ -412,7 +414,7 @@ class ApprovalManager:
             CODING_TASK_CAPABILITY, arguments, task_id=task.id,
             requested_by=task.actor.user_id, source=task.source,
             resource_scope=task.workspace_id, single_use=False,
-            ttl_seconds=self.policy.timeout_seconds or 3600,
+            ttl_seconds=self.policy.timeout_seconds or 3600, request_approval=request_approval,
         )
 
     async def revoke_coding_task_capability(self, approval_id: str, *, principal) -> bool:

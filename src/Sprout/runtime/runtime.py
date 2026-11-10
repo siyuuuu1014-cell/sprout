@@ -3712,6 +3712,8 @@ class Runtime:
                 current_session.metadata = {
                     **current_session.metadata, "last_code_task_id": task.id}
                 await self._session_store.save_session(current_session)
+            experiment = self._sandbox_lifecycle.filesystem.get(task.id)
+            post_apply = getattr(experiment, "post_apply_tests", None)
             result = await self.execute(task)
             report(self, "Task", f"{task.id}: {result.status.value}")
             content = f"Task {task.id}: {result.status.value}"
@@ -3747,12 +3749,29 @@ class Runtime:
                           if apply_output.get("applied") else "no_changes")
                 report(self, "Apply", detail)
                 content += f" ({result.error or detail})"
+                if post_apply is not None and apply_output.get("applied"):
+                    report(self, "Tests", "post-Apply read-only verification")
+                    try:
+                        post_result = await post_apply()
+                    except (OSError, ValueError) as exc:
+                        post_result = {"error": str(exc)}
+                    test_result = post_result.get("tests") or {}
+                    content += "\nPost-Apply read-only tests: " + json.dumps({
+                        "task_id": post_result.get("task_id"),
+                        "status": test_result.get("status", "unavailable"),
+                        "exit_code": test_result.get("exit_code"),
+                        "total": test_result.get("total"),
+                        "passed": test_result.get("passed"),
+                        "failed": test_result.get("failed"),
+                        "skipped": test_result.get("skipped"),
+                        "error": post_result.get("error"),
+                    }, ensure_ascii=False)
                 review_text = render_review(
                     review, task.id, task.workspace_id,
                     verification_status=verification_status(
                         evaluated, review, task.id, task.workspace_id),
                 )
-            elif result.error == "filesystem_review_evidence_mismatch":
+            elif (result.error or "").startswith("filesystem_"):
                 report(self, "Apply", f"BLOCKED: {result.error}")
                 content += f" ({result.error})"
             if result.metrics.get("sandbox_cleanup") == "failed":

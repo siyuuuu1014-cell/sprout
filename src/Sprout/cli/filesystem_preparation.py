@@ -7,7 +7,6 @@ import re
 from dataclasses import replace
 from pathlib import PurePosixPath
 
-import questionary
 import typer
 
 from Sprout.execution.coding_backend import _coding_capability, _run_coding_process
@@ -25,13 +24,14 @@ def _test_file(path):
             or 'tests' in PurePosixPath(path).parts)
 
 
-def plan_files(paths, instruction, *, symbols=None):
+def plan_files(paths, instruction, *, symbols=None, imports=()):
     """Plan distinct effects; names and execution hints never grant authority."""
     from Sprout.intents import (
         WriteIntentDisposition,
         conditional_test_extension,
         detect_task_hint,
         project_clauses,
+        project_feature_edit,
         write_intent_disposition,
     )
 
@@ -56,7 +56,13 @@ def plan_files(paths, instruction, *, symbols=None):
     body = re.sub(run_pattern, '', instruction, flags=re.I)
     if conditional_test_extension(instruction):
         body += "。补充缺失的测试"
+    restricted = {
+        path for clause in project_clauses(instruction)
+        if (match := re.fullmatch(r"(?:不要修改|不修改)\s*([\w./-]+\.\w+)", clause))
+        for path in paths if match[1] in {path, PurePosixPath(path).name}
+    }
     writes, actions, edited_sources = [], [], []
+    feature_sources = set()
     for clause in re.split(r'[，,、。;；\n]|并且|并|同时|然后|以及|最后', body):
         clause = re.sub(r"^\s*\d+[.、]\s*", "", clause).strip()
         if clause.startswith(("不要", "不修改", "不改动", "不写入", "保留")):
@@ -80,6 +86,9 @@ def plan_files(paths, instruction, *, symbols=None):
             selected.append(matches[0] if matches else label)
         if test_change:
             test_targets = [p for p in selected if _test_file(p)]
+            if not test_targets and feature_sources:
+                related = {a for a, b in imports if b in feature_sources and _test_file(a)}
+                test_targets = [p for p in paths if p in related]
             if not test_targets:
                 targets = [p for p in selected if p in sources] or edited_sources or sources
                 for path in targets:
@@ -107,6 +116,19 @@ def plan_files(paths, instruction, *, symbols=None):
                 writes.extend(targets)
                 edited_sources.extend(targets)
                 actions.append("code_modification")
+            elif project_feature_edit(clause):
+                # Without a named target, only a single connected source group
+                # is unambiguous. Disconnected modules cannot enter write scope.
+                group = set(sources[:1])
+                for _ in sources:
+                    group.update(b for a, b in imports if a in group and b in sources)
+                    group.update(a for a, b in imports if b in group and a in sources)
+                if not group or group != set(sources):
+                    raise PermissionError("filesystem_planning_ambiguous_source_target")
+                feature_sources = group
+                writes.extend(p for p in sources if p not in restricted)
+                edited_sources.extend(p for p in sources if p not in restricted)
+                actions.append("code_modification")
             elif clause.startswith(("修改代码", "修改源码")) and len(sources) == 1:
                 writes.extend(sources)
                 edited_sources.extend(sources)
@@ -131,13 +153,18 @@ def plan_files(paths, instruction, *, symbols=None):
             writes.append(next((p for p in paths if PurePosixPath(p).name.casefold()
                                 == 'readme.md'), 'README.md'))
             actions.append('code_modification')
+    if restricted.intersection(writes):
+        raise PermissionError("filesystem_planning_conflicting_file_operations")
     if not writes and not run_tests:
         raise PermissionError('filesystem_planning_target_unresolved')
     if len(set(writes)) > 64:
         raise PermissionError('filesystem_planning_input_budget')
     if run_tests:
         actions.append('test_execution')
-        if any(clause.startswith("修复失败的测试") for clause in project_clauses(instruction)):
+        clauses = project_clauses(instruction)
+        if (any(clause.startswith("修复失败的测试") for clause in clauses)
+                or any(a in {"如果发现失败", "如果测试失败"} and b == "根据真实错误修复"
+                       for a, b in zip(clauses, clauses[1:], strict=False))):
             actions.append("test_repair")
     return {**result, 'writes': tuple(dict.fromkeys(writes)),
             'execution': ('run_tests',) if run_tests else (),
@@ -150,9 +177,15 @@ async def discover_plan(runtime, workspace, message, owned, principal):
     from Sprout.runtime.dialogue import project_answer
 
     report(runtime, 'Planning', 'analyzing project files')
-    symbols = set()
+    symbols, imports = set(), set()
 
     def capture(analysis):
+        resources = {node.id: node.resource.path for node in analysis.graph.nodes
+                     if node.resource is not None}
+        imports.update((resources[edge.source], resources[edge.target])
+                       for edge in analysis.graph.edges
+                       if edge.relation in {"imports", "calls"}
+                       and edge.source in resources and edge.target in resources)
         symbols.update(
             (node.resource.path, node.qualified_name)
             for node in analysis.graph.nodes
@@ -161,7 +194,7 @@ async def discover_plan(runtime, workspace, message, owned, principal):
 
     async def provider(**request):
         return await _provide_cli_directory_task(runtime, workspace, request['session'],
-            request['principal'], request['message'], label='.')
+            request['principal'], request['message'], label='.', filesystem_preflight=True)
 
     response = await runtime._dispatch_project_analysis(
         replace(message, content='分析这个项目结构', metadata={}), owned,
@@ -176,7 +209,7 @@ async def discover_plan(runtime, workspace, message, owned, principal):
     ref = fresh.metadata['project_analysis_ref_v1']
     source = await runtime._metadata_or_raise().get_node_result_source(ref['node_id'])
     paths = [item['path'] for item in json.loads(source.resources_json)]
-    plan = plan_files(paths, message.content, symbols=symbols)
+    plan = plan_files(paths, message.content, symbols=symbols, imports=imports)
     overrides = runtime._file_broker._classify_overrides
     for group in (plan["reads"], plan["writes"]):
         for label in group:
@@ -240,9 +273,6 @@ async def preflight(runtime, workspace, owned, principal):
             arguments = {'workspace_id': workspace.id, 'command': list(argv),
                          'purpose': 'filesystem-preparation-readonly'}
             mode = current(runtime)
-            if mode is None and not await questionary.confirm(
-                    f'Inspect local Docker runtime: {argv[1:]}?', default=False).ask_async():
-                return False
             if mode is not None:
                 await mode.require()
             record = await ApprovalManager.request(manager, 'filesystem.docker.inspect', arguments,
@@ -251,7 +281,10 @@ async def preflight(runtime, workspace, owned, principal):
             if mode is not None:
                 mode.records.add(record.id)
             await manager.decide(record.id, True, principal=principal,
-                                 decided_by=principal.user_id, channel='cli')
+                                 decided_by=principal.user_id, channel='cli',
+                                 reason='Foreground Filesystem Docker preflight')
+            if mode is None:
+                typer.echo('[Approval] AUTO-APPROVED: filesystem.docker.inspect')
             return await manager.is_approved('filesystem.docker.inspect', arguments,
                 session_id=owned.id, requested_by=principal.user_id, source='cli',
                 resource_scope=workspace.id)

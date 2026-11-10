@@ -177,6 +177,22 @@ class FilesystemTestRun(FilesystemExperiment):
         return {'test_execution': result, 'status': result['status'], 'verified': False}
 
 
+async def run_prepared(runtime, task, owned, principal):
+    """Execute the exact registered read-only experiment and return its evidence."""
+    registered = runtime._sandbox_lifecycle.filesystem.get(task.id)
+    if (type(registered) is not FilesystemTestRun or registered.task != task
+            or await runtime.get_task(task.id) != task or task.actor != principal
+            or task.metadata.get('session_id') != owned.id):
+        raise PermissionError('test_execution_subject_changed')
+    report(runtime, 'Task', 'created: ' + task.id)
+    result = await runtime.execute(task)
+    node = await runtime._metadata_or_raise().get_execution_node(task.id + ':evaluation')
+    output = (node.metadata.get('output') or {}) if node else {}
+    proof = output.get('test_execution') if isinstance(output, dict) else None
+    return {'task_id': task.id, 'task_status': result.status.value,
+            'tests': proof, 'error': result.error}
+
+
 async def dispatch(runtime, message, session, principal, foreground, provider):
     from Sprout.agent.base import AgentResult
     from Sprout.message.models import OutboundMessage
@@ -193,21 +209,10 @@ async def dispatch(runtime, message, session, principal, foreground, provider):
             if task is None:
                 content = 'test_execution_cancelled'
             else:
-                registered = runtime._sandbox_lifecycle.filesystem.get(task.id)
-                if (type(registered) is not FilesystemTestRun or registered.task != task
-                        or await runtime.get_task(task.id) != task or task.actor != principal
-                        or task.metadata.get('session_id') != owned.id):
-                    raise PermissionError('test_execution_subject_changed')
-                report(runtime, 'Task', 'created: ' + task.id)
-                result = await runtime.execute(task)
-                node = await runtime._metadata_or_raise().get_execution_node(
-                    task.id + ':evaluation')
-                output = (node.metadata.get('output') or {}) if node else {}
-                proof = output.get('test_execution') if isinstance(output, dict) else None
-                metadata.update(task_id=task.id, test_execution=proof)
+                proof = await run_prepared(runtime, task, owned, principal)
+                metadata.update(task_id=task.id, test_execution=proof["tests"])
                 content = '```json\n' + json.dumps(
-                    {'task_id': task.id, 'task_status': result.status.value,
-                    'tests': proof, 'error': result.error}, ensure_ascii=False, indent=2) + '\n```'
+                    proof, ensure_ascii=False, indent=2) + '\n```'
         except PermissionError as exc:
             content = str(exc)
     await runtime._persist_turns(session, message, AgentResult(content=content, metadata=metadata))

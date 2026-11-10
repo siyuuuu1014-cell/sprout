@@ -175,8 +175,9 @@ async def test_plan_does_not_admit_unapproved_or_private_targets(automatic, path
                     user_id=principal.user_id), session, principal)
 
 
-async def test_diagnostic_preparation_never_prompts_for_paths_or_image(
-    tmp_path, monkeypatch, capsys,
+@pytest.mark.parametrize("diagnostic", [False, True])
+async def test_foreground_preparation_never_prompts_for_paths_or_image(
+    tmp_path, monkeypatch, capsys, diagnostic,
 ):
     from Sprout.cli.filesystem_task import prepare_filesystem
     from Sprout.gateway.identity import Principal
@@ -202,7 +203,8 @@ async def test_diagnostic_preparation_never_prompts_for_paths_or_image(
         return_value={'reads': ('app.py', 'test_app.py'), 'writes': ('test_app.py',),
                       'execution': ('run_tests',),
                       'actions': ('test_extension', 'test_execution')}))
-    monkeypatch.setattr('Sprout.security.local_diagnostics.current', lambda _: object())
+    monkeypatch.setattr('Sprout.security.local_diagnostics.current',
+                        lambda _: object() if diagnostic else None)
     prompt = AsyncMock(side_effect=AssertionError('No manual path/image prompts'))
     monkeypatch.setattr('questionary.text', prompt)
     monkeypatch.setattr('questionary.confirm', prompt)
@@ -257,3 +259,34 @@ def test_file_writes_and_test_execution_are_separate(request_text, writes, execu
 def test_missing_explicit_file_never_falls_back_to_other_sources(request_text):
     with pytest.raises(PermissionError, match='filesystem_planning_file_unavailable'):
         plan_files(('app.py', 'test_app.py'), request_text)
+
+
+def test_compound_data_task_keeps_analysis_and_coding():
+    from Sprout.intents import detect_task_hint
+
+    instruction = (
+        "分析当前项目，完善数据处理功能，增加输入校验和异常处理，"
+        "为修改涉及的函数补充单元测试。运行全部测试；如果发现失败，根据真实错误修复。"
+        "完成独立验证和代码审查后，将结果直接写回项目，并给出修改总结。"
+    )
+    assert detect_task_hint(instruction)
+    imports = {
+        ("pipeline.py", "aggregation.py"), ("pipeline.py", "validation.py"),
+        ("test_pipeline.py", "pipeline.py"), ("test_aggregation.py", "aggregation.py"),
+    }
+    paths = {"aggregation.py", "pipeline.py", "validation.py",
+             "test_pipeline.py", "test_aggregation.py"}
+    plan = plan_files(paths, instruction, imports=imports)
+    assert set(plan["reads"]) == paths
+    assert set(plan["writes"]) == paths
+    assert plan["execution"] == ("run_tests",)
+
+    assert "test_repair" in plan["actions"]
+
+    limited = plan_files(paths, instruction + "不要修改 pipeline.py。", imports=imports)
+    assert set(limited["reads"]) == paths
+    assert set(limited["writes"]) == paths - {"pipeline.py"}
+
+    with pytest.raises(PermissionError, match="ambiguous_source_target"):
+        plan_files(paths | {"unrelated.py"}, instruction, imports=imports)
+    assert not detect_task_hint("分析当前项目，如果发现失败，根据真实错误修复。")

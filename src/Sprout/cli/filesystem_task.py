@@ -8,7 +8,6 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
-import questionary
 import typer
 
 from Sprout.execution.docker_verification import safe_path
@@ -25,7 +24,6 @@ async def prepare_filesystem(runtime, workspace, message, owned, principal, *, t
         raise PermissionError("filesystem_experiment_local_foreground_required")
     try:
         from Sprout.cli.filesystem_preparation import discover_plan, preflight
-        from Sprout.security.local_diagnostics import current
 
         image = await preflight(runtime, workspace, owned, principal)
         plan = await discover_plan(runtime, workspace, message, owned, principal)
@@ -57,17 +55,6 @@ async def prepare_filesystem(runtime, workspace, message, owned, principal, *, t
                 "sha256": hashlib.sha256(json.dumps(specs, sort_keys=True).encode()).hexdigest(),
                 "frozen_at": datetime.now(UTC).isoformat(),
             }
-        confirmation = (
-            f"Host verification spec {frozen['sha256']}. "
-            "Passing verification enables exact Apply to the original workspace. "
-            if frozen else ""
-        )
-        if current(runtime) is None and not await questionary.confirm(
-                f"Confirm file operation plan. Read {reads}; edit {writes}; "
-                "output paths are checked in the original for conflicts; "
-                f"Docker image {image or 'not configured'}. {confirmation}Confirm?",
-                default=False).ask_async():
-            return None
     except (EOFError, KeyboardInterrupt):
         return None
     except PermissionError:
@@ -109,32 +96,24 @@ async def prepare_filesystem(runtime, workspace, message, owned, principal, *, t
     runtime._cli_code_writes[task.id] = (principal, owned.id, workspace.id, writes)
     evidence = evidence_parent / ("filesystem-" + task.id)
     evidence.mkdir(exist_ok=False)
-    from Sprout.runtime.isolated_test_run import FilesystemTestRun
+    from Sprout.runtime.isolated_test_run import FilesystemTestRun, run_prepared
 
     experiment = (FilesystemTestRun if test_only else FilesystemExperiment)(
         runtime, task, workspace, reads, image, evidence, verification=frozen)
     if test_only:
         experiment.test_files = tests
 
-    async def confirm_apply(arguments, review_text):
-        if review_text:
-            typer.echo(review_text)
-        lines = "\n".join(
-            f"{item['path']}: {item['before'] or 'absent'} -> {item['after']}"
-            for item in arguments["files"]
-        )
-        return await questionary.confirm(
-            f"Apply transaction {arguments['transaction']} to the original workspace?\n{lines}",
-            default=False,
-        ).ask_async() is True
+    # This is a live Host-owned experiment, never a persisted or model option.
+    experiment.automatic = True
+    if not test_only and "run_tests" in plan.get("execution", ()):
+        async def post_apply_tests():
+            fresh = await runtime._sessions.require_owner(owned.id, principal)
+            test_message = replace(
+                message, content="只运行当前项目已有的单元测试，不修改任何文件")
+            test_task = await prepare_filesystem(
+                runtime, workspace, test_message, fresh, principal, test_only=True)
+            return await run_prepared(runtime, test_task, fresh, principal)
 
-    async def confirm_tool(record):
-        return await questionary.confirm(
-            f"Allow {record.tool} for this task? Approval {record.id}",
-            default=False,
-        ).ask_async() is True
-
-    experiment.confirm_apply = confirm_apply
-    experiment.confirm_tool = confirm_tool
+        experiment.post_apply_tests = post_apply_tests
     runtime._sandbox_lifecycle.filesystem[task.id] = experiment
     return task

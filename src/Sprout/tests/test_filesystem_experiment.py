@@ -73,7 +73,8 @@ def test_filesystem_sandbox_cleans_up_after_partial_capture(tmp_path):
     assert experiment.ref is None
     assert (original / "app.py").read_text(encoding="utf-8") == "print(1)"
 
-async def test_filesystem_coding_confirms_pending_grant_in_owned_foreground():
+@pytest.mark.parametrize("automatic", [False, True])
+async def test_filesystem_coding_settles_grant_in_owned_foreground(automatic):
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
 
@@ -90,11 +91,15 @@ async def test_filesystem_coding_confirms_pending_grant_in_owned_foreground():
         _subject=AsyncMock(return_value=task), image="fixture",
         runtime=SimpleNamespace(approvals=manager), sandbox=SimpleNamespace(
             ref=SimpleNamespace(id="sandbox")),
-        confirm_tool=AsyncMock(return_value=True),
+        confirm_tool=AsyncMock(return_value=True), automatic=automatic,
     )
     grant = await FilesystemExperiment.approval(experiment, manager, task=task, node=object())
     assert grant.status is ApprovalStatus.APPROVED
-    experiment.confirm_tool.assert_awaited_once()
+    assert experiment.confirm_tool.await_count == int(not automatic)
+    assert all(record.status is not ApprovalStatus.PENDING
+               for record in await manager.store.list_approvals())
+    if automatic:
+        assert grant.reason == "Foreground Filesystem Coding"
 
 async def test_completed_filesystem_task_survives_sandbox_cleanup_failure(tmp_path, monkeypatch):
     import asyncio
