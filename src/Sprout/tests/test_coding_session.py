@@ -103,3 +103,22 @@ async def test_verifier_receives_frozen_session_context(tmp_path, monkeypatch):
         assert not (context.exported / "tests").exists()
     finally:
         store.close()
+
+
+async def test_filesystem_repair_seals_new_input_without_replacing_first_export(tmp_path):
+    from dataclasses import replace
+
+    store, session = await fixture(tmp_path)
+    session.sandbox = replace(session.sandbox, kind="filesystem_experiment")
+    try:
+        first, _ = await session.prepare()
+        (session.sandbox.root / "app.py").write_text("repaired", encoding="utf-8")
+        retry, _ = await session.prepare(repair=True)
+        assert retry.exported != first.exported
+        assert (first.exported / "app.py").read_bytes() == b"old\n"
+        assert (retry.exported / "app.py").read_bytes() == b"repaired"
+        (session.sandbox.root / "app.py").write_text("again", encoding="utf-8")
+        with pytest.raises(ValueError, match="intent changed"):
+            await session.prepare(repair=True)
+    finally:
+        store.close()

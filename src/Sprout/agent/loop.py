@@ -24,6 +24,13 @@ if TYPE_CHECKING:
     from Sprout.message.models import Message
 
 
+def _output_limit_notice(language):
+    return ("\n\n[输出达到模型 token 上限；回答尚未完成。请回复“继续”分段获取后续内容。]"
+            if language == "中文" or language.startswith("zh") else
+            "\n\n[Model output token limit reached; this answer is incomplete. "
+            "Reply 'continue' for the next part.]")
+
+
 def _skill_message(context: AgentContext) -> LLMMessage | None:
     """Skill system message, honouring the disclosure mode (design §6.1).
 
@@ -98,9 +105,8 @@ class AgentLoop:
                 "explain, ask for permission, or wait unless the request is truly "
                 "ambiguous. Use available tools when they help complete the requested "
                 "change; system-level safety and approvals are handled outside the model. "
-                "When the user asks to use a Sprout CLI command or perform an operation "
-                "available through the CLI, call cli_tool_run with command 'sprout' and "
-                "the appropriate argument list, then report the real command output. "
+                "Use only the tools supplied for this request. If a requested tool is "
+                "unavailable, explain that without claiming execution. "
                 f"Answer in language '{response_language}'. This is the configured "
                 "response language for this turn, so even progress/status text such as "
                 "'I'll start by analyzing the project structure' must use it. Keep code, "
@@ -128,6 +134,7 @@ class AgentLoop:
         specs = [tool.spec for tool in context.tools.values()]
         requested_by = str(context.user.get("id", "unknown"))
         usage = Usage()
+        response = None
         steps = 0
         model_calls = 0
         tool_calls = 0
@@ -155,6 +162,11 @@ class AgentLoop:
             messages.extend(tool_messages)
             if tool_summary.get("workspace_requested"):
                 return AgentResult(content="", metadata={"workspace_requested": True})
+            blocked = _blocked_tool_result(
+                tool_messages, tool_summary, response_language,
+                steps=steps, model_calls=model_calls, tool_calls=tool_calls)
+            if blocked is not None and not approval_ids:
+                return blocked
             if approval_ids:
                 return AgentResult(
                     content=(
@@ -215,11 +227,13 @@ class AgentLoop:
                 break
             if not response.tool_calls:
                 return AgentResult(
-                    content=response.text,
+                    content=response.text + (_output_limit_notice(response_language)
+                                             if response.finish_reason == "length" else ""),
                     metadata={
+                        "truncated": response.finish_reason == "length",
                         "steps": steps,
                         "finish_reason": response.finish_reason,
-                        "model": response.model,
+                        "model": response.model or getattr(self.model, "model", None),
                         "model_calls": model_calls,
                         "tool_calls": tool_calls,
                         "plan": self._last_plan,
@@ -245,6 +259,11 @@ class AgentLoop:
             messages.extend(tool_messages)
             if tool_summary.get("workspace_requested"):
                 return AgentResult(content="", metadata={"workspace_requested": True})
+            blocked = _blocked_tool_result(
+                tool_messages, tool_summary, response_language,
+                steps=steps, model_calls=model_calls, tool_calls=tool_calls)
+            if blocked is not None and not approval_ids:
+                return blocked
             if approval_ids:
                 return AgentResult(
                     content=(
@@ -291,7 +310,11 @@ class AgentLoop:
                 "model_calls": model_calls,
                 "tool_calls": tool_calls,
                 "plan": self._last_plan,
-                "usage": {"total_tokens": usage.total_tokens},
+                "model": response.model if response is not None else None,
+                "finish_reason": response.finish_reason if response is not None else None,
+                "usage": {"prompt_tokens": usage.prompt_tokens,
+                          "completion_tokens": usage.completion_tokens,
+                          "total_tokens": usage.total_tokens},
             },
         )
 
@@ -317,9 +340,8 @@ class AgentLoop:
                 "explain, ask for permission, or wait unless the request is truly "
                 "ambiguous. Use available tools when they help complete the requested "
                 "change; system-level safety and approvals are handled outside the model. "
-                "When the user asks to use a Sprout CLI command or perform an operation "
-                "available through the CLI, call cli_tool_run with command 'sprout' and "
-                "the appropriate argument list, then report the real command output. "
+                "Use only the tools supplied for this request. If a requested tool is "
+                "unavailable, explain that without claiming execution. "
                 f"Answer in language '{response_language}'. This is the configured "
                 "response language for this turn, so even progress/status text such as "
                 "'I'll start by analyzing the project structure' must use it. Keep code, "
@@ -367,9 +389,18 @@ class AgentLoop:
                 if not response.tool_calls:
                     if response.text:
                         yield response.text
-                    if include_result and response.finish_reason in {None, "stop", "end_turn"}:
+                    if response.finish_reason == "length":
+                        yield _output_limit_notice(response_language)
+                    if include_result and response.finish_reason in {
+                            None, "stop", "end_turn", "length"}:
                         yield AgentResult(content="", metadata={
                             "steps": steps, "model_calls": model_calls,
+                            "finish_reason": response.finish_reason,
+                            "model": response.model or getattr(self.model, "model", None),
+                            "truncated": response.finish_reason == "length",
+                            "usage": {"prompt_tokens": response.usage.prompt_tokens,
+                                      "completion_tokens": response.usage.completion_tokens,
+                                      "total_tokens": response.usage.total_tokens},
                             "tool_calls": tool_calls, "plan": self._last_plan,
                         })
                     return
@@ -394,6 +425,12 @@ class AgentLoop:
                 if tool_summary.get("workspace_requested"):
                     yield AgentResult(content="", metadata={"workspace_requested": True})
                     return
+                blocked = _blocked_tool_result(
+                    tool_messages, tool_summary, response_language,
+                    steps=steps, model_calls=model_calls, tool_calls=tool_calls)
+                if blocked is not None and not approval_ids:
+                    yield blocked if include_result else blocked.content
+                    return
                 if approval_ids:
                     yield AgentResult(
                         content="",
@@ -413,7 +450,9 @@ class AgentLoop:
             final_tool_calls = ()
             finish_reason = None
             step_usage = Usage()
+            model_name = getattr(self.model, "model", None)
             async for event in stream_events(messages, tools=specs):
+                model_name = event.model or model_name
                 if event.usage is not None:
                     step_usage = event.usage
                 if event.finish_reason is not None:
@@ -428,9 +467,16 @@ class AgentLoop:
             self._record_step(context.session.id, steps, "".join(content_parts),
                               final_tool_calls, step_usage)
             if not final_tool_calls:
-                if include_result and finish_reason in {None, "stop", "end_turn"}:
+                if finish_reason == "length":
+                    yield _output_limit_notice(response_language)
+                if include_result and finish_reason in {None, "stop", "end_turn", "length"}:
                     yield AgentResult(content="", metadata={
                         "steps": steps, "model_calls": model_calls,
+                        "finish_reason": finish_reason, "truncated": finish_reason == "length",
+                        "model": model_name,
+                        "usage": {"prompt_tokens": step_usage.prompt_tokens,
+                                  "completion_tokens": step_usage.completion_tokens,
+                                  "total_tokens": step_usage.total_tokens},
                         "tool_calls": tool_calls, "plan": self._last_plan,
                     })
                 return
@@ -449,6 +495,12 @@ class AgentLoop:
             messages.extend(tool_messages)
             if tool_summary.get("workspace_requested"):
                 yield AgentResult(content="", metadata={"workspace_requested": True})
+                return
+            blocked = _blocked_tool_result(
+                tool_messages, tool_summary, response_language,
+                steps=steps, model_calls=model_calls, tool_calls=tool_calls)
+            if blocked is not None and not approval_ids:
+                yield blocked if include_result else blocked.content
                 return
             if approval_ids:
                 yield AgentResult(
@@ -536,6 +588,11 @@ class AgentLoop:
             outcome.result.approval_id for outcome in outcomes if outcome.requires_approval
         ))
         for outcome in outcomes:
+            error = outcome.result.error or ""
+            if (error.startswith("Diagnostic mode refuses")
+                    or error == "native_project_probe_unavailable"
+                    or error.endswith("is denied by the security policy")):
+                summary["execution_blocked"] = True
             if outcome.result.workspace_request:
                 summary["workspace_requested"] = True
             if outcome.result.ok:
@@ -553,6 +610,20 @@ class AgentLoop:
                 )
             )
         return messages, tool_calls, approval_ids, summary
+
+
+def _blocked_tool_result(messages, summary, language, **metrics):
+    if not summary.get("execution_blocked"):
+        return None
+    header = (
+        "已停止后续工具尝试。以下是本轮工具返回的限制，"
+        "不表示先前的项目分析数据不存在：" if language in {"中文", "繁體中文"} else
+        "Stopped further tool attempts after an execution restriction. "
+        "This does not invalidate earlier project analysis. Tool results:"
+    )
+    details = "\n\n".join(f"[{item.name}] {item.content}" for item in messages[-3:])
+    return AgentResult(header + "\n\n" + details,
+                       metadata={"execution_blocked": True, "tool_summary": summary, **metrics})
 
 
 def _budget_int(budget: object, key: str, default: int) -> int:

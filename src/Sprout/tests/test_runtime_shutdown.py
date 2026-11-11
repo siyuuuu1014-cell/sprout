@@ -186,3 +186,23 @@ async def test_worker_does_not_dequeue_again_when_execution_consumes_cancellatio
         except (TimeoutError, asyncio.CancelledError):
             pass
         await runtime.stop_worker()
+
+async def test_filesystem_cleanup_failure_still_closes_storage(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    runtime, _ = build_runtime()
+    await runtime.start()
+    closed = AsyncMock(wraps=runtime.storage.close)
+    monkeypatch.setattr(type(runtime.storage), "close", lambda _: closed())
+
+    def fail():
+        raise OSError("filesystem cleanup failure")
+
+    monkeypatch.setattr(runtime._sandbox_lifecycle, "close_filesystem_all", fail)
+    try:
+        with pytest.raises(OSError, match="filesystem cleanup failure"):
+            await runtime.stop()
+        closed.assert_awaited_once()
+    finally:
+        if not closed.await_count:
+            await runtime.storage.close()

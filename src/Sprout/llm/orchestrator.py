@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 from Sprout.llm.base import ModelBudgetExhausted, ModelProvider
@@ -15,6 +15,27 @@ from Sprout.llm.usage import get_usage_recorder
 
 if TYPE_CHECKING:
     from Sprout.tools.spec import ToolSpec
+
+
+def _invalid_request(exc, ancestors=frozenset()):
+    """Recognize structured HTTP 400/422 through aiyallm's error wrappers.
+
+    Do not infer status from arbitrary error text. Mixed transient/terminal
+    failures retain the original retry behavior.
+    """
+    if id(exc) in ancestors:
+        return False
+    ancestors = ancestors | {id(exc)}
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status in {400, 422}:
+        return True
+    errors = getattr(exc, "errors", ())
+    if errors:
+        return all(_invalid_request(error, ancestors) for error in errors)
+    cause = getattr(exc, "cause", None) or getattr(exc, "__cause__", None)
+    return cause is not None and _invalid_request(cause, ancestors)
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +49,8 @@ class RetryPolicy:
     non_retryable_exception_types: tuple[type[Exception], ...] = ()
 
     def should_retry(self, exc: Exception) -> bool:
+        if _invalid_request(exc):
+            return False
         if self.non_retryable_exception_types and isinstance(
             exc, self.non_retryable_exception_types
         ):
@@ -101,7 +124,9 @@ class ModelOrchestrator:
             for attempt in range(1, self._policy.max_attempts + 1):
                 started = time.monotonic()
                 try:
-                    return await invoke_model(provider, messages, tools=tools)
+                    response = await invoke_model(provider, messages, tools=tools)
+                    model = response.model or getattr(provider, "model", None)
+                    return replace(response, model=model)
                 except ModelBudgetExhausted:
                     raise
                 except Exception as exc:  # noqa: BLE001 - retry/fallback boundary
@@ -164,6 +189,7 @@ class ModelOrchestrator:
                 tool_calls=response.tool_calls,
                 finish_reason=response.finish_reason,
                 usage=response.usage,
+                model=response.model,
             )
             return
         async for event in stream_events(messages, tools=tools):

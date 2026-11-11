@@ -7,6 +7,7 @@ and the event catalog. They live here once; callers derive their tables from
 
 from __future__ import annotations
 
+import json
 import re
 from enum import StrEnum
 
@@ -108,13 +109,38 @@ class WriteIntentDisposition(StrEnum):
     UNKNOWN = "unknown"
 
 
+def project_request_text(text: str) -> str:
+    """Keep literal data out of operation classification; preserve the original request."""
+    decoder = json.JSONDecoder()
+    pieces = []
+    end = 0
+    for match in re.finditer(r"[\[{]", text):
+        if match.start() < end:
+            continue
+        try:
+            value, length = decoder.raw_decode(text[match.start():])
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(value, (dict, list)):
+            pieces.extend((text[end:match.start()], " input_data "))
+            end = match.start() + length
+    pieces.append(text[end:])
+    normalized = "".join(pieces)
+    # Quoted filenames identify artifacts; quoted sentences remain quotations.
+    return re.sub(
+        r'["“‘`]([A-Za-z0-9_./\\:-]+\.[A-Za-z][\w-]*)["”’`]',
+        lambda match: match[1] if normalized[:match.start()].strip() else match[0],
+        normalized,
+    )
+
+
 def write_intent_disposition(text: str) -> WriteIntentDisposition:
     """Pure, conservative text judgment; UNKNOWN needs explicit human confirmation.
 
     No metadata, model labels or workspace signals can turn a known non-command
     into a write instruction. Unfamiliar wording is not a negative judgment.
     """
-    stripped = text.strip()
+    stripped = project_request_text(text).strip()
     if not stripped:
         return WriteIntentDisposition.KNOWN_NONWRITE
     if stripped == "/task" or stripped.startswith("/task "):
@@ -124,6 +150,23 @@ def write_intent_disposition(text: str) -> WriteIntentDisposition:
     # Ambiguous/mixed/quoted requests require a fresh explicit instruction.
     if any(mark in lowered for mark in ('"', "“", "”", "‘", "’", "`")):
         return WriteIntentDisposition.KNOWN_NONWRITE
+    if "\n" in stripped:
+        clauses = project_clauses(stripped)
+        first = clauses[0] if clauses else ""
+        # Classify the primary operation independently of subsequent execution
+        # requirements and file exclusions. A claimed authorization is not an
+        # operation; an execution preamble still needs a concrete edit below.
+        primary = write_intent_disposition(first)
+        resume = re.fullmatch(r"(?:请)?(?:直接|立即)执行[^。；;\n]*代码修改任务", first)
+        edits = [c.removeprefix("只") for c in clauses]
+        cancelled = _project_write_cancelled(clauses)
+        if cancelled:
+            return WriteIntentDisposition.KNOWN_NONWRITE
+        if (primary is WriteIntentDisposition.EXPLICIT_WRITE or (resume and any(
+            write_intent_disposition(c) is WriteIntentDisposition.EXPLICIT_WRITE
+            for c in edits
+        ))):
+            return WriteIntentDisposition.EXPLICIT_WRITE
     if any(term in lowered for term in (
         "不要", "不需要", "不是让", "先别", "别执行", "不执行", "不改", "仅分析",
         "只分析", "只读", "解释", "讨论", "总结", "现状", "进度", "已经", "昨天",
@@ -183,8 +226,28 @@ def write_intent_disposition(text: str) -> WriteIntentDisposition:
         return WriteIntentDisposition.KNOWN_NONWRITE
     if question:
         return WriteIntentDisposition.UNKNOWN
+    # A bounded action/object grammar, after narration/negation/question guards.
+    # "生成测试方案" or "解释如何生成测试" is not a request to write test code.
+    if re.fullmatch(
+        r"(?:(?:为|给)[^，。！？;\n]{1,100}?)?\s*(?:生成|编写|添加|创建|补写)\s*"
+        r"(?:一(?:个|些|组|份))?(?:单元测试|测试代码|测试文件|测试用例|测试)"
+        r"(?:[，,]\s*覆盖\s*[^，,。！？;\n]{1,160})?"
+        r"(?:[，,]\s*(?:并|并且)?\s*(?:运行|执行)测试)?", body,
+    ):
+        return WriteIntentDisposition.EXPLICIT_WRITE
     if re.match(r"^(?:请)?帮我|^请", lowered) and any(
         keyword in lowered for keyword in TASK_KEYWORDS
+    ):
+        return WriteIntentDisposition.EXPLICIT_WRITE
+    # A bounded imperative with an artifact object. Bare document nouns
+    # require a creation verb; arbitrary filenames must look like paths.
+    if re.fullmatch(
+        r"(?:那(?:你)?)?(?:请(?:帮我)?|帮我)?\s*"
+        r"(?:(?:为|给)(?:当前|这个|当前这个|该|本)?项目\s*)?"
+        r"(?:补齐|创建|生成|增加|添加|编写|补写)\s*"
+        r"(?:一(?:份|个)\s*[a-z][a-z0-9_-]*|(?:一(?:份|个))?\s*"
+        r"(?:[\w/-]+(?:\.[\w-]+)+|测试文件|测试代码|配置文件|文档))",
+        body,
     ):
         return WriteIntentDisposition.EXPLICIT_WRITE
     # Require an imperative, not an arbitrary keyword buried in narration.
@@ -199,9 +262,78 @@ def write_intent_disposition(text: str) -> WriteIntentDisposition:
             else WriteIntentDisposition.UNKNOWN)
 
 
+def project_clauses(text: str) -> tuple[str, ...]:
+    """Separate operation clauses from list markers and dependent clauses."""
+    return tuple(
+        re.sub(r"^\d+[.、]\s*", "", part.strip())
+        for part in re.split(
+            r"[。；;\n，,]|并且?(?!不)|然后|同时|最后", project_request_text(text),
+        )
+        if part.strip()
+    )
+
+
+def _project_write_cancelled(clauses: tuple[str, ...]) -> bool:
+    """Global cancellation remains distinct from file-specific exclusions."""
+    return any(c.removeprefix("请").casefold().startswith((
+        "取消", "先别执行", "不要执行", "不执行",
+        "不要修改任何", "不修改任何", "不做任何修改",
+        "只分析", "仅分析", "do not modify any", "don't modify any",
+        "only analyze", "only analyse",
+    )) for c in clauses)
+
+
+def conditional_test_extension(text: str) -> bool:
+    clauses = project_clauses(text)
+    return (bool(clauses) and clauses[0].startswith(("检查", "请检查"))
+            and "测试" in clauses[0]
+            and any(c.startswith(("不足时补充", "不足时添加")) for c in clauses[1:])
+            and not any(c.startswith(("不要", "只分析", "不修改")) for c in clauses))
+
+
+def project_feature_edit(clause: str) -> bool:
+    """A direct feature edit, including one without a named file."""
+    return re.fullmatch(r"(?:请)?完善[^，。；！？]{1,60}功能", clause) is not None
+
+
 def detect_task_hint(text: str) -> bool:
     """Compatible bool fast path; UNKNOWN is not permission to create a Task."""
-    return write_intent_disposition(text) is WriteIntentDisposition.EXPLICIT_WRITE
+    text = project_request_text(text)
+    if "\n" in text and _project_write_cancelled(project_clauses(text)):
+        return False
+    if write_intent_disposition(text) is WriteIntentDisposition.EXPLICIT_WRITE:
+        return True
+    if any(mark in text for mark in ('"', '“', '”', '‘', '’', chr(96), '?', '？')):
+        return False
+    clauses = project_clauses(text)
+    feature_edit = any(project_feature_edit(c) for c in clauses)
+    leading_write = (
+        bool(clauses)
+        and write_intent_disposition(clauses[0]) is WriteIntentDisposition.EXPLICIT_WRITE
+    )
+    if not clauses or any(c.startswith(("或者", "还是", "只分析", "仅分析"))
+                          or (c.startswith("如果") and not (
+                              (feature_edit or leading_write)
+                              and c in {"如果发现失败", "如果测试失败"}))
+                          or (c.startswith("不要") and not (
+                              c.startswith("不要修改其他") or (
+                                  feature_edit and re.fullmatch(
+                                      r"不要修改\s+[\w./-]+\.\w+", c))))
+                          or ("不修改" in c and "其他" not in c)
+                          for c in clauses):
+        return False
+    first = clauses[0]
+    if feature_edit or conditional_test_extension(text):
+        return True
+    if first.startswith(("参考", "依据", "按照", "严格依据")):
+        return any(write_intent_disposition(c) is WriteIntentDisposition.EXPLICIT_WRITE
+                   for c in clauses[1:])
+    if not first.startswith(("分析", "检查", "请分析", "请检查")):
+        return leading_write
+    return any(c.startswith(("补充缺失的测试", "补充测试", "生成单元测试", "修改代码",
+                             "修复失败的测试"))
+               and write_intent_disposition(c) is WriteIntentDisposition.EXPLICIT_WRITE
+               for c in clauses[1:])
 
 
 def needs_intent_clarification(text: str) -> bool:
@@ -247,7 +379,7 @@ def clarification_answer(text: str) -> str | None:
     choices = {
         "read": {"只分析", "仅分析", "只检查", "只检查bug", "检查bug", "提出优化建议",
                  "只给建议", "analyze only", "analyse only", "inspect only", "read only"},
-        "write": {"直接修改", "修改代码", "直接修改代码", "直接修复", "modify the code",
+        "write": {"直接改", "直接修改", "修改代码", "直接修改代码", "直接修复", "modify the code",
                   "modify directly", "fix it", "make changes"},
         "cancel": {"先别做了", "取消", "不做了", "cancel", "stop", "never mind"},
         "chat": {"我只是问问", "只是问问", "just asking"},

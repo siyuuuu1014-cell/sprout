@@ -11,6 +11,7 @@ from Sprout.execution.policy_emit import emit_policy_decision
 from Sprout.security.access import AccessDecision, ActionRequest, ActionType, PolicyDecision
 from Sprout.security.approval import ApprovalManager
 from Sprout.security.engine import PolicyEngine
+from Sprout.security.layered_policy import LayeredPolicyEngine
 from Sprout.task.models import DelegationScope
 from Sprout.workspace.models import ResourceKind, ResourceRef, Workspace
 
@@ -60,13 +61,15 @@ class GitBroker:
             return GitResult(action="diff", allowed=False, reason=decision.value)
         return await git_s1.run_read(workspace, "diff", scope)
 
-    def _check_review_policy(self, task, paths, root):
+    def _check_review_policy(self, task, paths, root, *, recheck=False):
         from Sprout.execution.verification_export import EXCLUDED
         from Sprout.workspace.classifier import classify
 
         if task.delegation_scope.is_expired():
             raise PermissionError("git_scope_expired")
         bound = task.delegation_scope.bind_paths(str(root))
+        decide = (self._policy.recheck if recheck and isinstance(self._policy, LayeredPolicyEngine)
+                  else self._policy.decide)
         for path in paths:
             if any(part.casefold() in EXCLUDED for part in path.split("/")):
                 raise PermissionError("git_project_private_resource")
@@ -74,7 +77,7 @@ class GitBroker:
                 request = ActionRequest(task_id=task.id, actor=task.actor, action=action,
                     scope=bound, resource=ResourceRef(task.workspace_id, str(root / path),
                                                     kind=classify(path)))
-                decision = self._policy.decide(request)
+                decision = decide(request)
                 if decision.decision is not AccessDecision.ALLOW:
                     raise PermissionError(decision.reason or "git_policy_denied")
 

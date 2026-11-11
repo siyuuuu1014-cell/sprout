@@ -22,12 +22,29 @@ async def prepare(runtime, workspace_id, *, message, session, principal):
     from Sprout.task.models import DelegationScope
     from Sprout.workspace.authorized_content import relative_label
 
-    workspace = await runtime.get_workspace(workspace_id)
-    if workspace is None:
-        raise PermissionError("cli_code_workspace_unavailable")
     owned = await runtime._sessions.require_owner(session.id, principal)
     if runtime._sessions.frozen_principal(owned) != principal:
         raise PermissionError("cli_code_subject_unavailable")
+    bound = runtime.session_workspace_id(owned)
+    if bound and workspace_id and bound != workspace_id:
+        raise PermissionError("cli_code_subject_unavailable")
+    workspace_id = bound or workspace_id
+    workspace = await runtime.get_workspace(workspace_id) if workspace_id else None
+    if workspace is None or not workspace.root.is_dir():
+        raise PermissionError("cli_code_workspace_unavailable")
+    from Sprout.runtime.isolated_test_run import execution_request
+
+    if execution_request(message.content):
+        from Sprout.cli.filesystem_task import prepare_filesystem
+
+        return await prepare_filesystem(runtime, workspace, message, owned, principal,
+                                        test_only=True)
+    from Sprout.workspace.models import WorkspaceKind
+
+    if workspace.kind is WorkspaceKind.LOCAL_DIRECTORY and not (workspace.root / ".git").exists():
+        from Sprout.cli.filesystem_task import prepare_filesystem
+
+        return await prepare_filesystem(runtime, workspace, message, owned, principal)
     prompts = (
         ("reads", "READ inputs (comma-separated Workspace-relative files):"),
         ("writes", "WRITE targets (comma-separated; only these files may change):"),

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
+from Sprout.llm.diagnostics import record_completion
 from Sprout.llm.messages import (
     LLMMessage,
     LLMResponse,
@@ -73,6 +74,7 @@ class OpenAICompatibleProvider:
             payload["tools"] = [self._encode_tool(spec) for spec in tools]
         if stream:
             payload["stream"] = True
+            payload["stream_options"] = {"include_usage": True}
         if self.thinking_mode is not None:
             payload["thinking"] = {"type": self.thinking_mode}
         if self.max_output_tokens is not None:
@@ -96,44 +98,16 @@ class OpenAICompatibleProvider:
                     f"{response.text[:500]}"
                 )
             data = response.json()
-        return self._decode_response(data)
+        decoded = self._decode_response(data)
+        record_completion(self, decoded.finish_reason, decoded.usage if data.get("usage") else None)
+        return decoded
 
     async def stream(
         self, messages: Sequence[LLMMessage], *, tools: Sequence[ToolSpec] = ()
     ):
         """Stream completion text deltas from a chat-completions endpoint."""
-        payload = self._request_payload(messages, tools, stream=True)
-
-        url = f"{self.base_url}/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-            async with client.stream("POST", url, json=payload, headers=headers) as response:
-                if response.status_code >= 400:
-                    body = (await response.aread()).decode("utf-8", errors="replace")
-                    raise RuntimeError(
-                        f"Model request failed with HTTP {response.status_code}: "
-                        f"{body[:500]}"
-                    )
-                async for line in response.aiter_lines():
-                    if not line or not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
-                    if data == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data)
-                    except json.JSONDecodeError:
-                        continue
-                    choices = chunk.get("choices") or []
-                    if not choices:
-                        continue
-                    delta = choices[0].get("delta") or {}
-                    content = delta.get("content")
-                    if content:
-                        yield content
+        async for event in self.stream_events(messages, tools=tools):
+            yield event.content
 
     async def stream_events(
         self, messages: Sequence[LLMMessage], *, tools: Sequence[ToolSpec] = ()
@@ -148,6 +122,7 @@ class OpenAICompatibleProvider:
         }
         tool_deltas: dict[int, dict[str, str]] = {}
         finish_reason: str | None = None
+        model = self.model
         usage = Usage()
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
             async with client.stream("POST", url, json=payload, headers=headers) as response:
@@ -167,6 +142,16 @@ class OpenAICompatibleProvider:
                         chunk = json.loads(data)
                     except json.JSONDecodeError:
                         continue
+                    model = chunk.get("model") or model
+                    usage_data = chunk.get("usage")
+                    if usage_data:
+                        usage = Usage(
+                            prompt_tokens=int(usage_data.get("prompt_tokens", 0)),
+                            completion_tokens=int(
+                                usage_data.get("completion_tokens", 0)
+                            ),
+                            total_tokens=int(usage_data.get("total_tokens", 0)),
+                        )
                     choices = chunk.get("choices") or []
                     if not choices:
                         continue
@@ -188,15 +173,7 @@ class OpenAICompatibleProvider:
                             entry["name"] += function["name"]
                         if function.get("arguments"):
                             entry["arguments"] += function["arguments"]
-                    usage_data = chunk.get("usage")
-                    if usage_data:
-                        usage = Usage(
-                            prompt_tokens=int(usage_data.get("prompt_tokens", 0)),
-                            completion_tokens=int(
-                                usage_data.get("completion_tokens", 0)
-                            ),
-                            total_tokens=int(usage_data.get("total_tokens", 0)),
-                        )
+
 
         tool_calls = tuple(
             ToolCall(
@@ -206,10 +183,12 @@ class OpenAICompatibleProvider:
             )
             for index, entry in sorted(tool_deltas.items())
         )
+        record_completion(self, finish_reason, usage)
         yield LLMStreamEvent(
             tool_calls=tool_calls,
             finish_reason=finish_reason,
             usage=usage,
+            model=model,
         )
 
     @staticmethod

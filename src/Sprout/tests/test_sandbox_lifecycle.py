@@ -358,3 +358,85 @@ def test_the_read_tool_describes_a_plain_directory_as_the_workspace(
     assert "sandbox" not in description, "a plain directory is not a sandbox"
     assert "worktree" not in description
     assert "source code" in description, "the description should name the use"
+
+
+async def test_orphan_scan_preserves_markerless_sibling(tmp_path, monkeypatch, caplog):
+    from unittest.mock import AsyncMock
+
+    orphan = tmp_path / ".sprout-sprout-sandbox-stale"
+    orphan.mkdir()
+    (orphan / ".pytest_cache").mkdir()
+    first = _workspace(_git_repo(tmp_path))
+    second_root = tmp_path / "other"
+    second_root.mkdir()
+    second = replace(first, id="other", root=second_root, kind=WorkspaceKind.LOCAL_DIRECTORY)
+    metadata = _FakeMetadata(workspace=first)
+    metadata.list_workspaces = AsyncMock(return_value=[second, first])
+    remove = AsyncMock()
+    monkeypatch.setattr(GitWorktreeSandbox, "remove", remove)
+    await SandboxLifecycleService(metadata).reconcile_orphans()
+    remove.assert_not_awaited()
+    assert orphan.is_dir()
+    assert sum("missing_worktree_marker" in r.message for r in caplog.records) == 1
+
+
+async def test_cleanup_never_routes_filesystem_ref_to_git(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    workspace = _workspace(_git_repo(tmp_path))
+    ref = SandboxRef("fs", "filesystem_experiment", tmp_path / "sprout-filesystem-stale")
+    proposal = ChangeProposal(task_id=_task().id, sandbox_ref=ref)
+    metadata = _FakeMetadata(workspace=workspace, proposals=(proposal,), tasks=(_task(),))
+    remove = AsyncMock()
+    monkeypatch.setattr(GitWorktreeSandbox, "remove", remove)
+    await SandboxLifecycleService(metadata).cleanup_proposal(proposal)
+    remove.assert_not_awaited()
+
+
+
+def test_filesystem_close_settles_already_absent_directory(tmp_path):
+    from Sprout.sandbox.filesystem import KIND, FilesystemSandbox
+
+    sandbox = FilesystemSandbox(tmp_path)
+    sandbox.ref = SandboxRef("gone", KIND, tmp_path / "sprout-filesystem-already-removed")
+    sandbox.close()
+    sandbox.close()
+    assert sandbox.ref is None
+
+
+
+async def test_markerless_diagnostic_survives_sqlite_reopen_without_hiding_worktree(
+    tmp_path, monkeypatch, caplog,
+):
+    from unittest.mock import AsyncMock
+
+    from Sprout.storage.local.sqlite.driver import SqliteDatabase
+    from Sprout.storage.local.sqlite.metadata import SqliteMetadataStore
+
+    repo = _git_repo(tmp_path)
+    workspace = _workspace(repo)
+    ref = await GitWorktreeSandbox(workspace).create()
+    marker = ref.root / ".git"
+    original_marker = marker.read_bytes()
+    marker.unlink()
+    remove = AsyncMock()
+    monkeypatch.setattr(GitWorktreeSandbox, "remove", remove)
+    for _ in range(3):
+        store = SqliteMetadataStore(SqliteDatabase(tmp_path / "metadata.db"))
+        try:
+            await store.save_workspace(workspace)
+            await SandboxLifecycleService(store).reconcile_orphans()
+        finally:
+            store.close()
+
+    remove.assert_not_awaited()
+    assert sum("missing_worktree_marker" in r.message for r in caplog.records) == 1
+    assert ref.root.exists()
+
+    marker.write_bytes(original_marker)
+    store = SqliteMetadataStore(SqliteDatabase(tmp_path / "metadata.db"))
+    try:
+        await SandboxLifecycleService(store).reconcile_orphans()
+    finally:
+        store.close()
+    remove.assert_awaited_once()

@@ -216,7 +216,18 @@ def chat(
             )
         )
         raise typer.Exit(code=2)
-    runtime = create_runtime(settings)
+    from Sprout.security.local_diagnostics import prepare
+
+    diagnostics = prepare(settings, message=message, session=session)
+    if diagnostics is not None:
+        settings = diagnostics.settings
+        typer.echo(ui.warning(
+            "LOCAL DIAGNOSTIC: 免人工审批；前台工具可执行宿主命令；Coding 使用隔离后端。"
+        ))
+        typer.echo(ui.warning(f"独立诊断数据目录：{diagnostics.root}"))
+        runtime = create_runtime(settings, local_diagnostics=diagnostics)
+    else:
+        runtime = create_runtime(settings)
 
     asyncio.run(_chat(runtime, settings, message=message, session=session, user=user))
 
@@ -261,8 +272,17 @@ async def _chat(runtime, settings, *, message: str | None, session: str | None, 
         attach_evolution(runtime, settings)
 
     try:
-        async with managed(runtime):
+        from Sprout.security.local_diagnostics import current, foreground
+
+        async with managed(runtime), foreground(runtime):
             session, workspace_id = await _prepare_cli_context(runtime, session, user)
+            diagnostics = current(runtime)
+            if diagnostics is not None:
+                await diagnostics.bind(runtime, session, current_cli_principal())
+                diagnostics.progress = typer.echo
+                workspace = await runtime.get_workspace(workspace_id) if workspace_id else None
+                if workspace is not None:
+                    typer.echo(f"[Workspace] {workspace.root}")
             gateway = CLIGateway(runtime)
             if message is not None:
                 if _handle_natural_language_request(message):
@@ -351,9 +371,14 @@ async def _provide_cli_analysis_task(runtime, workspace_id, *, message, session,
 
     if not principal.authenticated or principal.source != "cli":
         raise PermissionError("cli_analysis_identity_unavailable")
-    workspace = await runtime.get_workspace(workspace_id) if workspace_id else None
-    if workspace is None:
+    owned = await runtime._sessions.require_owner(session.id, principal)
+    bound = runtime.session_workspace_id(owned)
+    workspace_id = bound or workspace_id
+    if not workspace_id:
         raise PermissionError("cli_analysis_workspace_required")
+    workspace = await runtime.get_workspace(workspace_id)
+    if workspace is None or not workspace.root.is_dir():
+        raise PermissionError("cli_session_workspace_unavailable")
     if not sys.stdin.isatty():
         raise PermissionError("cli_analysis_interactive_confirmation_required")
     typer.echo(_L("本次只读分析工作区：", "Read-only analysis workspace: ")
@@ -361,9 +386,16 @@ async def _provide_cli_analysis_task(runtime, workspace_id, *, message, session,
     typer.echo(_L(
         "选择范围不替代 Policy/Scope 授权。", "Selection does not override Policy/Scope.",
     ))
-    from Sprout.runtime.analysis_consent import code_metrics_request
+    from Sprout.runtime.analysis_consent import (
+        code_metrics_request,
+        coverage_request,
+        source_review_request,
+    )
 
     selection = _analysis_selection(message.content)
+    if ((coverage_request(message.content) and (not selection or selection[0] == "file"))
+            or (source_review_request(message.content) and not selection)):
+        selection = ("directory", ".")
     if code_metrics_request(message.content) and selection and selection[0] != "file":
         selection = None
     if selection and selection[0] == "directory":
@@ -403,7 +435,12 @@ async def _provide_cli_analysis_task(runtime, workspace_id, *, message, session,
                 raise PermissionError("analysis_file_selection_invalid")
         typer.echo(_L("本次分析请求：", "Analysis request: ") + message.content)
         typer.echo(_L("只读取所选文件：", "Selected files only: ") + "\n" + "\n".join(paths))
-        confirmed = await questionary.confirm(_L(
+        from Sprout.security.local_diagnostics import current
+
+        diagnostics = current(runtime)
+        if diagnostics is not None:
+            await diagnostics.require()
+        confirmed = diagnostics is not None or await questionary.confirm(_L(
             "确认请求分析以上文件？", "Confirm analysis of these files?",
         ), default=False).ask_async()
         if not confirmed:
@@ -453,7 +490,7 @@ def _analysis_selection(content: str) -> tuple[str, str] | None:
 
 
 async def _provide_cli_directory_task(
-    runtime, workspace, session, principal, message, *, label=None,
+    runtime, workspace, session, principal, message, *, label=None, filesystem_preflight=False,
 ):
     """Confirm an exact read-only scope through Runtime's existing approvals."""
     from Sprout.runtime.analysis_consent import bind, context
@@ -477,10 +514,16 @@ async def _provide_cli_directory_task(
             runtime, workspace, session, principal, target)
         target = Path(arguments['path'])
         typer.echo(_L("自动分析授权范围：", "Automatic analysis scope: ") + str(target))
-        if reusable is None and not await questionary.confirm(_L(
+        from Sprout.security.local_diagnostics import current
+
+        diagnostics = current(runtime)
+        if diagnostics is not None:
+            await diagnostics.require()
+        if (reusable is None and diagnostics is None and not filesystem_preflight
+                and not await questionary.confirm(_L(
                 "授权列举此目录及子目录，并只读分析 Policy 允许的项目文件？",
                 "Authorize directory/subdirectory listing and analysis of policy-allowed files?"),
-                default=False).ask_async():
+                default=False).ask_async()):
             return None
     except (EOFError, KeyboardInterrupt):
         return None
@@ -498,7 +541,10 @@ async def _provide_cli_directory_task(
         execution_mode=TaskExecutionMode.READ_ONLY, delegation_scope=scope,
         metadata={"session_id": owned.id, "analysis_directory": label},
     )
-    await bind(runtime, task, workspace, owned, principal, arguments)
+    await bind(runtime, task, workspace, owned, principal, arguments,
+               automatic=filesystem_preflight)
+    if filesystem_preflight and diagnostics is None:
+        typer.echo("[Approval] AUTO-APPROVED: directory.list")
     return task
 
 
@@ -516,13 +562,62 @@ def _cli_analysis_task_provider(runtime, workspace_id, live=None):
     return provide
 
 
-async def _cli_turn_stream(runtime, message, **kwargs):
-    """Display a denied turn without granting, retrying or settling its effects."""
-    try:
-        async for chunk in runtime.handle_stream(message, **kwargs):
+async def _cli_turn_stream(runtime, message, *, live=None, progress=None, **kwargs):
+    """Render a foreground node's exact approval before its wait can proceed."""
+    from Sprout.execution.process_broker import foreground_frozen_approval
+    from Sprout.security.local_diagnostics import foreground_progress
+
+    principal = kwargs.get("principal")
+    owner = asyncio.current_task()
+
+    async def prompt(source_runtime, record):
+        if (source_runtime is not runtime or asyncio.current_task() is not owner
+                or record.session_id != message.session_id
+                or record.source != "cli" or record.requested_by != principal.user_id):
+            return
+        session = await runtime._sessions.require_owner(record.session_id, principal)
+        if runtime._sessions.frozen_principal(session) != principal:
+            raise PermissionError("cli_frozen_approval_subject_changed")
+        if live is not None:
+            live.stop()
+        try:
+            _print_approval_record(record)
+            choice = await _prompt_task_gate_choice(
+                _L("允许执行这条沙箱验证命令？", "Allow this sandbox verification command?")
+            )
+            await runtime.approvals.decide(
+                record.id, choice == "approve", decided_by=principal.user_id,
+                channel="cli", principal=principal,
+            )
+        finally:
+            if live is not None:
+                live.start()
+
+    interactive = (kwargs.get("foreground") and message.session_id and principal is not None
+                   and principal.authenticated and principal.source == "cli")
+    stream = runtime.handle_stream(message, **kwargs)
+    from contextlib import aclosing
+
+    async with aclosing(stream):
+        while True:
+            token = foreground_frozen_approval.set(prompt) if interactive else None
+            progress_token = foreground_progress.set(
+                (runtime, owner, progress or typer.echo)
+            ) if interactive else None
+            try:
+                chunk = await anext(stream)
+            except StopAsyncIteration:
+                return
+            except PermissionError as exc:
+                chunk = StreamChunk(error=str(exc))
+            finally:
+                if token is not None:
+                    foreground_frozen_approval.reset(token)
+                if progress_token is not None:
+                    foreground_progress.reset(progress_token)
             yield chunk
-    except PermissionError as exc:
-        yield StreamChunk(error=str(exc))
+            if chunk.error is not None:
+                return
 
 
 async def _repl(
@@ -567,6 +662,14 @@ async def _repl(
         if _handle_natural_language_request(content):
             continue
         if content.startswith("/"):
+            from Sprout.security.local_diagnostics import current
+
+            if current(runtime) is not None and content.split()[0] not in {
+                "/", "/help", "/language", "/clear", "/q", "/quit", "/exit", "/permissions",
+                "/status",
+            }:
+                typer.echo(ui.warning("Diagnostic mode refuses operational slash commands"))
+                continue
             if content == "/permissions":
                 from Sprout.cli.commands.security import session_permission_inventory
 
@@ -677,6 +780,16 @@ async def _repl(
                 await _continue_foreground_task(runtime, {"task_id": task.id}, user)
                 continue
             if content == "/status" or content.startswith("/status "):
+                if current(runtime) is not None:
+                    from Sprout.cli.filesystem_preparation import readonly_status
+
+                    try:
+                        typer.echo(await readonly_status(
+                            runtime, session, current_cli_principal(),
+                            content.removeprefix("/status").strip()))
+                    except (PermissionError, LookupError) as exc:
+                        typer.echo(ui.warning(str(exc)))
+                    continue
                 task_id = content.removeprefix("/status").strip()
                 if not task_id:
                     typer.echo(
@@ -704,6 +817,12 @@ async def _repl(
                 typer.echo(ui.key_value("task", task.id))
                 typer.echo(ui.key_value("status", task.status.value))
                 typer.echo(ui.key_value("instruction", task.instruction[:80]))
+                if task.metadata.get("filesystem_experiment"):
+                    review = await runtime.filesystem_review(
+                        task.id, session, current_cli_principal())
+                    if review is not None:
+                        _render_cli_markdown(review)
+                    continue
                 await _approve_task_gates(runtime, task, user)
                 continue
             if content == "/web":
@@ -762,6 +881,11 @@ async def _repl(
         reply_metadata: dict = {}
         response_error: str | None = None
         console = Console(theme=_CLI_MARKDOWN_THEME)
+        from Sprout.security.local_diagnostics import current
+
+        diagnostics = current(runtime)
+        if diagnostics is not None:
+            diagnostics.progress = lambda line, output=console: output.print(line, markup=False)
         try:
             principal = current_cli_principal()
         except ValueError:
@@ -779,9 +903,11 @@ async def _repl(
                 console=console,
                 refresh_per_second=12,
                 vertical_overflow="crop",
+                transient=True,
             ) as live:
                 async for chunk in _cli_turn_stream(
-                    runtime, stream_message, principal=principal, foreground=True,
+                    runtime, stream_message, principal=principal, foreground=True, live=live,
+                    progress=lambda line, output=console: output.print(line, markup=False),
                     analysis_task_provider=_cli_analysis_task_provider(runtime, workspace_id, live),
                     code_task_provider=_cli_code_task_provider(runtime, workspace_id, live),
                 ):
@@ -814,13 +940,12 @@ async def _repl(
                 if chunk.outbound is not None:
                     session = chunk.outbound.session_id
                     reply_metadata = dict(chunk.outbound.metadata)
+        if response_chunks:
+            _render_cli_markdown("".join(response_chunks))
+            console.print()
         if response_error is not None:
             typer.secho(response_error, fg=typer.colors.RED)
-        elif response_chunks:
-            if not console.is_terminal:
-                _render_cli_markdown("".join(response_chunks))
-            console.print()
-        else:
+        elif not response_chunks:
             console.print(
                 Markdown(
                     _L(
@@ -834,6 +959,9 @@ async def _repl(
         handled = False
         if await _handle_cli_workspace_consent(runtime, session, reply_metadata, user):
             handled = True
+            if session:
+                owned = await runtime._sessions.require_owner(session, principal)
+                workspace_id = runtime.session_workspace_id(owned)
         elif reply_metadata.get("foreground_task"):
             await _continue_foreground_task(runtime, reply_metadata, user)
             handled = True
@@ -854,6 +982,10 @@ async def _repl(
 
 async def _approve_task_gates(runtime: Any, task: Any, user: str) -> None:
     """Handle each distinct gate in one /status interaction."""
+    from Sprout.security.local_diagnostics import current as current_diagnostics
+    from Sprout.security.local_diagnostics import report
+
+    diagnostics = current_diagnostics(runtime)
     parked = {"waiting_approval", "waiting_resource", "ready_to_apply"}
     while True:
         current = await runtime.get_task(task.id) or task
@@ -863,6 +995,9 @@ async def _approve_task_gates(runtime: Any, task: Any, user: str) -> None:
 
         kind, handle = await runtime.task_progress(current)
         if kind == "approval" and handle:
+            if diagnostics is not None:
+                typer.echo(ui.warning("Diagnostic mode cannot approve this pending operation."))
+                return
             record = await runtime.approvals.store.get_approval(handle)
             if record is None:
                 typer.echo(
@@ -915,7 +1050,7 @@ async def _approve_task_gates(runtime: Any, task: Any, user: str) -> None:
                     typer.echo("Exact Workspace replacement (content snapshots; not Git output):")
                     render_diff("workspace_replacement", content["text"])
                 plan_sha256 = proposal.metadata["apply_plan_sha256"]
-                if not await _confirm_exact_apply_plan(plan_sha256):
+                if diagnostics is None and not await _confirm_exact_apply_plan(plan_sha256):
                     typer.echo(ui.warning("Not confirmed; no Apply write."))
                     return
                 current_proposal = await runtime.find_change_proposal(proposal.id)
@@ -923,10 +1058,18 @@ async def _approve_task_gates(runtime: Any, task: Any, user: str) -> None:
                         current_proposal.metadata.get("apply_plan_sha256") != plan_sha256):
                     typer.echo(ui.warning("Apply Plan changed; review it again before confirming."))
                     return
+                report(runtime, "Review", f"completed: {proposal.id}")
+                report(runtime, "Apply", "starting exact plan")
                 await runtime.approve_change_proposal(proposal.id, decided_by="cli",
                                                      principal=current_cli_principal())
+                result = await runtime.find_change_proposal(proposal.id)
+                if result is not None:
+                    report(runtime, "Apply", result.status.value)
                 typer.echo(ui.success("Exact Apply Plan approved; checking persisted result."))
                 continue
+            if diagnostics is not None:
+                typer.echo(ui.warning("Diagnostic mode requires an exact Apply Plan."))
+                return
             has_failures = any(item.failed for item in proposal.test_results)
             if has_failures:
                 typer.echo(
@@ -1276,7 +1419,12 @@ async def _prepare_cli_context(runtime: Any, session_id: str | None, user: str):
             if workspace is None or not workspace.root.is_dir():
                 raise PermissionError("cli_session_workspace_unavailable")
             return session.id, workspace_id
-    workspace_id = await _confirm_cli_workspace(runtime)
+    from Sprout.security.local_diagnostics import current
+
+    if current(runtime) is not None:
+        workspace_id = (await runtime.open_workspace(Path.cwd().resolve())).id
+    else:
+        workspace_id = await _confirm_cli_workspace(runtime)
     session = await runtime._sessions.resolve(
         Message("", channel="cli", user_id=user, session_id=session_id), principal=principal)
     # Confirmation yielded to terminal input. Recheck ownership before binding.
@@ -1499,7 +1647,8 @@ def _print_approval_record(
 ) -> None:
     typer.echo("")
     typer.echo(ui.text(_approval_text("title"), bold=True))
-    scope = ("task_scope" if task_offer else "similar_scope" if getattr(record, "approval_class", "")
+    scope = ("task_scope" if task_offer else
+             "similar_scope" if getattr(record, "approval_class", "")
              and getattr(record, "session_id", "") else "exact_scope")
     rows = _approval_detail_rows(record)
     rows.extend(
@@ -1579,11 +1728,23 @@ def _approval_text(key: str, **values: object) -> str:
 _APPROVAL_TEXT: dict[str, dict[str, str]] = {
     "task_scope": {
         "zh": "仅本次调用，或允许当前任务在同一目录使用该程序。任务授权有期限。",
-        "en": "Approve this invocation or allow this executable in the same directory for this task.",
+        "en": (
+            'Approve this invocation or allow this executable in the same '
+            'directory for this task.'
+        ),
     },
     "yes_task": {
-        "zh": "本任务内允许 {executable} 在 {root} 使用其他参数。程序可间接修改文件或运行 Git，此授权不提供操作系统隔离。Git 仅限版本和执行路径查询。",
-        "en": "Allow other arguments for {executable} in {root} for this task. Programs can modify files or run Git indirectly. This consent provides no OS isolation. Git covers version and exec-path queries only.",
+        "zh": (
+            "本任务内允许 {executable} 在 {root} 使用其他参数。"
+            "程序可间接修改文件或运行 Git，此授权不提供操作系统隔离。"
+            "Git 仅限版本和执行路径查询。"
+        ),
+        "en": (
+            'Allow other arguments for {executable} in {root} for this task. '
+            'Programs can modify files or run Git indirectly. This consent '
+            'provides no OS isolation. Git covers version and exec-path '
+            'queries only.'
+        ),
     },
     "action": {
         "zh": "将执行",

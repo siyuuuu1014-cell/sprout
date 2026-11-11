@@ -20,17 +20,54 @@ def code_metrics_request(text):
         r".*(?:行数|多少行|\blines\b)|^你现在有多少行代码", text))
 
 
+def coverage_request(text):
+    text = text.strip().casefold()
+    return (text.startswith(("检查", "分析", "请检查", "请分析"))
+            and "测试" in text and "覆盖" in text)
+
+
+def source_review_request(text):
+    from Sprout.intents import project_clauses
+
+    clauses = project_clauses(text.strip().casefold())
+    return (bool(clauses) and clauses[0].startswith(
+        ("检查代码", "请检查代码", "审查代码", "请审查代码", "review the code"))
+        and not any(c.startswith(("不要", "别审查")) for c in clauses))
+
+
 def explicit_request(text):
     """A CLI imperative can select analysis; it never grants its effects."""
     text = text.strip().casefold()
     if re.search(r'(?:不要|无需|不必|停止|取消)\s*(?:再|重新|继续)?\s*(?:分析|扫描)|'
                  r"\b(?:do not|don't)\s+(?:analy[sz]e|scan)", text):
         return False
-    return code_metrics_request(text) or bool(re.fullmatch(
+    if coverage_request(text) or source_review_request(text) or code_metrics_request(text):
+        return True
+    return bool(re.fullmatch(
         r"(?:你)?(?:能|可以|能否)(?:帮我)?\s*分析(?:一下)?\s*当前项目(?:吗)?[？?。]?", text
     )) or bool(re.search(
         r'^(?:请|帮我|麻烦)?\s*(?:重新)?(?:分析|扫描|analy[sz]e\b|inspect\b)|'
         r'^(?:请)?继续.*(?:未完成|失败|被拒绝).*(?:项目分析|分析项目)', text))
+
+
+def coverage_evidence(analysis, view):
+    """Bound the source shown to the read-only analysis Agent."""
+    chunks = ["\n\nAuthorized Python source for static coverage review:"]
+    remaining = 24_000
+    omitted = 0
+    for entry in view.entries:
+        if not entry.relative_path.casefold().endswith(".py"):
+            continue
+        text = entry.text()
+        chunk = f"\n\n--- {entry.relative_path} ---\n{text}"
+        if len(chunk) > remaining:
+            omitted += 1
+            continue
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    if omitted:
+        chunks.append(f"\n{omitted} Python file(s) omitted by the review text limit.")
+    return "".join(chunks)
 
 
 class _DirectoryLayer(PolicyLayer):
@@ -81,7 +118,7 @@ async def context(runtime, workspace, session, principal, target):
     return owned, scope, arguments, reusable
 
 
-async def bind(runtime, task, workspace, owned, principal, arguments):
+async def bind(runtime, task, workspace, owned, principal, arguments, *, automatic=False):
     """Called only after the foreground CLI confirmed this exact directory."""
     from Sprout.task.models import TaskExecutionMode, TaskStatus
 
@@ -100,9 +137,10 @@ async def bind(runtime, task, workspace, owned, principal, arguments):
             resource_scope=arguments['path']):
         record = await runtime.approvals.request('directory.list', arguments, task_id=task.id,
             session_id=owned.id, requested_by=principal.user_id, source=principal.source,
-            single_use=False, resource_scope=arguments['path'])
+            single_use=False, resource_scope=arguments['path'], request_approval=not automatic)
         await runtime.approvals.decide(record.id, True, decided_by=principal.user_id,
-            channel='cli', reason='Foreground CLI confirmed this exact read-only directory')
+            channel='cli', reason=('Foreground Filesystem discovery' if automatic
+                                   else 'Foreground CLI confirmed this exact read-only directory'))
     record = await runtime.approvals._usable_record('directory.list', arguments,
         task_id=task.id, session_id=owned.id, requested_by=principal.user_id,
         source=principal.source,

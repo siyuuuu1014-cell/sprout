@@ -235,10 +235,15 @@ def _project_analyze_tool_call(message: Message, intent: str) -> dict[str, Any] 
         re.search(r"分析|扫描|\b(?:analy[sz]e|inspect|scan)\b", text)
         and any(term in text for term in ("项目", "project", "目录", "directory", "folder"))
     )
-    from Sprout.runtime.analysis_consent import code_metrics_request
+    from Sprout.runtime.analysis_consent import (
+        code_metrics_request,
+        coverage_request,
+        source_review_request,
+    )
 
-    if not (code_metrics_request(text) or explicit_analysis or project_analysis or any(
-            term.casefold() in text for term in _PROJECT_ANALYZE_TERMS)):
+    if not (source_review_request(text) or coverage_request(text)
+            or code_metrics_request(text) or explicit_analysis
+            or project_analysis or any(term.casefold() in text for term in _PROJECT_ANALYZE_TERMS)):
         return None
     metadata = dict(message.metadata)
     raw_path = (
@@ -365,6 +370,7 @@ class Runtime:
         self._local_acceptance_receipts = {}
         self._local_apply_plans = {}
         self._local_apply_permits = {}
+        self._filesystem_apply_permits = {}
         self._local_git_reviews = {}
         self._node_products = {}
         self._node_publications = {}
@@ -623,7 +629,8 @@ class Runtime:
     async def _resolve_local_apply_resource(self, permit):
         from Sprout.execution.apply_plan import resolve_resource
 
-        return await resolve_resource(self, permit)
+        resolve = self._filesystem_apply_permits.get(permit)
+        return await resolve() if resolve is not None else await resolve_resource(self, permit)
 
     async def _prepare_local_apply_proposal(self, scope):
         from Sprout.execution.apply_plan import publish
@@ -1814,6 +1821,16 @@ class Runtime:
         paths = task.delegation_scope.bind_paths(str(workspace.root)).narrow(
             scope.task.delegation_scope.bind_paths(str(workspace.root)))
         sandbox = getattr(tool, "_sandbox", None)
+        experiment = self._sandbox_lifecycle.filesystem.get(task.id)
+        if sandbox is not None and experiment is not None:
+            experiment.sandbox.check()
+            if sandbox != experiment.sandbox.ref:
+                raise PermissionError("filesystem_experiment_sandbox_mismatch")
+            from Sprout.sandbox.filesystem import checked_label
+
+            if "path" in arguments:
+                checked_label(arguments["path"], sandbox.root,
+                              self._file_broker._classify_overrides)
         if sandbox is not None:
             from Sprout.workspace.authorized_content import relative_label
 
@@ -1828,8 +1845,11 @@ class Runtime:
                     raise PermissionError("node_tool_sandbox_unavailable")
                 # The isolated adapter validates relative_cwd and import paths
                 # against the same persisted sandbox before dispatch.
+                if experiment is not None:
+                    resource = ResourceRef(workspace.id, workspace.root.as_posix(),
+                                           kind=classify(workspace.root))
                 return ActionRequest(task_id=task.id, actor=task.actor,
-                                     action=ActionType.TOOL_INVOKE, scope=paths)
+                                     action=ActionType.TOOL_INVOKE, resource=resource, scope=paths)
             if (not valid or getattr(tool, "_task_id", None) != task.id
                     or getattr(tool, "_scope", None) != scope.task.delegation_scope):
                 raise PermissionError("node_tool_sandbox_unavailable")
@@ -1882,6 +1902,14 @@ class Runtime:
                     or request.action not in {ActionType.FILE_WRITE, ActionType.FILE_DELETE}):
                 raise PermissionError("node_file_resource_mismatch")
             relative = target.relative_to(root).as_posix()
+            if task.metadata.get("filesystem_experiment"):
+                from Sprout.sandbox.filesystem import checked_label
+
+                experiment = self._sandbox_lifecycle.filesystem.get(task.id)
+                if experiment is None or sandbox != experiment.sandbox.ref:
+                    raise PermissionError("node_file_filesystem_sandbox_unavailable")
+                experiment.sandbox.check()
+                checked_label(relative, root, self._file_broker._classify_overrides)
             self._check_cli_write_target(task, relative)
             if task != frame[3].task:
                 raise PermissionError("node_file_binding_changed")
@@ -2130,6 +2158,10 @@ class Runtime:
                 if admission is not None:
                     admission["unavailable_reason"] = "project_auto_discovery_unavailable"
                     admission["directory_listing_reason"] = listing.reason
+                    from Sprout.security.local_diagnostics import current
+
+                    if current(self) is not None:
+                        admission["unavailable_reason"] += ": " + listing.reason
                 raise PermissionError("project_auto_discovery_unavailable")
             identities = {}
             for entry in listing.entries:
@@ -2229,6 +2261,9 @@ class Runtime:
                 admission["projected_data"] = projector(analysis, view)
                 if admission.get("code_metrics"):
                     return admission["projected_data"]
+                if admission.get("source_review"):
+                    return ToolResult.success(result.content + admission["projected_data"],
+                                              data=result.data)
             return result
 
         result = await self._capture_project_selection(
@@ -3054,6 +3089,9 @@ class Runtime:
             from Sprout.storage.bootstrap import ensure_storage_ready
 
             await ensure_storage_ready(self._settings)
+        reconcile = getattr(self.storage.metadata, "reconcile_filesystem_apply", None)
+        if reconcile is not None:
+            await reconcile()
         self._started = True
         self._verification_stopping = False
         await self.events.publish(Event(RUNTIME_STARTED, {"version": _package_version()}))
@@ -3177,8 +3215,11 @@ class Runtime:
                     await self._stop_outbox_worker()
                     await self.events.publish(Event(RUNTIME_STOPPED, {}))
                 finally:
-                    # A failed worker/flush must not leave authority connections open.
-                    await self.storage.close()
+                    # Close authority stores even if worker or sandbox cleanup fails.
+                    try:
+                        self._sandbox_lifecycle.close_filesystem_all()
+                    finally:
+                        await self.storage.close()
 
     async def _start_outbox_worker(self) -> None:
         """Drain the transactional outbox into the derived layers.
@@ -3211,14 +3252,25 @@ class Runtime:
     # -- online path ---------------------------------------------------------
     async def _dispatch_project_analysis(
         self, message, session, *, principal, analysis_task, classification,
-        analysis_task_provider=None, reply_to=None,
+        analysis_task_provider=None, reply_to=None, on_capture=None,
     ):
         """Admit an explicit host reference; routing hints confer no authority.
 
         This local-only lane does not select Tasks by Session, create a Scope,
         or reinterpret old/running graphs. The existing guard owns execution.
         """
-        from Sprout.runtime.analysis_consent import code_metrics_request, explicit_request
+        from Sprout.runtime.analysis_consent import (
+            code_metrics_request,
+            coverage_request,
+            explicit_request,
+            source_review_request,
+        )
+        from Sprout.runtime.isolated_test_run import execution_request
+
+        if (analysis_task is None and analysis_task_provider is not None
+                and principal is not None and principal.authenticated and principal.source == "cli"
+                and (execution_request(message.content) or detect_task_hint(message.content))):
+            return None
         from Sprout.runtime.dialogue import (
             analysis_followup,
             code_status,
@@ -3352,6 +3404,13 @@ class Runtime:
             node = ExecutionNode(task_id=task.id, type=NodeType.AGENT)
             admission = {"task": task, "workspace": workspace, "paths": paths,
                          "target": target, "message": message, "analysis_result": None}
+            if cli_request and (coverage_request(message.content)
+                                or source_review_request(message.content)):
+                from Sprout.runtime.analysis_consent import coverage_evidence
+
+                admission["source_review"] = True
+                admission["coverage_review"] = coverage_request(message.content)
+                admission["content_project"] = coverage_evidence
             if cli_request and code_metrics_request(message.content):
                 if len(paths) != 1 or not paths[0].casefold().endswith(".py"):
                     raise PermissionError("code_metrics_requires_one_python_file")
@@ -3390,11 +3449,8 @@ class Runtime:
             if not self.session_workspace_id(current_session):
                 current_session.metadata[self.SESSION_WORKSPACE_KEY] = workspace.id
             await self._session_store.save_session(current_session)
-            coverage = admission["analysis_result"].data.get("coverage", {})
-            if coverage.get("mode") == "discovery":
-                content += ("\n\n覆盖范围 / coverage: authorized project files; "
-                            f"{coverage.get('file_count', 0)} files; "
-                            "partial project coverage (policy/scope and supported resource types).")
+            if on_capture is not None:
+                on_capture(admission["analysis_data"])
             reason = ""
         except PermissionError as exc:
             content = reason = str(exc)
@@ -3590,7 +3646,11 @@ class Runtime:
         """
         workspace_id = str(message.metadata.get("workspace_id") or "")
         workspace = await self.get_workspace(workspace_id)
-        if workspace is not None and not (workspace.root / ".git").exists():
+        from Sprout.security.local_diagnostics import report
+
+        if (workspace is not None and not (workspace.root / ".git").exists()
+                and (not foreground or code_task_provider is None)):
+            report(self, "Task", "DENIED: git_repository_required")
             return OutboundMessage(
                 content="编码任务需要 Git 仓库。请先自行初始化 Git，再重新提交；只读分析仍可使用。",
                 channel=message.channel,
@@ -3604,6 +3664,7 @@ class Runtime:
         # No caller-selected channel or metadata can turn unattended input into
         # an interactive approval source. Unresolved embeddings are unattended.
         source = principal.source if principal is not None else "automation"
+        report(self, "Task", "creating...")
         if code_task_provider is not None:
             from copy import deepcopy
 
@@ -3644,17 +3705,82 @@ class Runtime:
                     ),
                 },
             )
+        report(self, "Task", f"created: {task.id}")
         if foreground:
             if code_task_provider is not None:
                 current_session = await self._sessions.require_owner(session.id, principal)
                 current_session.metadata = {
                     **current_session.metadata, "last_code_task_id": task.id}
                 await self._session_store.save_session(current_session)
+            experiment = self._sandbox_lifecycle.filesystem.get(task.id)
+            post_apply = getattr(experiment, "post_apply_tests", None)
             result = await self.execute(task)
+            report(self, "Task", f"{task.id}: {result.status.value}")
             content = f"Task {task.id}: {result.status.value}"
+            review_text = ""
+            if task.metadata.get("filesystem_experiment") and (
+                    result.status is TaskStatus.COMPLETED or result.error in {
+                        "filesystem_verification_required", "filesystem_source_conflict_at_review",
+                        "filesystem_apply_coordinator_unavailable",
+                        "filesystem_verification_failed",
+                    } or (result.error or "").startswith("filesystem_apply_")):
+                from Sprout.execution.filesystem_review import (
+                    checked_changes,
+                    render_review,
+                    verification_status,
+                )
+
+                review_node = await self._metadata_or_raise().get_execution_node(
+                    f"{task.id}:approval")
+                review = review_node.metadata["output"]["filesystem_review"]
+                changes = checked_changes(review, task.id, task.workspace_id)["changes"]
+                evaluated = await self._metadata_or_raise().get_execution_node(
+                    f"{task.id}:evaluation")
+                if evaluated is None:
+                    report(self, "ChangeSet", f"captured: {len(changes)} file(s)")
+                    report(self, "Review", f"completed: {len(changes)} file(s)")
+                if result.error == "filesystem_verification_required":
+                    report(self, "Verification", "NOT_VERIFIED")
+                applied_node = await self._metadata_or_raise().get_execution_node(
+                    f"{task.id}:apply")
+                apply_output = (applied_node.metadata.get("output") or {}) if applied_node else {}
+                detail = (f"BLOCKED: {result.error}" if result.error else
+                          f"completed: {apply_output['transaction_id']}"
+                          if apply_output.get("applied") else "no_changes")
+                report(self, "Apply", detail)
+                content += f" ({result.error or detail})"
+                if post_apply is not None and apply_output.get("applied"):
+                    report(self, "Tests", "post-Apply read-only verification")
+                    try:
+                        post_result = await post_apply()
+                    except (OSError, ValueError) as exc:
+                        post_result = {"error": str(exc)}
+                    test_result = post_result.get("tests") or {}
+                    content += "\nPost-Apply read-only tests: " + json.dumps({
+                        "task_id": post_result.get("task_id"),
+                        "status": test_result.get("status", "unavailable"),
+                        "exit_code": test_result.get("exit_code"),
+                        "total": test_result.get("total"),
+                        "passed": test_result.get("passed"),
+                        "failed": test_result.get("failed"),
+                        "skipped": test_result.get("skipped"),
+                        "error": post_result.get("error"),
+                    }, ensure_ascii=False)
+                review_text = render_review(
+                    review, task.id, task.workspace_id,
+                    verification_status=verification_status(
+                        evaluated, review, task.id, task.workspace_id),
+                )
+            elif (result.error or "").startswith("filesystem_test_"):
+                content += f" ({result.error.split(':', 1)[0]})"
+            elif (result.error or "").startswith("filesystem_"):
+                report(self, "Apply", f"BLOCKED: {result.error}")
+                content += f" ({result.error})"
+            if result.metrics.get("sandbox_cleanup") == "failed":
+                content += "\nSandbox cleanup failed; task result retained."
             await self._persist_turns(session, message, AgentResult(content=content))
             return OutboundMessage(
-                content=content,
+                content=content + ("\n" + review_text if review_text else ""),
                 channel=message.channel,
                 session_id=session.id,
                 correlation_id=message.id,
@@ -3795,21 +3921,54 @@ class Runtime:
         :meth:`_workspace_request_from_agent`, runs after the agent and handles
         the case this gate cannot see.
         """
+        from Sprout.runtime.isolated_test_run import dispatch, execution_request
+
+        if execution_request(message.content or ""):
+            return await dispatch(self, message, session, principal, foreground,
+                                  code_task_provider), None
         if not detect_task_hint(message.content or ""):
+            from Sprout.intents import project_request_text
+
+            request = project_request_text(message.content or "")
+            quoted = re.search(r'["“‘`]', request)
+            explicit_prefix = quoted is not None and detect_task_hint(request[:quoted.start()])
+            primary = request.splitlines()[0] if "\n" in request else ""
+            explicit_primary = bool(primary) and detect_task_hint(primary)
+            if (str(context.metadata.get("intent") or "") == "task"
+                    and (explicit_prefix or explicit_primary)):
+                return OutboundMessage(
+                    ("编码请求的主操作与限制条件不一致，请明确是否允许修改目标文件。"
+                     if explicit_primary else
+                     "编码请求未通过操作与目标判定。请明确要修改的文件，并检查输入示例是否完整。"),
+                    message.channel, session.id, message.id,
+                    {"intent": "task", "blocked_reason": "coding_request_not_admitted",
+                     "reason": ("conflicting_constraints" if explicit_primary
+                                else "unresolved_literal")},
+                ), message
             return None
         if self._asks_for_workspace(message, context, session):
             held, outbound = await self._request_workspace(message, session)
             return outbound, held
-        if str(context.metadata.get("intent") or "") != "task":
+        cli = (foreground and code_task_provider is not None and principal is not None
+               and principal.authenticated and principal.source == message.channel == "cli")
+        if not cli and str(context.metadata.get("intent") or "") != "task":
             return None
         explicit = str(message.metadata.get("workspace_id") or "")
+        if cli:
+            session = await self._sessions.require_owner(session.id, principal)
+            explicit = self.session_workspace_id(session)
+            if not explicit:
+                held, outbound = await self._request_workspace(message, session)
+                return outbound, held
+            message = replace(message, metadata={**message.metadata, "workspace_id": explicit})
         if explicit:
             # The message names its workspace: the resume from a consent grant,
             # or a caller that bound one deliberately. Already an instruction.
-            return await self._handle_task(
+            outbound = await self._handle_task(
                 message, session, principal=principal, foreground=foreground,
                 code_task_provider=code_task_provider,
-            ), None
+            )
+            return outbound, message if outbound.metadata.get("blocked_reason") else None
         # A workspace the operator consented to earlier in this session. Without
         # this the session only stopped *asking*; the coding intent still fell
         # through to the conversation path, where the agent has no write tools —
@@ -3832,10 +3991,11 @@ class Runtime:
             message,
             metadata={**dict(message.metadata), "workspace_id": workspace_id},
         )
-        return await self._handle_task(
+        outbound = await self._handle_task(
             message, session, principal=principal, foreground=foreground,
             code_task_provider=code_task_provider,
-        ), None
+        )
+        return outbound, message if outbound.metadata.get("blocked_reason") else None
 
     async def _workspace_request_from_agent(
         self, result: AgentResult, message: Message, session
@@ -3855,6 +4015,12 @@ class Runtime:
         """
         if not result.metadata.get(WORKSPACE_REQUESTED_KEY):
             return None
+        if self.session_workspace_id(session) and message.channel == "cli":
+            reason = "当前会话已绑定工作区，但此请求没有进入项目工作流。请明确操作和目标。"
+            return message, OutboundMessage(
+                reason, message.channel, session.id, message.id,
+                {"blocked_reason": "project_operation_unresolved"},
+            )
         if write_intent_disposition(message.content) is WriteIntentDisposition.KNOWN_NONWRITE:
             return None
         if str(message.metadata.get("workspace_id") or ""):
@@ -4130,6 +4296,10 @@ class Runtime:
         workspace_id = message.metadata.get("workspace_id")
         if isinstance(workspace_id, str) and workspace_id:
             payload["workspace_id"] = workspace_id
+        from Sprout.security.local_diagnostics import report
+
+        label = "code_modification" if intent == Intent.TASK else str(intent)
+        report(self, "Intent", label)
         await self.events.publish(Event(INTENT_RECOGNIZED, payload, message.id))
         await self.events.publish(Event(trigger_event, payload, message.id))
         if intent == "conversation":
@@ -4167,6 +4337,10 @@ class Runtime:
         self, message: Message, context, *, pending_question: str | None = None,
     ) -> dict[str, Any]:
         from Sprout.intents import capability_question
+        from Sprout.runtime.isolated_test_run import execution_request
+
+        if pending_question is None and execution_request(message.content or ""):
+            return {"intent": "tool", "confidence": 1.0, "reason": "test_execution"}
 
         if pending_question is None and context.metadata.get("session_task_history_query"):
             return {"intent": "conversation", "confidence": 1.0,
@@ -5196,6 +5370,7 @@ class Runtime:
         budget: TaskBudget | None = None,
         metadata: dict[str, object] | None = None,
         execution_mode: str = TaskExecutionMode.CODE,
+        _filesystem_foreground: bool = False,
     ) -> Task:
         """Create and persist a task without starting orchestration yet."""
         if metadata and "host_acceptance_v1" in metadata:
@@ -5207,7 +5382,18 @@ class Runtime:
         if workspace is None:
             raise LookupError(f"Workspace not found: {workspace_id}")
         task_metadata = execution_metadata(metadata or {}, execution_mode)
-        if execution_mode == TaskExecutionMode.CODE and not (workspace.root / ".git").exists():
+        from Sprout.orchestration.terminal import LocalOrchestratorBackend
+        from Sprout.workspace.models import WorkspaceKind
+
+        filesystem = (
+            _filesystem_foreground
+            and isinstance(self._orchestrator_backend, LocalOrchestratorBackend)
+            and workspace.kind is WorkspaceKind.LOCAL_DIRECTORY
+            and actor is not None and actor.authenticated and actor.source == source == "cli"
+            and delegation_scope is not None and bool(delegation_scope.allowed_paths)
+        )
+        if (execution_mode == TaskExecutionMode.CODE and not (workspace.root / ".git").exists()
+                and not filesystem):
             raise ValueError(
                 "Coding tasks require a Git repository. Initialize Git yourself first; "
                 "Sprout will not initialize or modify repository state automatically."
@@ -5702,6 +5888,8 @@ class Runtime:
             return
         TaskStateMachine.validate(task.status, TaskStatus.CANCELLED)
         await metadata.update_task_status(task_id, TaskStatus.CANCELLED)
+        if task.status in {TaskStatus.WAITING_RESOURCE, TaskStatus.WAITING_APPROVAL}:
+            self._sandbox_lifecycle.close_filesystem(task_id)
         self._verification_hosts.pop(task_id, None)
 
     async def cancel_task(self, task_id: str, *, reason: str = "") -> Task:
@@ -5831,6 +6019,41 @@ class Runtime:
                 await self._sandbox_lifecycle.cleanup_proposal(proposal)
         return result
 
+    async def filesystem_review(self, task_id, session_id, principal):
+        """Read the settled foreground review independently of the live sandbox."""
+        task = await self.get_task(task_id)
+        if (task is None or not principal.authenticated or principal.source != "cli"
+                or task.actor != principal or not session_id
+                or task.metadata.get("session_id") != session_id
+                or not task.metadata.get("filesystem_experiment")):
+            return None
+        session = await self._sessions.require_owner(session_id, principal)
+        if self._sessions.frozen_principal(session) != principal:
+            return None
+        node = await self._metadata_or_raise().get_execution_node(f"{task.id}:approval")
+        if (node is None or node.task_id != task.id or node.type is not NodeType.APPROVAL
+                or node.status is not NodeStatus.COMPLETED
+                or node.metadata.get("execution_guard", {}).get("state") != "completed"):
+            return None
+        review = (node.metadata.get("output") or {}).get("filesystem_review")
+        if review is None:
+            return None
+        from Sprout.execution.filesystem_review import render_review, verification_status
+
+        evaluated = await self._metadata_or_raise().get_execution_node(f"{task.id}:evaluation")
+        text = render_review(
+            review, task.id, task.workspace_id,
+            verification_status=verification_status(evaluated, review, task.id, task.workspace_id),
+        )
+        from Sprout.execution.filesystem_apply import transaction_summary
+
+        summary = await transaction_summary(
+            self._metadata_or_raise(), task.id, review["fingerprint"])
+        return text + ("\n\n" + summary if summary else "")
+
+    def _filesystem_trajectory(self, task_id):
+        return JsonlTrajectoryRecorder(trajectory_path(self._trajectory_dir, task_id))
+
     async def execute(
         self,
         task: Task,
@@ -5851,6 +6074,9 @@ class Runtime:
                             "replay_plan", {}).get("fingerprint")):
                     raise ValueError("Replay preflight waits require the dedicated recovery entry")
                 task = authoritative
+            experiment = self._sandbox_lifecycle.filesystem.get(task.id)
+            if experiment is not None:
+                return await experiment.run(self, authoritative)
             return await self._execute_task(
                 task,
                 artifact_snapshot=artifact_snapshot,

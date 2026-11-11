@@ -189,6 +189,9 @@ async def test_seven_input_git_review(tmp_path, monkeypatch, iteration):
         assert "return 0 if value < 0 else value" in evidence["patches"]["tracked"]
         assert evidence["budgets"]["elapsed_seconds"] < git_s1.REVIEW_TOTAL_SECONDS
         assert metrics["view_check"]["calls"] == 10
+        assert metrics["audit"]["calls"] < metrics["policy"]["calls"]
+        # Every native snapshot still performs live boundary checks.
+        assert metrics["policy"]["calls"] > metrics["snapshot"]["calls"]
         assert metrics["source"]["calls"] == 2
         assert object_selections and all(len(paths) == 1 and paths[0] in ctx["files"]
                                          for paths in object_selections)

@@ -15,7 +15,7 @@ from Sprout.strategy.acceptance import AcceptanceSpec
 
 
 async def verify_isolated_cases(metadata, runner, *, context, node, acceptance_spec,
-                                regression_spec, phase="evaluation"):
+                                regression_spec, phase="evaluation", expected_manifest=None):
     if phase not in {"baseline", "evaluation"}:
         raise ValueError("Explicit isolated verification phase required")
     owner = node.metadata.get("execution_guard", {}).get("owner")
@@ -26,9 +26,17 @@ async def verify_isolated_cases(metadata, runner, *, context, node, acceptance_s
         return {"waiting": True, "waiting_kind": "configuration",
                 "reason": "frozen_regression_spec_required", "verified": False}
     regression = AcceptanceSpec.from_payload(regression_spec) if regression_spec else None
+    frozen = dict(expected_manifest) if expected_manifest is not None else None
+
+    def check_candidate():
+        if frozen is not None and input_manifest(context.exported) != frozen:
+            raise ValueError("verification_candidate_changed")
+
+    check_candidate()
     contract = {"acceptance": acceptance.to_payload(),
                 "regression": regression.to_payload() if regression else None,
-                "phase": phase, "input_manifest": input_manifest(context.exported),
+                "phase": phase, "input_manifest": (frozen if frozen is not None else
+                                                  input_manifest(context.exported)),
                 "image": context.image}
     await metadata.ensure_coding_intent({
         "id": str(uuid5(NAMESPACE_URL, node.id + ":case-plan:" + phase)),
@@ -36,6 +44,7 @@ async def verify_isolated_cases(metadata, runner, *, context, node, acceptance_s
         "signature": hashlib.sha256(json.dumps(contract, sort_keys=True).encode()).hexdigest(),
         "contract": contract, "schema_version": 1,
     })
+    check_candidate()
     cases, demo_source = planned_cases(acceptance, regression, phase)
     demo_path = context.evidence / (phase + "-public-demo.py")
     if demo_path.exists():
@@ -44,14 +53,16 @@ async def verify_isolated_cases(metadata, runner, *, context, node, acceptance_s
     else:
         with demo_path.open("x", encoding="utf-8", newline="") as stream:
             stream.write(demo_source)
-    before = input_manifest(context.exported)
+    before = frozen if frozen is not None else input_manifest(context.exported)
     records, results = [], []
     for kind, index, case in cases:
         command = case_command(kind, case, demo_source)
         request = replace(context, command=command, relative_cwd=".", read_only_input=True)
         backend = DockerCodingBackend(metadata, runner, node_id=node.id, owner=owner,
                                      command_slot=f"{phase}-{kind}-{index}")
+        check_candidate()
         process = await backend.execute(request, node_id=node.id)
+        check_candidate()
         if process.needs_approval:
             return {"waiting": True, "waiting_kind": "approval",
                     "pending_approvals": [process.approval_id], "verified": False}

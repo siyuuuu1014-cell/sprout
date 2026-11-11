@@ -81,7 +81,8 @@ async def test_loop_respects_model_call_budget() -> None:
     tool_call = LLMResponse(
         content=None,
         tool_calls=(ToolCall(id="c", name="echo_tool", arguments={"text": "x"}),),
-        finish_reason="tool_calls",
+        finish_reason="tool_calls", model="deepseek-fixture",
+        usage=Usage(prompt_tokens=30, completion_tokens=12, total_tokens=42),
     )
     model = ScriptedModel([tool_call] * 5)
     tools = ToolRegistry()
@@ -100,6 +101,11 @@ async def test_loop_respects_model_call_budget() -> None:
 
     assert result.metadata["model_calls"] == 1
     assert result.metadata["truncated"] is True
+    assert result.metadata["model"] == "deepseek-fixture"
+    assert result.metadata["finish_reason"] == "tool_calls"
+    assert result.metadata["usage"] == {
+        "prompt_tokens": 30, "completion_tokens": 12, "total_tokens": 42,
+    }
 
 
 @pytest.mark.asyncio

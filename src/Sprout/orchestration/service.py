@@ -70,6 +70,11 @@ class SequentialOrchestrator:
                 status=TaskStatus.WAITING_RESOURCE,
                 error="Unconfirmed node ownership requires reconciliation; no local replay",
             )
+        for node in stored:
+            if self._settled_failure(node):
+                await self._update_task_status(graph.task_id, TaskStatus.FAILED, recorder)
+                return TaskResult(task_id=graph.task_id, status=TaskStatus.FAILED,
+                                  error=node.metadata["output"]["error"])
         nodes = await self._restore(graph)
         deadline = None
         if budget is not None and budget.max_duration_seconds > 0:
@@ -172,7 +177,17 @@ class SequentialOrchestrator:
 
     # -- node execution ------------------------------------------------------
     @staticmethod
+    def _settled_failure(node: ExecutionNode) -> bool:
+        guard = node.metadata.get("execution_guard")
+        output = node.metadata.get("output")
+        return (node.status is NodeStatus.FAILED and isinstance(guard, dict)
+                and guard.get("state") == "failed" and isinstance(output, dict)
+                and isinstance(output.get("error"), str))
+
+    @staticmethod
     def _blocks_local_replay(node: ExecutionNode) -> bool:
+        if SequentialOrchestrator._settled_failure(node):
+            return False
         guard = node.metadata.get("execution_guard", {})
         if not isinstance(guard, dict):
             return True
@@ -228,7 +243,8 @@ class SequentialOrchestrator:
         status = NodeStatus(result["status"])
         output = result.get("output")
         event_name = ("node.completed" if status is NodeStatus.COMPLETED else
-                      "node.cancelled" if status is NodeStatus.CANCELLED else "node.waiting")
+                      "node.cancelled" if status is NodeStatus.CANCELLED else
+                      "node.failed" if status is NodeStatus.FAILED else "node.waiting")
         await self._record(
             recorder, event_name,
             task_id, {"node_id": node.id, "type": node.type.value},

@@ -46,9 +46,16 @@ def create_runtime(
     settings: Settings | None = None,
     *,
     task_queue: TaskQueueBackend | None = None,
+    local_diagnostics=None,
 ) -> Runtime:
     """Assemble a Runtime from settings (loaded from the default search path)."""
     settings = settings or load_settings()
+    if local_diagnostics is not None:
+        from Sprout.security.local_diagnostics import LocalCLIDiagnostics
+
+        if (type(local_diagnostics) is not LocalCLIDiagnostics
+                or settings is not local_diagnostics.settings):
+            raise PermissionError("Host-prepared diagnostic settings required")
     sqlite_cfg = settings.sqlite
     pragmas = SqlitePragmas(
         busy_timeout_ms=sqlite_cfg.busy_timeout_ms,
@@ -90,6 +97,16 @@ def create_runtime(
         tool_risk_lookup=tool_risk_lookup,
     )
 
+    if local_diagnostics is not None:
+        from dataclasses import replace
+
+        from Sprout.security.local_diagnostics import DiagnosticApprovals
+
+        security = replace(security, approvals=DiagnosticApprovals(
+            storage.operational, diagnostics=local_diagnostics, events=events,
+            policy=security.approval_policy, audit=security.audit, commands=security.commands,
+        ))
+
     tools = create_tool_registry(
         storage,
         security=security,
@@ -127,6 +144,8 @@ def create_runtime(
         task_queue=task_queue,
         settings=settings,
     )
+
+    runtime._local_cli_diagnostics = local_diagnostics
 
     tool_executor = ToolExecutor(
         tools=tools,
@@ -211,6 +230,8 @@ def _build_provider(
             name=provider_name,
             timeout_seconds=settings.timeout_seconds,
             temperature=settings.temperature,
+            thinking_mode=settings.thinking_mode,
+            max_output_tokens=settings.max_output_tokens,
         )
     api_key = resolve_api_key(provider_name, env_name=api_key_env)
     if not api_key:

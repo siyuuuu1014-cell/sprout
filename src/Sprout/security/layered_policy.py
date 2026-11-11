@@ -289,6 +289,13 @@ class LayeredPolicyEngine:
 
     # -- decisions ---------------------------------------------------------
     def decide(self, request: ActionRequest) -> PolicyDecision:
+        return self._decide(request, audit_allow=True)
+
+    def recheck(self, request: ActionRequest) -> PolicyDecision:
+        """Re-evaluate an audited operation at an internal I/O boundary."""
+        return self._decide(request, audit_allow=False)
+
+    def _decide(self, request: ActionRequest, *, audit_allow: bool) -> PolicyDecision:
         base_decision = self._base.decide(request)
         effective = base_decision.decision
         matched = list(base_decision.matched_rules)
@@ -327,7 +334,7 @@ class LayeredPolicyEngine:
             reason=reason or f"Effective policy after {len(self._layers)} layer(s)",
             matched_rules=tuple(matched),
         )
-        if self._audit is not None:
+        if self._audit is not None and (audit_allow or effective is not AccessDecision.ALLOW):
             self._audit.record_decision(request, decision)
         return decision
 

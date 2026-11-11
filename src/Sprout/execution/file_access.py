@@ -83,7 +83,7 @@ def file_operation(
     root: Path, target: Path, operation: str, authorize: Callable[[], None],
     *, content: str = "", newline: str | None = None,
 ):
-    if operation == "conditional_write" and os.name != "nt":
+    if operation in {"conditional_write", "conditional_create"} and os.name != "nt":
         raise FileBoundaryError("conditional_write_platform_unavailable")
     if os.name == "nt":
         return _windows(root, target, operation, authorize, content, newline)
@@ -105,6 +105,8 @@ def _missing(operation, authorize):
 
 
 def _stream(fd: int, operation: str, content: str, newline: str | None):
+    if operation == "conditional_create":
+        return _write_and_verify_fd(fd, content)
     if operation == "conditional_write":
         return _conditional_write_fd(fd, content)
     if operation == "snapshot":
@@ -152,6 +154,12 @@ def _conditional_write_fd(fd, options):
             or hashlib.sha256(old).hexdigest() != old_digest):
         raise ConditionalWriteRefused("conditional_write_version_changed")
     check()  # Final authority check on the same exclusive, verified handle.
+    return _write_and_verify_fd(fd, data)
+
+
+def _write_and_verify_fd(fd, data):
+    import hashlib
+
     os.lseek(fd, 0, os.SEEK_SET)
     view = memoryview(data)
     while view:
@@ -285,6 +293,8 @@ def _win_open(path, access, *, disposition=3):
     handle = kernel.CreateFileW(str(path), access, 1, None, disposition, 0x02200000, None)
     if handle == ctypes.c_void_p(-1).value:
         code = ctypes.get_last_error()
+        if disposition == 1 and code in {80, 183}:
+            raise ConditionalWriteRefused("conditional_create_target_exists")
         if code in {2, 3}:
             raise FileNotFoundError("secure_target_missing")
         raise FileBoundaryError(f"secure_open_refused:{code}")
@@ -446,6 +456,9 @@ def _windows(root, target, operation, authorize, content, newline):
     import msvcrt
     from ctypes import wintypes as w
 
+    creating = operation == "conditional_create"
+    if creating and (type(content) is not bytes or len(content) > 16 * 1024 * 1024):
+        raise ConditionalWriteRefused("conditional_create_options_invalid")
     _win_volume(root)
     relative = target.relative_to(root).parts
     if not relative and operation != "exists":
@@ -465,6 +478,8 @@ def _windows(root, target, operation, authorize, content, newline):
             try:
                 _win_directory(parent, stack)
             except FileNotFoundError:
+                if creating:
+                    raise ConditionalWriteRefused("conditional_create_parent_missing") from None
                 if operation != "write":
                     return _missing(operation, authorize)
                 authorize()
@@ -472,12 +487,13 @@ def _windows(root, target, operation, authorize, content, newline):
                     raise FileBoundaryError("secure_directory_creation_refused") from None
                 _win_directory(parent, stack)
         authorize()  # Recheck before OPEN_ALWAYS may create a leaf.
-        access = {"conditional_write": 0xC0000000, "write": 0x40000000,
+        access = {"conditional_write": 0xC0000000, "conditional_create": 0xC0000000,
+                  "write": 0x40000000,
                   "read": 0x80000000, "snapshot": 0x80000000,
                   "delete": 0x10080, "probe": 0x80, "exists": 0x80}[operation]
+        disposition = 1 if creating else 4 if operation == "write" else 3
         try:
-            handle = _win_open(parent / relative[-1], access,
-                               disposition=4 if operation == "write" else 3)
+            handle = _win_open(parent / relative[-1], access, disposition=disposition)
         except FileNotFoundError:
             if operation == "snapshot":
                 return _missing(operation, authorize)
@@ -491,7 +507,14 @@ def _windows(root, target, operation, authorize, content, newline):
                 return True
             if info.attributes & 0x10 or info.links != 1:
                 raise FileBoundaryError("non_regular_or_shared_file")
-            authorize()  # Pinned identity does not freeze time-dependent authority.
+            try:
+                authorize()  # Pinned identity does not freeze time-dependent authority.
+            except ConditionalWriteRefused as exc:
+                if creating:
+                    # CREATE_NEW already changed the directory; this is not a refusal with
+                    # proof that nothing happened.
+                    raise FileBoundaryError("conditional_create_unconfirmed") from exc
+                raise
             if operation in {"probe", "exists"}:
                 return True
             if operation == "delete":
@@ -500,7 +523,7 @@ def _windows(root, target, operation, authorize, content, newline):
                     raise FileBoundaryError("handle_delete_refused")
                 return True
             fd = msvcrt.open_osfhandle(handle, os.O_BINARY | (
-                os.O_RDWR if operation == "conditional_write" else
+                os.O_RDWR if creating or operation == "conditional_write" else
                 os.O_WRONLY if operation == "write" else os.O_RDONLY
             ))
             handle = None  # Ownership transferred to the CRT fd.

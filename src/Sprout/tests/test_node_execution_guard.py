@@ -456,3 +456,29 @@ def test_cli_execution_query_is_read_only(monkeypatch):
     result = CliRunner().invoke(project.app, ["task-executions", "known"])
     assert result.exit_code == 0, result.output
     assert '"execution_state": "uncertain"' in result.output
+
+
+async def test_confirmed_filesystem_test_failure_is_terminal_and_not_replayed(tmp_path):
+    from unittest.mock import AsyncMock
+
+    store, node = await _fixture(tmp_path / "tests-failed.db")
+    node = replace(node, metadata={"filesystem_test_loop": True})
+    output = {"filesystem_tests_failed": True, "error": "pytest exit 1"}
+    run = AsyncMock(return_value=output)
+    try:
+        guard = NodeExecutionGuard(store)
+        first = await guard.execute(node, run)
+        assert first["status"] == "failed" and first["output"] == output
+        assert await guard.execute(node, run) == first
+        from Sprout.orchestration.models import ExecutionGraph
+        from Sprout.orchestration.service import SequentialOrchestrator
+        from Sprout.task.models import TaskStatus
+
+        await store.update_task_status(node.task_id, TaskStatus.RUNNING)
+        graph = ExecutionGraph(task_id=node.task_id, nodes=(node,), entry_node_ids=(node.id,))
+        restored = await SequentialOrchestrator(store).execute(graph, handler=run)
+        assert restored.status is TaskStatus.FAILED and restored.error == "pytest exit 1"
+        assert (await store.get_task(node.task_id)).status is TaskStatus.FAILED
+        run.assert_awaited_once()
+    finally:
+        store.close()

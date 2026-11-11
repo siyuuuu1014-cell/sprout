@@ -54,6 +54,9 @@ if TYPE_CHECKING:
 APPROVAL_TOOL = "process_run"
 
 
+# Trusted foreground transport may render the already checked pending record.
+foreground_frozen_approval = ContextVar("foreground_frozen_approval", default=None)
+
 class ProcessBroker:
     """Runs structured process requests only after a PolicyEngine decision."""
 
@@ -1062,19 +1065,33 @@ class ProcessBroker:
             except (OSError, ValueError):
                 return ProcessResult(command=command_tuple, allowed=False, started=False,
                                      error="Frozen execution authority changed before approval")
-        if decision.decision is not AccessDecision.ALLOW:
-            # Only the exact plain CLI execution shape can consume a CLI grant;
-            # extra secret injection, alternate scope/actor or preflight cannot.
-            cli_binding = None
-            if (not secret_names and not required_env and scope is None and actor is None
-                    and not known_command and command_origin == "caller"
-                    and not preflight_only and max_output_bytes is None
-                    and Path(workspace.root).resolve() == cwd_path.resolve()):
-                cli_binding = _cli_process_binding(
-                    command_tuple, cwd_path, env, timeout_seconds,
-                    task_id, session_id, source, requested_by, resource_scope,
-                    workspace.id, workspace.kind.value,
-                )
+        from Sprout.security.local_diagnostics import process_refused
+
+        cli_binding = None
+        if (not secret_names and not required_env and scope is None and actor is None
+                and not known_command and command_origin == "caller"
+                and not preflight_only and max_output_bytes is None
+                and Path(workspace.root).resolve() == cwd_path.resolve()):
+            cli_binding = _cli_process_binding(
+                command_tuple, cwd_path, env, timeout_seconds,
+                task_id, session_id, source, requested_by, resource_scope,
+                workspace.id, workspace.kind.value,
+            )
+        foreground_handoff = False
+        if (decision.decision in {AccessDecision.ALLOW, AccessDecision.REQUIRE_APPROVAL}
+                and process_refused(
+                    self._approvals, task_id, command_tuple,
+                    frozen_scope=dispatch.record["scope"] if dispatch is not None else None,
+                )):
+            try:
+                foreground_handoff = await _consume_cli_approval(self, self._approvals, cli_binding)
+            except PermissionError as exc:
+                return ProcessResult(command=command_tuple, allowed=False, started=False,
+                                     error=str(exc))
+            if not foreground_handoff:
+                return ProcessResult(command=command_tuple, allowed=False, started=False,
+                    error="Diagnostic mode requires a foreground CLI handoff or Coding container")
+        if decision.decision is not AccessDecision.ALLOW and not foreground_handoff:
             blocked = await self._withheld(
                 command_tuple,
                 decision,
@@ -1304,19 +1321,26 @@ class ProcessBroker:
             # would raise its own request and the operator would face five
             # identical prompts for one decision.
             return replace(withheld, approval_id=existing.id)
-        record = await self._approvals.request(
-            APPROVAL_TOOL,
-            approval_arguments,
-            task_id=task_id,
-            requested_by=requested_by,
-            resource_scope=resource_scope,
-            source=source,
-            session_id=session_id,
-            # Exact ordinary commands are single-use. Preserve legacy round
-            # and frozen Local Acceptance reuse, bounded by Task and expiry.
-            single_use=bool(dispatch is not None
-                            and dispatch.record.get("verification_command") is not None),
-        )
+        from contextlib import nullcontext
+
+        from Sprout.security.local_diagnostics import exact_approval
+
+        gate = (exact_approval(self._approvals, task_id, APPROVAL_TOOL, approval_arguments,
+                               resource_scope) if dispatch is not None else nullcontext())
+        with gate:
+            record = await self._approvals.request(
+                APPROVAL_TOOL,
+                approval_arguments,
+                task_id=task_id,
+                requested_by=requested_by,
+                resource_scope=resource_scope,
+                source=source,
+                session_id=session_id,
+                # Exact ordinary commands are single-use. Preserve legacy round
+                # and frozen Local Acceptance reuse, bounded by Task and expiry.
+                single_use=bool(dispatch is not None
+                                and dispatch.record.get("verification_command") is not None),
+            )
         return replace(withheld, approval_id=record.id)
 
     def _frozen_approval_arguments(self, record):
@@ -1388,6 +1412,7 @@ class ProcessBroker:
             raise PermissionError("frozen_approval_authority_changed")
         # Only the host's still-unstarted, exact frozen request reaches here.
         # Approval expiry, authority revalidation and external cancellation remain active.
+        prompt = foreground_frozen_approval.get()
         with clock.approval_wait() if clock is not None else nullcontext():
             while True:
                 task, workspace = await runtime._project_analysis_subject(scope)
@@ -1399,6 +1424,10 @@ class ProcessBroker:
                 record = await self._check_frozen_approval(execution, approval_id, arguments)
                 if record.status is ApprovalStatus.APPROVED:
                     return
+                if prompt is not None:
+                    await prompt(runtime, record)
+                    prompt = None
+                    continue
                 await asyncio.sleep(min(0.5, max(0, deadline - time.monotonic())))
 
     def _record_allowlist(

@@ -140,3 +140,35 @@ async def test_human_decision_arrives_while_original_frame_waits(execution, monk
     await helper
     assert result.started and result.exit_code == 0
     assert e.spawn.await_count == 1
+
+
+@pytest.mark.parametrize("choice", ["approve", "reject"])
+async def test_foreground_cli_prompts_for_in_node_approval(execution, monkeypatch, choice):
+    from unittest.mock import AsyncMock
+
+    from Sprout.cli.commands import chat
+    from Sprout.message.models import Message, StreamChunk
+
+    e = execution
+    e.mode[0] = AccessDecision.REQUIRE_APPROVAL
+    e.rig.node = replace(e.rig.node, budget=NodeBudget(timeout_seconds=30))
+    runtime, principal = e.rig.runtime, e.rig.principal
+    prompt = AsyncMock(return_value=choice)
+    monkeypatch.setattr(chat, "_prompt_task_gate_choice", prompt)
+    monkeypatch.setattr(chat, "_print_approval_record", lambda record: None)
+
+    async def stream(message, **kwargs):
+        with runtime._project_analysis_scope(e.rig.task, e.rig.workspace, e.rig.node):
+            result = await invoke(e)
+        yield StreamChunk(content=str(result.allowed))
+
+    monkeypatch.setattr(runtime, "handle_stream", stream)
+    message = Message("run", channel="cli", session_id=e.rig.session.id)
+
+    async def collect():
+        return [c.content async for c in chat._cli_turn_stream(
+            runtime, message, principal=principal, foreground=True)]
+
+    assert await asyncio.wait_for(collect(), timeout=4) == [str(choice == "approve")]
+    prompt.assert_awaited_once()
+    assert e.spawn.await_count == int(choice == "approve")

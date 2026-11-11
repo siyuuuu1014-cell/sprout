@@ -9,5 +9,4 @@ base_url = "https://api.deepseek.com"
 api_key_env = "DEEPSEEK_API_KEY"
 timeout_seconds = 120.0
 thinking_mode = "disabled"
-# Conservative per-request limit for the initial connectivity test, not a money cap.
-max_output_tokens = 256
+# Use the provider output default; Task budgets bound the complete execution.

@@ -71,7 +71,7 @@ def build_coding_session_factory(runtime, task):
         raise ValueError("Guarded file broker required")
 
     class BoundSession(CodingNodeSession):
-        async def prepare(self):
+        async def prepare(self, *, repair=False):
             current = await self.metadata.get_task(pinned.id)
             persisted_node = await self.metadata.get_execution_node(self.node.id)
             workspace = await self.metadata.get_workspace(pinned.workspace_id)
@@ -95,7 +95,7 @@ def build_coding_session_factory(runtime, task):
             if evidence.is_symlink():
                 raise ValueError("Linked coding evidence directory forbidden")
             evidence.mkdir(exist_ok=True)
-            return await super().prepare()
+            return await super().prepare(repair=repair)
 
     def factory(*, task, node, sandbox):
         if (coding_task_binding(task) != binding or node.task_id != pinned.id

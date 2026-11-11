@@ -153,14 +153,10 @@ _LANGUAGE_REQUEST_MARKERS = (
     "改為",
     "设置语言",
     "設定語言",
-    "使用",
-    "请用",
-    "請用",
     "switch language",
     "change language",
     "switch to",
     "change to",
-    "use ",
     "set language",
     "set ui language",
     "切り替え",
@@ -282,6 +278,12 @@ def language_request(text: str) -> str | None:
     folded = text.casefold().strip()
     if not folded:
         return None
+    # A generic "use" is a command only when its sole target is a language.
+    # Otherwise a content request such as "请用至少3000个中文汉字介绍..." must
+    # reach the model rather than being consumed by the CLI.
+    usage = re.fullmatch(r"(?:使用|请用|請用|use\s+)\s*(.+?)[。.!！]?", folded)
+    if usage is not None and usage[1] in _ALIASES:
+        return _ALIASES[usage[1]]
     has_switch_marker = any(marker in folded for marker in _LANGUAGE_REQUEST_MARKERS)
     has_language_phrase = bool(
         re.search(

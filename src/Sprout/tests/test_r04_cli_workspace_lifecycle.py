@@ -19,7 +19,7 @@ async def test_project_request_defaults_to_root(automatic):
     await cli.run()
     assert cli.create.call_args.kwargs["metadata"]["analysis_directory"] == "."
     assert len(cli.state.prompts) == 1
-    assert any("CLI_PROJECT_MAIN_RESULT" in s for s in cli.state.display)
+    assert any("Indexed counts" in s and "Files: 3" in s for s in cli.state.display)
     assert len([m for m in cli.state.seen if str(m.role) == "tool"]) == 1
 
 
@@ -87,6 +87,39 @@ async def test_session_binding_survives_new_cli_and_cwd(cli, monkeypatch, tmp_pa
     assert await chat._prepare_cli_context(runtime, session_id, "display") == (
         session_id, workspace_id)
     assert confirm.await_count == 1
+
+
+async def test_diagnostic_session_binds_current_directory_without_prompt(tmp_path, monkeypatch):
+    from Sprout.config.settings import Settings
+    from Sprout.gateway.identity import Principal
+    from Sprout.security.local_diagnostics import LocalCLIDiagnostics
+    from Sprout.storage.bundle import StorageBundle
+    from Sprout.storage.local.sqlite.metadata import open_metadata_store
+    from Sprout.tests.conftest import build_runtime
+
+    storage = StorageBundle.in_memory()
+    storage.metadata = open_metadata_store(str(tmp_path / 'metadata.db'))
+    runtime = build_runtime(storage=storage)[0]
+    principal = Principal("owner", source="cli", authenticated=True)
+    monkeypatch.setattr(chat, "current_cli_principal", lambda: principal)
+    mode = LocalCLIDiagnostics(Settings())
+    monkeypatch.setattr(runtime, "_local_cli_diagnostics", mode, raising=False)
+    monkeypatch.chdir(tmp_path)
+    confirm = AsyncMock(side_effect=AssertionError("diagnostic launch must not prompt"))
+    monkeypatch.setattr(chat, "_confirm_cli_workspace", confirm)
+    try:
+        async with mode.foreground(runtime):
+            session_id, workspace_id = await chat._prepare_cli_context(runtime, None, "display")
+            workspace = await runtime.get_workspace(workspace_id)
+            assert workspace.root == tmp_path
+            stored = await runtime._session_store.get_session(session_id)
+            assert runtime.session_workspace_id(stored) == workspace_id
+            assert await chat._prepare_cli_context(runtime, session_id, "display") == (
+                session_id, workspace_id)
+        confirm.assert_not_awaited()
+    finally:
+        await runtime.stop()
+        await runtime.storage.close()
 
 
 async def test_two_sessions_do_not_share_binding(cli, monkeypatch):

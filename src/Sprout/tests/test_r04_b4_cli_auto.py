@@ -54,7 +54,9 @@ async def test_whole_project_natural_language_repl_not_manual_manifest(automatic
     assert "directory.list" in kwargs["delegation_scope"].allowed_actions
     assert not kwargs["metadata"].get("required_paths")
     assert cli.state.classification == 1
-    assert any("CLI_PROJECT_MAIN_RESULT" in value for value in cli.state.display)
+    assert any("Indexed counts" in value and "Files: 3" in value
+               for value in cli.state.display)
+    assert not any("CLI_PROJECT_MAIN_RESULT" in value for value in cli.state.display)
     assert set(cli.captured.opens) == {"src/main.py", "src/worker.py", "src2/outside.py"}
     assert any("覆盖" in value or "coverage" in value.lower() for value in cli.state.display)
 
@@ -103,7 +105,7 @@ async def test_auto_platform_failure_does_not_publish_success(automatic, monkeyp
     monkeypatch.setattr(file_access, "directory_entries", unavailable)
     await cli.run()
     assert not cli.captured.opens
-    assert not any("CLI_PROJECT_MAIN_RESULT" in value for value in cli.state.display)
+    assert not any("Indexed counts" in value for value in cli.state.display)
 
 
 @pytest.fixture
@@ -141,7 +143,7 @@ async def test_capability_offer_requires_followup_and_directory_consent(
     assert cli.create.await_count == int(expected)
     assert bool(cli.captured.opens) == expected
     if expected:
-        assert any("CLI_PROJECT_MAIN_RESULT" in value for value in cli.state.display)
+        assert any("Indexed counts" in value for value in cli.state.display)
 
 
 @pytest.mark.parametrize("case", ["other_session", "expired", "no_offer"])
@@ -207,5 +209,5 @@ async def test_discovery_failure_reason_is_safe_and_still_denied(
     await cli.run()
     assert reasons == [expected_reason]
     assert not cli.captured.opens
-    assert not any("CLI_PROJECT_MAIN_RESULT" in value for value in cli.state.display)
+    assert not any("Indexed counts" in value for value in cli.state.display)
     assert not any("private filename" in value for value in cli.state.display)

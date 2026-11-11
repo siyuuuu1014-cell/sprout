@@ -20,6 +20,8 @@ def _digest(value):
 
 
 async def claim(db, record, snapshot):
+    if type(record) is dict and record.get("version") == 3:
+        return await _claim_filesystem(db, record, snapshot)
     keys = {"version", "id", "task_id", "workspace_id", "proposal_id", "node_id", "owner",
             "target", "principal", "plan", "plan_sha256", "approval_id"}
     if type(record) is dict and record.get("version") == 2:
@@ -115,6 +117,90 @@ async def claim(db, record, snapshot):
     return changed == 1
 
 
+async def _claim_filesystem(db, record, snapshot):
+    """Bind the shared ledger to exact settled nodes instead of a Git proposal."""
+    from Sprout.execution.filesystem_review import checked_changes, verification_status
+    from Sprout.orchestration.models import ExecutionNode, NodeStatus, NodeType
+
+    task_id = record["task_id"]
+    workspace_id = record["workspace_id"]
+    review_id, evaluation_id = f"{task_id}:approval", f"{task_id}:evaluation"
+    rows = []
+    for node_id in (review_id, evaluation_id):
+        row = await db.fetchone(
+            "SELECT * FROM execution_nodes WHERE id=? AND task_id=? AND status='completed'",
+            (node_id, task_id))
+        if row is None:
+            return False
+        rows.append(row)
+    review, evaluation = rows
+    review_metadata = json.loads(review["metadata_json"])
+    if review["type"] != "approval" or review_metadata.get(
+            "execution_guard", {}).get("state") != "completed":
+        return False
+    try:
+        evidence = review_metadata["output"]["filesystem_review"]
+        payload = checked_changes(evidence, task_id, workspace_id)
+    except (KeyError, TypeError, ValueError):
+        return False
+    verified = ExecutionNode(
+        id=evaluation_id, task_id=task_id, type=NodeType(evaluation["type"]),
+        status=NodeStatus.COMPLETED, metadata=json.loads(evaluation["metadata_json"]),
+    )
+    expected = {"version": 1, "files": [{
+        "path": relative_label(change["path"]),
+        "identity": change["before"]["identity"] if change["before"] else None,
+        "before": change["before"]["sha256"] if change["before"] else None,
+        "after": change["after"]["sha256"],
+    } for change in payload["changes"]]}
+    labels = [item["path"].casefold() for item in expected["files"]]
+    if (json.loads(evaluation["dependencies_json"]) != [review_id]
+            or snapshot != evidence["fingerprint"] or payload["conflicts"]
+            or not 0 < len(labels) <= 64 or len(set(labels)) != len(labels)
+            or record["proposal_id"] != f"filesystem:{task_id}:{snapshot}"
+            or record["plan"] != expected or record["plan_sha256"] != fingerprint(expected)
+            or verification_status(verified, evidence, task_id, workspace_id) != "passed"):
+        return False
+    authority = await db.fetchone(
+        "SELECT actor_json,delegation_scope_json FROM tasks WHERE id=?", (task_id,))
+    if authority is None or json.loads(authority["actor_json"]) != json.loads(
+            _encode(record["principal"])):
+        return False
+    stored = {**record, "operation": "apply_v1", "changeset_sha256": snapshot,
+              "authority_actor_json": authority["actor_json"],
+              "authority_scope_json": authority["delegation_scope_json"],
+              "review_node_json": review["metadata_json"],
+              "evaluation_node_json": evaluation["metadata_json"]}
+    initial = {"phase": "CLAIMED", "files": {}, "reason": ""}
+    return await db.execute(
+        "INSERT OR IGNORE INTO isolated_git_transactions "
+        "(id,proposal_id,workspace_id,owner,state,record_json,result_json,operation) "
+        "SELECT ?,?,?,?,'active',?,?,'apply_v1' WHERE EXISTS ("
+        "SELECT 1 FROM tasks t JOIN workspaces w ON w.id=t.workspace_id "
+        "JOIN execution_nodes a ON a.task_id=t.id "
+        "JOIN execution_nodes r ON r.task_id=t.id "
+        "JOIN execution_nodes e ON e.task_id=t.id "
+        "WHERE t.id=? AND w.id=? AND w.root=? AND t.status='running' AND t.source='cli' "
+        "AND t.actor_json=? AND t.delegation_scope_json=? "
+        "AND json_extract(t.actor_json,'$.authenticated')=1 "
+        "AND json_extract(t.actor_json,'$.source')='cli' "
+        "AND json_extract(t.metadata_json,'$.filesystem_experiment')=1 "
+        "AND json_extract(t.metadata_json,'$.session_id')=? "
+        "AND a.id=? AND a.type='apply' AND a.status='running' "
+        "AND json_array_length(a.dependencies_json)=1 "
+        "AND json_extract(a.dependencies_json,'$[0]')=e.id "
+        "AND json_extract(a.metadata_json,'$.execution_guard.owner')=? "
+        "AND json_extract(a.metadata_json,'$.execution_guard.state')='active' "
+        "AND r.id=? AND r.status='completed' AND r.metadata_json=? "
+        "AND e.id=? AND e.status='completed' AND e.metadata_json=?)",
+        (record["id"], record["proposal_id"], workspace_id, record["owner"],
+         _encode(stored), _encode(initial), task_id, workspace_id, record["target"],
+         authority["actor_json"], authority["delegation_scope_json"], record["session_id"],
+         record["node_id"], record["owner"], review_id, review["metadata_json"],
+         evaluation_id, evaluation["metadata_json"]),
+    ) == 1
+
+
 async def observe(db, identifier):
     row = await db.fetchone("SELECT * FROM isolated_git_transactions WHERE id=? "
                             "AND operation='apply_v1'", (identifier,))
@@ -160,7 +246,7 @@ async def transition(db, identifier, owner, *, start=None, outcome=None, reason=
                 or status not in {"WRITTEN", "REJECTED", "UNKNOWN"}):
             return False
         expected = files[path]["after"] if status == "WRITTEN" else files[path]["before"]
-        rejected_v2 = status == "REJECTED" and old["record"]["version"] == 2
+        rejected_v2 = status == "REJECTED" and old["record"]["version"] in {2, 3}
         if rejected_v2:
             if outcome["after"] is not None and not _digest(outcome["after"]):
                 raise ValueError("Observed refusal digest invalid")
@@ -196,6 +282,17 @@ async def transition(db, identifier, owner, *, start=None, outcome=None, reason=
         live_args = (old["record"]["task_id"], old["record"]["node_id"],
                      old["record"]["authority_actor_json"],
                      old["record"]["authority_scope_json"], owner)
+    if start is not None and old["record"]["version"] == 3:
+        record = old["record"]
+        live_sql += (
+            " AND EXISTS (SELECT 1 FROM execution_nodes r JOIN execution_nodes e "
+            "ON r.task_id=e.task_id WHERE r.task_id=? AND r.id=? AND e.id=? "
+            "AND r.status='completed' AND e.status='completed' "
+            "AND r.metadata_json=? AND e.metadata_json=?)"
+        )
+        task_id = record["task_id"]
+        live_args += (task_id, f"{task_id}:approval", f"{task_id}:evaluation",
+                      record["review_node_json"], record["evaluation_node_json"])
     return await db.execute(
         "UPDATE isolated_git_transactions SET result_json=?,state=? WHERE id=? AND owner=? "
         "AND operation='apply_v1' AND state='active' AND result_json=?" + live_sql,
@@ -223,3 +320,65 @@ async def approve_proposal(db, snapshot):
         "UPDATE change_proposals SET status='approved' WHERE "
         + " AND ".join(c + " IS ?" for c in columns),
         tuple(snapshot[c] for c in columns)) == 1
+
+async def reconcile_filesystem(db):
+    """Publish completed effects after a crash, without opening project files."""
+    from datetime import UTC, datetime
+
+    rows = await db.fetchall(
+        "SELECT g.id,g.record_json,g.result_json,t.id AS task_id,n.id AS node_id,"
+        "n.status AS node_status,n.metadata_json AS node_metadata "
+        "FROM isolated_git_transactions g "
+        "JOIN tasks t ON t.id=json_extract(g.record_json,'$.task_id') "
+        "JOIN execution_nodes n ON n.id=json_extract(g.record_json,'$.node_id') "
+        "AND n.task_id=t.id WHERE g.operation='apply_v1' AND g.state='completed' "
+        "AND json_extract(g.record_json,'$.version')=3 "
+        "AND json_extract(g.result_json,'$.phase')='COMPLETED' "
+        "AND g.workspace_id=t.workspace_id AND t.status='running' AND n.type='apply' "
+        "AND json_extract(t.metadata_json,'$.filesystem_experiment')=1 "
+        "AND json_extract(t.metadata_json,'$.session_id')="
+        "json_extract(g.record_json,'$.session_id') "
+        "AND json_extract(n.metadata_json,'$.execution_guard.owner')=g.owner"
+    )
+    recovered = 0
+    for row in rows:
+        record, result = json.loads(row["record_json"]), json.loads(row["result_json"])
+        plan, observed = record["plan"], result["files"]
+        files = plan["files"]
+        if (not files or fingerprint(plan) != record["plan_sha256"]
+                or len(observed) != len(files) or any(
+                    observed.get(item["path"]) != {
+                        "status": "WRITTEN", "before": item["before"], "after": item["after"],
+                    } for item in files)):
+            continue
+        metadata = json.loads(row["node_metadata"])
+        guard = metadata["execution_guard"]
+        if row["node_status"] == "running" and guard["state"] == "active":
+            metadata["execution_guard"] = {
+                **guard, "state": "completed", "settled_at": datetime.now(UTC).isoformat(),
+            }
+            metadata["output"] = {"applied": True, "transaction_id": row["id"],
+                                  "files": len(files), "recovered": True}
+            settled = _encode(metadata)
+        elif (row["node_status"] == "completed" and guard["state"] == "completed"
+              and metadata.get("output", {}).get("applied") is True
+              and metadata["output"].get("transaction_id") == row["id"]):
+            settled = row["node_metadata"]
+        else:
+            continue
+        evidence = ("EXISTS (SELECT 1 FROM isolated_git_transactions WHERE id=? "
+                    "AND state='completed' AND record_json=? AND result_json=?)")
+        args = (row["id"], row["record_json"], row["result_json"])
+        _, changed = await db.execute_batch([
+            ("UPDATE execution_nodes SET status='completed',metadata_json=? "
+             "WHERE id=? AND status=? AND metadata_json=? AND " + evidence
+             + " AND EXISTS (SELECT 1 FROM tasks WHERE id=? AND status='running')",
+             (settled, row["node_id"], row["node_status"], row["node_metadata"],
+              *args, row["task_id"])),
+            ("UPDATE tasks SET status='completed' WHERE id=? AND status='running' AND "
+             + evidence + " AND EXISTS (SELECT 1 FROM execution_nodes WHERE id=? "
+             "AND status='completed' AND metadata_json=?)",
+             (row["task_id"], *args, row["node_id"], settled)),
+        ])
+        recovered += changed
+    return recovered

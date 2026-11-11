@@ -72,4 +72,10 @@ async def test_incomplete_stream_does_not_emit_normal_terminal(monkeypatch, fail
             await consume()
     else:
         await consume()
-    assert not any(isinstance(part, AgentResult) for part in chunks)
+    terminals = [part for part in chunks if isinstance(part, AgentResult)]
+    if failure == "truncated":
+        assert len(terminals) == 1
+        assert terminals[0].metadata["truncated"] is True
+        assert terminals[0].metadata["finish_reason"] == "length"
+    else:
+        assert not terminals

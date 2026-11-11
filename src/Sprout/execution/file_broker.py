@@ -549,6 +549,7 @@ class FileBroker:
 
         from Sprout.execution.file_snapshot import ResourceIdentity
         from Sprout.workspace.authorized_content import relative_label
+        from Sprout.workspace.models import WorkspaceKind
 
         if os.name != "nt":
             raise PermissionError("conditional_apply_platform_unavailable")
@@ -559,6 +560,7 @@ class FileBroker:
         request, workspace, path, identity, old_sha, data = record
         path = relative_label(path)
         target = workspace.root / path
+        create = identity is None and old_sha is None
         if (type(request) is not ActionRequest or not request.actor.authenticated
                 or not request.actor.source or not request.task_id
                 or request.action not in {ActionType.FILE_WRITE, ActionType.FILE_APPLY}
@@ -566,7 +568,10 @@ class FileBroker:
                 or request.resource.path != target.as_posix()
                 or request.resource.kind != classify(
                     target, workspace_root=workspace.root, overrides=self._classify_overrides)
-                or type(identity) is not ResourceIdentity or type(data) is not bytes):
+                or (create and (request.action is not ActionType.FILE_APPLY
+                                or workspace.kind is not WorkspaceKind.LOCAL_DIRECTORY))
+                or (not create and type(identity) is not ResourceIdentity)
+                or type(data) is not bytes):
             raise PermissionError("conditional_apply_subject_invalid")
         expected = (request, workspace, path, identity, old_sha, data)
         # Policy remains authoritative. SANDBOX_ONLY is not host-write authority.
@@ -598,8 +603,12 @@ class FileBroker:
         # Synchronous bounded native call: no worker may outlive cancellation.
         # Coordinator must record write-start BEFORE this call and settle any
         # exception as UNKNOWN unless independent no-write proof exists.
-        result = file_operation(workspace.root, target, "conditional_write", authorize,
-                                content=(identity, old_sha, data, authorize))
+        if create:
+            result = file_operation(
+                workspace.root, target, "conditional_create", authorize, content=data)
+        else:
+            result = file_operation(workspace.root, target, "conditional_write", authorize,
+                                    content=(identity, old_sha, data, authorize))
         if (result != {"sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}
                 or await resolve(permit) != expected):
             raise PermissionError("conditional_apply_result_unconfirmed")
