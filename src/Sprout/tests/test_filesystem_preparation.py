@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from Sprout.cli.filesystem_preparation import plan_files, resolve_image
+from Sprout.tests.test_cli_test_generation_continuity import PERSISTED_CODING_REQUESTS
 from Sprout.tests.test_r04_b4_cli_auto import automatic as automatic
 from Sprout.tests.test_r04_b4_cli_auto import captured as captured
 from Sprout.tests.test_r04_b4_cli_auto import cli as cli
@@ -346,4 +347,13 @@ def test_readonly_reference_before_explicit_write_keeps_same_plan():
         '参考 SPEC.md，修改 "app.py" 中的函数，并运行测试。',
     )
     assert plan["writes"] == ("app.py",)
+    assert plan["execution"] == ("run_tests",)
+
+
+@pytest.mark.parametrize("instruction", PERSISTED_CODING_REQUESTS)
+def test_persisted_multiline_coding_preserves_source_only_plan(instruction):
+    paths = ("README.md", "SPEC.md", "order_total.py", "tests/test_order_total.py",
+             "pyproject.toml")
+    plan = plan_files(paths, instruction)
+    assert plan["writes"] == ("order_total.py",)
     assert plan["execution"] == ("run_tests",)

@@ -3932,12 +3932,18 @@ class Runtime:
             request = project_request_text(message.content or "")
             quoted = re.search(r'["“‘`]', request)
             explicit_prefix = quoted is not None and detect_task_hint(request[:quoted.start()])
-            if str(context.metadata.get("intent") or "") == "task" and explicit_prefix:
+            primary = request.splitlines()[0] if "\n" in request else ""
+            explicit_primary = bool(primary) and detect_task_hint(primary)
+            if (str(context.metadata.get("intent") or "") == "task"
+                    and (explicit_prefix or explicit_primary)):
                 return OutboundMessage(
-                    "编码请求未通过操作与目标判定。请明确要修改的文件，并检查输入示例是否完整。",
+                    ("编码请求的主操作与限制条件不一致，请明确是否允许修改目标文件。"
+                     if explicit_primary else
+                     "编码请求未通过操作与目标判定。请明确要修改的文件，并检查输入示例是否完整。"),
                     message.channel, session.id, message.id,
                     {"intent": "task", "blocked_reason": "coding_request_not_admitted",
-                     "reason": "unresolved_literal"},
+                     "reason": ("conflicting_constraints" if explicit_primary
+                                else "unresolved_literal")},
                 ), message
             return None
         if self._asks_for_workspace(message, context, session):

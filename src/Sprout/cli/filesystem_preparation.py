@@ -70,11 +70,13 @@ def plan_files(paths, instruction, *, symbols=None, imports=()):
     feature_sources = set()
     for clause in re.split(r'[，,、。;；\n]|并且|并|同时|然后|以及|最后', body):
         clause = re.sub(r"^\s*\d+[.、]\s*", "", clause).strip()
-        if clause.startswith(("不要", "不修改", "不改动", "不写入", "保留")):
+        if clause.startswith(("不要", "请不要", "也不要", "不允许",
+                              "不修改", "不改动", "不写入", "保留")):
             continue
         # A reference names an input, not an edit target.
         clause = re.sub(
-            r"^(?:严格\s*)?(?:按照|按|参考|依据)\s*[A-Za-z0-9_./-]+\.[A-Za-z][A-Za-z0-9_]*",
+            r"^(?:请)?(?:严格\s*)?(?:按照|按|参考|依据)\s*(?:已经读取的\s*)?"
+            r"[A-Za-z0-9_./-]+\.[A-Za-z][A-Za-z0-9_]*",
             "", clause,
         ).strip()
         mentioned = re.findall(r'[A-Za-z0-9_./-]+\.[A-Za-z][A-Za-z0-9_]*', clause)

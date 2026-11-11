@@ -150,6 +150,23 @@ def write_intent_disposition(text: str) -> WriteIntentDisposition:
     # Ambiguous/mixed/quoted requests require a fresh explicit instruction.
     if any(mark in lowered for mark in ('"', "“", "”", "‘", "’", "`")):
         return WriteIntentDisposition.KNOWN_NONWRITE
+    if "\n" in stripped:
+        clauses = project_clauses(stripped)
+        first = clauses[0] if clauses else ""
+        # Classify the primary operation independently of subsequent execution
+        # requirements and file exclusions. A claimed authorization is not an
+        # operation; an execution preamble still needs a concrete edit below.
+        primary = write_intent_disposition(first)
+        resume = re.fullmatch(r"(?:请)?(?:直接|立即)执行[^。；;\n]*代码修改任务", first)
+        edits = [c.removeprefix("只") for c in clauses]
+        cancelled = _project_write_cancelled(clauses)
+        if cancelled:
+            return WriteIntentDisposition.KNOWN_NONWRITE
+        if (primary is WriteIntentDisposition.EXPLICIT_WRITE or (resume and any(
+            write_intent_disposition(c) is WriteIntentDisposition.EXPLICIT_WRITE
+            for c in edits
+        ))):
+            return WriteIntentDisposition.EXPLICIT_WRITE
     if any(term in lowered for term in (
         "不要", "不需要", "不是让", "先别", "别执行", "不执行", "不改", "仅分析",
         "只分析", "只读", "解释", "讨论", "总结", "现状", "进度", "已经", "昨天",
@@ -256,6 +273,16 @@ def project_clauses(text: str) -> tuple[str, ...]:
     )
 
 
+def _project_write_cancelled(clauses: tuple[str, ...]) -> bool:
+    """Global cancellation remains distinct from file-specific exclusions."""
+    return any(c.removeprefix("请").casefold().startswith((
+        "取消", "先别执行", "不要执行", "不执行",
+        "不要修改任何", "不修改任何", "不做任何修改",
+        "只分析", "仅分析", "do not modify any", "don't modify any",
+        "only analyze", "only analyse",
+    )) for c in clauses)
+
+
 def conditional_test_extension(text: str) -> bool:
     clauses = project_clauses(text)
     return (bool(clauses) and clauses[0].startswith(("检查", "请检查"))
@@ -272,6 +299,8 @@ def project_feature_edit(clause: str) -> bool:
 def detect_task_hint(text: str) -> bool:
     """Compatible bool fast path; UNKNOWN is not permission to create a Task."""
     text = project_request_text(text)
+    if "\n" in text and _project_write_cancelled(project_clauses(text)):
+        return False
     if write_intent_disposition(text) is WriteIntentDisposition.EXPLICIT_WRITE:
         return True
     if any(mark in text for mark in ('"', '“', '”', '‘', '’', chr(96), '?', '？')):

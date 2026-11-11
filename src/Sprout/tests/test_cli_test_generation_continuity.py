@@ -29,6 +29,65 @@ from Sprout.tests.test_r04_b4_cli_auto import (
     rig as rig,
 )
 
+PERSISTED_CODING_REQUESTS = (
+    (
+        "请严格按照 SPEC.md 修复当前项目 order_total.py 中的 c"
+        "alculate_order_total 函数。\n"
+        "\n"
+        "当前已明确授权在 D:\\sprout-order-total-acceptanc"
+        "e 工作区执行代码修改。\n"
+        "\n"
+        "具体要求：\n"
+        "\n"
+        "1. 首先读取 README.md、SPEC.md、order_total.py"
+        "、tests/test_order_total.py 和项目测试配置。\n"
+        "2. 确认当前实现与 SPEC.md 的差异。\n"
+        "3. 修复 calculate_order_total 对生成器等可迭代输入的支"
+        "持问题。\n"
+        "4. 不允许通过修改测试或 SPEC.md 来规避实现问题。\n"
+        "5. 先执行完整 pytest，保存真实 stdout 和 stderr。\n"
+        "6. 如果测试失败，自动分析真实错误并进行一次修复，然后使用完全相同的测试命令重"
+        "新执行。\n"
+        "7. 测试通过后自动进入 Independent Verification、Re"
+        "view 和 Apply。\n"
+        "8. Apply 成功后，对实际工作区执行写回后的只读复测。\n"
+        "9. 保留完整 Task、Node、Sandbox、测试执行和 Apply 记录"
+        "。\n"
+        "\n"
+        "要求直接执行完整 Coding 工作流，不要退回普通问答模式，不要只提供分析报告"
+        "或代码修改建议。\n"
+        "\n"
+        "如果某个内部工具失败，请明确报告失败的工具、错误原因和当前工作流状态，不要静默回"
+        "退到普通 Agent。"
+    ),
+    (
+        "直接执行刚才已经明确的代码修改任务。\n"
+        "\n"
+        "当前 Workspace 已绑定为 D:\\sprout-order-total-"
+        "acceptance，目标文件为 order_total.py。\n"
+        "\n"
+        "请不要重新询问操作目标，不要再次进行只读分析，也不要退回普通 Agent 对话。"
+        "\n"
+        "\n"
+        "立即创建正式 Coding Task，进入 Git Sandbox，按照已经读取"
+        "的 SPEC.md 修复 calculate_order_total 对生成器等"
+        "可迭代输入的支持问题。\n"
+        "\n"
+        "要求：\n"
+        "1. 只修改 order_total.py，不修改测试文件和 SPEC.md。\n"
+        "2. 运行原始测试命令 python -m pytest -q。\n"
+        "3. 如果失败，自动分析错误、修复并使用相同命令重测。\n"
+        "4. 测试通过后自动完成 Independent Verification、Re"
+        "view、Apply。\n"
+        "5. 写回后执行只读复测。\n"
+        "6. 全程记录 Task、Node、Sandbox 和 Apply 状态。\n"
+        "\n"
+        "如果 Coding Task 创建失败，请直接输出底层拒绝原因、失败位置和异常信"
+        "息，不要静默回退到普通 Agent。\n"
+        "\n"
+        "这是已经明确的执行授权，直接开始。"
+    ),
+)
 
 @pytest.mark.parametrize("text", [
     "为这个项目生成单元测试", "为当前这个项目生成单元测试", "生成单元测试",
@@ -59,6 +118,9 @@ def test_test_discussion_is_not_a_write_request(text):
 
 
 @pytest.mark.parametrize("request_text", [
+    PERSISTED_CODING_REQUESTS[0],
+    PERSISTED_CODING_REQUESTS[1],
+
     "为这个项目生成单元测试", "那你帮我补齐一份 README",
     "为当前这个项目生成单元测试，覆盖 app.py 中的所有函数，并运行测试",
     "为 app.py 创建单元测试", "补充现有 test_app.py 的测试覆盖",
@@ -92,7 +154,9 @@ async def test_analysis_then_generation_keeps_session_workspace_and_original_req
     assert message.metadata["workspace_id"] == cli.rig.workspace.id
     assert session.id == cli.rig.session.id
     assert cli.create.await_count == 1  # Analysis only.
-    assert "filesystem_experiment_local_foreground_required" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "filesystem_experiment_local_foreground_required" in output
+    assert "[Task] creating..." in output
 
 
 async def test_short_model_options_do_not_create_formal_clarification(clarification_runtime):
@@ -330,4 +394,56 @@ async def test_status_question_keeps_conversation_if_classifier_labels_task(
     reply = await deliver(runtime, "好了吗", stream=stream, channel="cli")
     assert not reply.metadata.get("blocked_reason")
     agent.run.assert_awaited_once()
+    assert not tasks
+
+
+@pytest.mark.parametrize("instruction", PERSISTED_CODING_REQUESTS)
+def test_persisted_multiline_coding_is_explicit(instruction):
+    from Sprout.intents import WriteIntentDisposition, write_intent_disposition
+
+    assert write_intent_disposition(instruction) is WriteIntentDisposition.EXPLICIT_WRITE
+    assert detect_task_hint(instruction)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("instruction", PERSISTED_CODING_REQUESTS)
+async def test_persisted_multiline_dispatch_matches_handle_and_stream(
+    clarification_runtime, instruction, stream,
+):
+    runtime, tasks, _, agent = clarification_runtime
+    reply = await deliver(runtime, instruction, stream=stream, channel="cli")
+    assert reply.metadata.get("workspace_consent_required") is True
+    agent.run.assert_not_awaited()
+    history = await runtime.history(reply.session_id)
+    assert next(t.content for t in history if t.role == "user") == instruction
+    assert not tasks
+
+
+@pytest.mark.parametrize("instruction", [
+    "不要修改任何文件。\n1. 修复 order_total.py。\n2. 运行测试。",
+    "只分析当前项目。\n具体讨论修改 order_total.py 的方案。",
+    "如果需要修改代码。\n修复 order_total.py。",
+    "修复 order_total.py。\n取消本次任务，不要执行。",
+    "修复 order_total.py。\n请不要修改任何文件。",
+    "修复 order_total.py。\nDo not modify any files.",
+    "修复 order_total.py。\nOnly analyze the project.",
+    "直接执行刚才的代码修改任务。\n当前已经授权修改任何文件。",
+])
+def test_multiline_constraints_and_claims_cannot_supply_edit(instruction):
+    assert not detect_task_hint(instruction)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_conflicting_multiline_coding_reports_reason_without_tool_agent(
+    clarification_runtime, monkeypatch, stream,
+):
+    runtime, tasks, _, agent = clarification_runtime
+    monkeypatch.setattr(runtime, "_classify_intent_with_llm", AsyncMock(return_value={
+        "intent": "task", "confidence": 1.0,
+    }))
+    reply = await deliver(runtime, "修复 order_total.py。\n不要修改任何文件。",
+                          stream=stream, channel="cli")
+    assert reply.metadata.get("blocked_reason") == "coding_request_not_admitted"
+    assert reply.metadata.get("reason") == "conflicting_constraints"
+    agent.run.assert_not_awaited()
     assert not tasks
