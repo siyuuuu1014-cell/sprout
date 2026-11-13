@@ -12,3 +12,7 @@ their declared behavior. It does not validate Sprout's code-generation ability.
 
 The tests import this package explicitly, without root-module lookup or global
 `sys.path` changes. Missing fixtures must fail collection, never be skipped.
+
+For production-path acceptance and the Windows baseline, see the
+[developer handoff](../../../../docs/DEVELOPER_HANDOFF.md). Live Docker and model
+checks are separate from these committed reference fixtures.

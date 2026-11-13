@@ -1,5 +1,10 @@
 # Six-database stack (Docker)
 
+This guide covers storage services. For the separate foreground Coding image and
+its Docker setup, see [Coding images](coding/README.md). The local SQLite
+profile can run foreground Coding with Docker and a compatible Coding image
+without starting the optional storage containers.
+
 Two commands cover the lifecycle — create the six databases, then prove they all
 work. Both are wrappers over the project's own CLI, so the same code runs with
 or without Docker: `init` is `sprout storage init`, `test` is
@@ -16,23 +21,24 @@ or without Docker: `init` is `sprout storage init`, `test` is
 
 With no verb, `./bootstrap.ps1` brings the stack up and runs `test`.
 
-## Fresh clone — what a teammate runs
+## Fresh clone
+
+Check out the repository's dev branch and run the locked install from the
+repository root. The packaged scripts are in this directory. The CLI also
+copies Docker templates into the Sprout home directory when it initializes.
 
 ```bash
-git clone https://github.com/WingYouth/SEAM_Sprout.git
-cd SEAM_Sprout
-~/.sprout/docker/bootstrap.sh init      # macOS / Linux: create all six databases
-~/.sprout/docker/bootstrap.sh test      # prove them
+uv sync --locked --group dev
+cd src/Sprout/config/docker_templates
+bash bootstrap.sh init
+bash bootstrap.sh test
 ```
 ```powershell
-.\docker\bootstrap.ps1 init     # Windows, from the repository root
-.\docker\bootstrap.ps1 test
+uv sync --locked --group dev
+Set-Location src/Sprout/config/docker_templates
+./bootstrap.ps1 init
+./bootstrap.ps1 test
 ```
-
-> **Branch note.** The stack currently ships on `dev`. If the branch you cloned
-> (usually `main`) has no generated home stack yet, run `sprout` once or
-> `sprout home` after the
-> clone — the commands below assume the checkout contains this directory.
 
 `init` is the entire "set up the databases" story: pull the three service images
 (with the CN mirror fallback), build the runner image, start the lanes, then

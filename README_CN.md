@@ -11,16 +11,13 @@
 
 <br />
 
-### 项目任务的显式类型
+### 交互式项目开发
 
-`sprout project task-create <workspace_id> "<需求>" --mode code` 默认创建编码任务。
-编码要求已有 Git 仓库，并在普通应用和验证完成前通过冻结的输入/输出验收用例及可执行最小 Demo。
-Sprout 不会自动初始化 Git。只读分析使用 `--mode read_only`，不提供写入工具，也允许非 Git 项目。
-HTTP/RPC/SDK 创建任务使用相同的 `execution_mode` 字段。
+在目标项目目录启动 `sprout chat`，确认工作区后直接描述需求。前台 Coding 按项目类型选择 Filesystem Sandbox 或 Git Worktree。已在 Windows、DeepSeek 和 Docker 上实测非 Git Python 的功能新增、模块抽取、多文件修复、补测试和写回。流程会发现文件、规划读写范围、冻结独立验收和回归用例，在隔离副本内修改、验证并生成 Diff，最后写回原项目并重新验证。
 
-缺少类型的历史任务会在执行和恢复时被阻止。未执行且无提案的任务可通过
-`sprout project task-confirm-mode <task_id> --mode code|read_only` 确认；已有执行记录或提案的任务须重新创建。
-人工强制应用仍是独立入口，必须记录豁免原因，不代表验证完成。
+正常流程需要可用的模型、Docker Engine 和包含项目依赖的本地 Coding 镜像。受支持的任务内操作自动审批；仍可能需要首次确认工作区，其他独立操作可保留人工审批。无需设置诊断环境变量、手填文件清单或提供验收 JSON。TypeScript 和 Go 的非 Git Coding 完整流程尚未接通。现有测试全绿时按规格主动找问题并修复的路径目前接入 Filesystem 适配器。
+
+`sprout project task-create <workspace_id> "<需求>" --mode code` 是另一条显式任务入口；`--mode read_only` 用于只读任务。HTTP/RPC/SDK 使用 `execution_mode` 字段。缺少类型的历史任务仍按原有确认或重建流程处理。启动步骤、架构和待办见[开发交接文档](docs/DEVELOPER_HANDOFF.md)。
 
 <div align="center">
   <img src="assets/seam_sprout.svg" alt="SEAM Sprout logo" width="200" />
@@ -46,7 +43,7 @@ SEAM Sprout 是每一个计算机项目的一段“基因”。它可以接入�
   明确的跨文件 FastAPI router 包含关系会生成独立的源码组合路径及前缀证据链，SQL CREATE TABLE 保留列和约束原文。
   结果不代表实时数据库或部署 URL；跨文件 ORM 继承、动态工厂、注解类型映射、SQL 方言语义及版本相关的挂载后修改仍未解析。
 - **代码生成**：把意图变成具体代码修改，而不是只给文字建议。
-- **隔离环境运行**：在 git worktree 沙箱中运行生成代码，通过受控 broker 应用变更。
+- **隔离环境运行**：使用文件系统沙箱或 Git Worktree，在 Docker 中执行受支持的检查，通过 Broker 应用已审查变更。
 - **代码校验**：对每次修改进行测试和检查，避免直接写入错误代码。
 - **代码集成**：把验证通过的变更集成回项目，并保留完整过程记录。
 - **有序关闭**：先停止并等待本地任务消费器退出，再完成后台写入、outbox 刷新和数据库关闭；服务退出不等于取消业务任务。
@@ -58,7 +55,7 @@ SEAM Sprout 是每一个计算机项目的一段“基因”。它可以接入�
 - 需要持续修复、重构、补全功能的代码库。
 - 希望生成代码后能安全运行、测试并集成的团队。
 - 需要项目级记忆、进化和审计能力的企业或组织。
-- **如实的隔离边界**：每个高危动作都要先经过 authorization 层（hard floor → policy → approval），变更落在 git worktree sandbox 里。该 sandbox 隔离的是*变更可见性*，不是*权限*——agent 进程与宿主共享 filesystem、OS user、network 和 kernel，没有 container 或 OS 级后台。七个 execution broker 里，当前装配进 runtime 的是 file、process、apply 三个；network、database、git 三个 broker 已实现但尚未接进 agent 路径。
+- **受控执行**：前台 Coding 在 Docker 中执行项目检查，通过运行时 Broker 应用已审查的变更。
 
 ## 采用技术
 
@@ -97,7 +94,7 @@ src/Sprout/
 ├── gateway/       # Runtime、RPC、Task、Daemon 与传输网关
 ├── orchestration/ # 图编译器、Temporal terminal、worker 与 workflows
 ├── rootstock/     # 会话/根持久化后台
-├── sandbox/       # Git worktree 沙箱
+├── sandbox/       # Filesystem Sandbox / Git Worktree
 ├── task/          # 任务模型与生命周期
 ├── trajectory/    # 轨迹持久化
 ├── workspace/     # 工作区辅助
@@ -122,7 +119,7 @@ assets/            # 共享 Logo 与静态资源
 ```bash
 git clone <repository-url>
 cd SEAM_Sprout
-uv sync --dev
+uv sync --locked --group dev
 ```
 
 默认配置完全离线：使用 `echo` 模型提供方、本地 SQLite 数据库，不连接外部 MCP 客户端。
@@ -132,6 +129,8 @@ uv sync --dev
 ```bash
 pip install aiyallm
 ```
+
+从目标项目目录启动的命令见[开发交接文档](docs/DEVELOPER_HANDOFF.md)，Docker 准备见 [Coding 镜像说明](src/Sprout/config/docker_templates/coding/README.md)。
 
 ### 六个数据库，两条命令
 

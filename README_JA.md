@@ -2,11 +2,17 @@
 
 SEAM Sprout は、ソフトウェアプロジェクトのための自己進化型 AI エージェントです。コードベースに接続し、構造と文脈を理解し、コードを生成し、隔離環境で実行し、結果を検証してから変更を統合します。
 
+## 現在の対応範囲
+
+Git を使わない Python プロジェクトの対話型 Coding は、Windows、DeepSeek、Docker で機能追加、共通モジュールの抽出、複数ファイルの修正、独立検証、書き戻しと再テストまで実機確認済みです。対象ディレクトリで `sprout chat` を起動し、ワークスペースを確認して依頼を入力します。対応する処理の承認は自動で行われ、診断用フラグや手書きの検証 JSON は不要です。利用可能なモデル、Docker、依存パッケージを含むローカル Coding イメージが必要です。Git は Worktree を使用します。非 Git の TypeScript と Go の Coding は未対応です。
+
+[Developer handoff](docs/DEVELOPER_HANDOFF.md) · [English](README.md) · [简体中文](README_CN.md)
+
 ## 主な特徴
 
 - 正確なプロジェクト解析: リポジトリ構造、コード文脈、セッション、記憶、知識を事前に確認します。
 - コード生成: 意図を具体的な変更に変換します。
-- 隔離実行: git worktree サンドボックスで生成コードを実行します。
+- 隔離実行: ファイルシステム Sandbox または Git Worktree を準備し、Docker で検証します。
 - コード検証: 統合前にテストとチェックを行います。
 - コード統合: 検証済みの変更をプロジェクトへ適用し、履歴を残します。
 - 自動成長: 完了した作業から学び、将来の改善提案を作成します。
@@ -37,7 +43,7 @@ SEAM Sprout は、ソフトウェアプロジェクトのための自己進化�
 ```bash
 git clone <repository-url>
 cd SEAM_Sprout
-uv sync --dev
+uv sync --locked --group dev
 ```
 
 ## Web コンソール
@@ -134,7 +140,7 @@ src/Sprout/
 ├── gateway/       # ランタイム、RPC、タスクゲートウェイ
 ├── orchestration/ # グラフコンパイラと Temporal worker
 ├── rootstock/     # セッション永続化バックエンド
-├── sandbox/       # git worktree サンドボックス
+├── sandbox/       # Filesystem Sandbox / Git Worktree
 ├── task/          # タスクモデル
 ├── trajectory/    # 軌跡の永続化
 ├── workspace/     # ワークスペースヘルパー

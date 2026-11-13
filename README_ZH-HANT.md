@@ -2,11 +2,17 @@
 
 SEAM Sprout 是軟體專案的自我進化 AI 代理人。它會接入程式碼庫、理解結構與上下文，然後執行程式碼生成、隔離環境執行、程式碼驗證與整合，並持續推動專案自動成長。
 
+## 目前支援範圍
+
+已在 Windows、DeepSeek 和 Docker 實測非 Git Python 前景 Coding：新增功能、抽取共用模組、多檔案修正、獨立驗收、寫回及複測。從目標專案啟動 `sprout chat`，確認工作區後輸入需求。受支援流程會自動處理任務內核准，無需設定診斷開關或手填驗收 JSON。需配置可用模型、Docker 與含專案相依套件的本機 Coding 映像。Git 使用獨立 Worktree；TypeScript 與 Go 的非 Git Coding 尚未接通。
+
+[Developer handoff](docs/DEVELOPER_HANDOFF.md) · [English](README.md) · [简体中文](README_CN.md)
+
 ## 主要特色
 
 - 精準專案分析：在行動前理解儲存庫結構、程式碼上下文、工作階段、記憶與知識。
 - 程式碼生成：把意圖轉換成具體修改，而不只是文字建議。
-- 隔離環境執行：在 git worktree 沙箱中執行生成程式碼。
+- 隔離執行：前景 Coding 可使用檔案系統沙箱或 Git Worktree，並在 Docker 中執行檢查。
 - 程式碼驗證：每次修改都先測試與檢查。
 - 程式碼整合：套用驗證通過的變更，並保留完整軌跡。
 - 自動成長：從已完成的工作中學習，產生可審核的改善提案。
@@ -37,7 +43,7 @@ SEAM Sprout 是軟體專案的自我進化 AI 代理人。它會接入程式碼�
 ```bash
 git clone <repository-url>
 cd SEAM_Sprout
-uv sync --dev
+uv sync --locked --group dev
 ```
 
 ## Web 控制台
@@ -134,7 +140,7 @@ src/Sprout/
 ├── gateway/       # Runtime、RPC、任務閘道
 ├── orchestration/ # 圖編譯器與 Temporal worker
 ├── rootstock/     # 工作階段持久化後端
-├── sandbox/       # Git worktree 沙箱
+├── sandbox/       # Filesystem Sandbox / Git Worktree
 ├── task/          # 任務模型
 ├── trajectory/    # 軌跡持久化
 ├── workspace/     # 工作區輔助
