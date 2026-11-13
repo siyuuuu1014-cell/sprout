@@ -11,20 +11,13 @@
 
 <br />
 
-### Explicit project task modes
+### Interactive project coding
 
-`sprout project task-create <workspace_id> "<instruction>" --mode code` is the
-default coding entry. It requires an existing Git repository and frozen
-input/output acceptance tests plus an executable minimal demo before normal
-application and verified completion. Sprout never initializes Git automatically.
-Use `--mode read_only` for analysis without write tools, including non-Git projects.
-HTTP/RPC/SDK task inputs use the matching `execution_mode` field.
+Run `sprout chat` from the target project, confirm its workspace, and describe the change. Local foreground Coding selects a filesystem sandbox for a non-Git Python project or an isolated Worktree for a Git project. The verified non-Git Python workflow discovers files, plans reads and writes, freezes independent acceptance and regression cases, edits an isolated copy, tests it in Docker, reviews the diff, applies it, and retests the files written to the original project. Supported operations within this workflow are approved automatically. Workspace confirmation and approvals for other operations remain available.
 
-Historical tasks without a mode are blocked on execution and resume. Only an
-untouched task can be confirmed with
-`sprout project task-confirm-mode <task_id> --mode code|read_only`; tasks with
-execution records or proposals must be recreated. Force application remains a
-separate operator action requiring an exemption reason, not verified completion.
+A configured model, running Docker Engine, and a compatible local Coding image are required for this workflow. Manual READ/WRITE lists, acceptance JSON, and the diagnostic flag are unnecessary on the normal path. Full non-Git Coding for TypeScript and Go is pending. The conditional “find and repair a specification defect” path with green existing tests currently supports the filesystem adapter.
+
+`sprout project task-create <workspace_id> "<instruction>" --mode code` is a separate explicit task API. Use `--mode read_only` for a read-only task. HTTP/RPC/SDK use `execution_mode`. Historical tasks without a mode require the existing confirmation or recreation procedure. See the [developer handoff](docs/DEVELOPER_HANDOFF.md) for startup, architecture and known gaps.
 
 <div align="center">
   <img src="assets/seam_sprout.svg" alt="SEAM Sprout logo" width="200" />
@@ -54,7 +47,7 @@ It is designed to help every project improve, repair itself, and grow automatica
   Dynamic factories, cross-file ORM inheritance, annotation type maps, SQL dialect
   semantics, and version-dependent late router changes remain unresolved.
 - **Code generation**: turns intent into concrete changes instead of only answering questions.
-- **Isolated execution**: runs generated code in a git-worktree sandbox and applies changes through controlled brokers.
+- **Isolated execution**: uses a filesystem sandbox or Git Worktree and runs supported checks in Docker.
 - **Code verification**: tests and checks every change before integration.
 - **Code integration**: applies verified changes back to the project and records the full trace.
 - **Orderly shutdown**: joins the local task consumer before flushing background
@@ -67,7 +60,7 @@ It is designed to help every project improve, repair itself, and grow automatica
 - Codebases that need continuous repair, refactoring, or feature completion.
 - Teams that want generated code to be executed, tested, and integrated safely.
 - Organizations that require project-level memory, evolution, and auditability.
-- **Honest isolation boundary**: every risky action goes through the authorization layer (hard floor → policy layers → approvals), and changes land in a git-worktree sandbox. That sandbox isolates *change visibility*, not *privileges* — agent processes share the host filesystem, OS user, network, and kernel, and there is no container or OS-level backend. Of the seven execution brokers, the file, process, and apply brokers are the ones assembled into the runtime today; the network, database, and git brokers exist but are not yet wired into the agent path.
+- **Controlled execution**: supported foreground Coding runs project checks in Docker and applies reviewed changes through the runtime brokers.
 
 ## Tech Stack
 
@@ -107,7 +100,7 @@ src/Sprout/
 ├── gateway/       # Runtime, RPC, task, daemon, and transport gateways
 ├── orchestration/ # Graph compiler, Temporal terminal, worker, and workflows
 ├── rootstock/     # Session/root persistence backends
-├── sandbox/       # Git worktree sandbox
+├── sandbox/       # Filesystem Sandbox / Git Worktree
 ├── task/          # Task models and lifecycle
 ├── trajectory/    # Trajectory persistence
 ├── workspace/     # Workspace helpers
@@ -188,16 +181,14 @@ brokers.
 ```bash
 git clone <repository-url>
 cd SEAM_Sprout
-uv sync --dev
+uv sync --locked --group dev
 ```
 
 The default configuration is fully offline: the `echo` model provider, local SQLite databases, and no external MCP clients.
 
-For the `aiyallm` model provider, install its distribution:
+The locked install includes the aiyallm provider dependency.
 
-```bash
-pip install aiyallm
-```
+For setup from a target project directory, see the [developer handoff](docs/DEVELOPER_HANDOFF.md). The [Coding image guide](src/Sprout/config/docker_templates/coding/README.md) covers Docker setup.
 
 ### Six databases in one command
 
@@ -474,7 +465,9 @@ This project is licensed under the [MIT License](LICENSE).
 
 ---
 
-# Supplementary Project Documents
+# Historical project documents
+
+These archived notes and test plans describe earlier snapshots. Use the developer handoff above for current behavior, commands and evidence.
 
 ## Agent Instructions
 

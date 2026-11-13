@@ -2,11 +2,17 @@
 
 SEAM Sprout은 소프트웨어 프로젝트를 위한 자기 진화형 AI 에이전트입니다. 코드베이스에 연결해 구조와 문맥을 이해하고, 코드를 생성하고, 격리 환경에서 실행하고, 검증한 뒤 변경을 통합합니다.
 
+## 현재 지원 범위
+
+Git이 없는 Python 프로젝트의 대화형 Coding은 Windows, DeepSeek, Docker에서 기능 추가, 공통 모듈 추출, 여러 파일 수정, 독립 검증, 프로젝트 반영과 재테스트까지 검증했습니다. 대상 디렉터리에서 `sprout chat`을 실행하고 작업 공간을 확인한 뒤 요청을 입력합니다. 지원되는 작업의 승인은 자동 처리되며 진단 플래그나 수동 검증 JSON이 필요 없습니다. 사용 가능한 모델, Docker, 프로젝트 의존성을 포함한 로컬 Coding 이미지가 필요합니다. Git은 Worktree를 사용합니다. 비 Git TypeScript와 Go의 Coding은 아직 지원하지 않습니다.
+
+[Developer handoff](docs/DEVELOPER_HANDOFF.md) · [English](README.md) · [简体中文](README_CN.md)
+
 ## 주요 특징
 
 - 정밀한 프로젝트 분석: 저장소 구조, 코드 문맥, 세션, 메모리, 지식을 사전에 확인합니다.
 - 코드 생성: 의도를 구체적인 변경으로 변환합니다.
-- 격리 실행: git worktree 샌드박스에서 생성 코드를 실행합니다.
+- 격리 실행: 파일시스템 Sandbox 또는 Git Worktree를 준비하고 Docker에서 검증합니다.
 - 코드 검증: 통합 전에 테스트와 점검을 수행합니다.
 - 코드 통합: 검증된 변경을 프로젝트에 적용하고 이력을 남깁니다.
 - 자동 성장: 완료된 작업에서 학습하고 개선 제안을 만듭니다.
@@ -37,7 +43,7 @@ SEAM Sprout은 소프트웨어 프로젝트를 위한 자기 진화형 AI 에이
 ```bash
 git clone <repository-url>
 cd SEAM_Sprout
-uv sync --dev
+uv sync --locked --group dev
 ```
 
 ## Web 콘솔
@@ -134,7 +140,7 @@ src/Sprout/
 ├── gateway/       # 런타임, RPC, 작업 게이트웨이
 ├── orchestration/ # 그래프 컴파일러와 Temporal worker
 ├── rootstock/     # 세션 영속화 백엔드
-├── sandbox/       # git worktree 샌드박스
+├── sandbox/       # Filesystem Sandbox / Git Worktree
 ├── task/          # 작업 모델
 ├── trajectory/    # 궤적 영속화
 ├── workspace/     # 워크스페이스 헬퍼

@@ -1,5 +1,9 @@
 # Independent verification image
 
+This image targets the dedicated verification observer and its replay/integration
+paths. For ordinary foreground Coding image discovery and post-Apply testing,
+see [Coding images](../coding/README.md).
+
 This image is only for Python/pytest acceptance observations. It is not the
 Sprout runtime image and contains no business dependencies or project checkout.
 

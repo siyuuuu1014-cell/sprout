@@ -2,11 +2,17 @@
 
 O SEAM Sprout é um agente de IA autoevolutivo para projetos de software. Ele se conecta a uma base de código, entende sua estrutura e contexto, gera código, executa em um ambiente isolado, verifica o resultado e depois integra as alterações.
 
+## Suporte atual
+
+O fluxo interativo de Coding para projetos Python sem Git foi validado no Windows com DeepSeek e Docker, incluindo alterações em vários arquivos, extração de módulos, verificação independente, aplicação e novos testes. Inicie `sprout chat` na pasta do projeto e confirme o espaço de trabalho. As aprovações do fluxo suportado são automáticas, sem modo de diagnóstico ou JSON de aceitação manual. São necessários um modelo configurado, Docker e uma imagem local de Coding com as dependências do projeto. Projetos Git usam Worktree. O fluxo completo sem Git para TypeScript e Go ainda está pendente.
+
+[Developer handoff](docs/DEVELOPER_HANDOFF.md) · [English](README.md) · [简体中文](README_CN.md)
+
 ## Principais recursos
 
 - Análise precisa do projeto: estrutura do repositório, contexto, sessões, memória e conhecimento.
 - Geração de código: converte a intenção em mudanças concretas.
-- Execução isolada: executa o código em um sandbox de git worktree.
+- Execução isolada: prepara um Sandbox de arquivos ou Git Worktree e executa verificações no Docker.
 - Verificação de código: testa e confere cada alteração antes da integração.
 - Integração de código: aplica mudanças verificadas e mantém o histórico.
 - Crescimento automático: aprende com o trabalho concluído e cria propostas de melhoria.
@@ -37,7 +43,7 @@ O SEAM Sprout é um agente de IA autoevolutivo para projetos de software. Ele se
 ```bash
 git clone <repository-url>
 cd SEAM_Sprout
-uv sync --dev
+uv sync --locked --group dev
 ```
 
 ## Console web
@@ -134,7 +140,7 @@ src/Sprout/
 ├── gateway/       # Gateways de runtime, RPC e tarefas
 ├── orchestration/ # Compilador de grafo e worker Temporal
 ├── rootstock/     # Backends de persistência de sessão
-├── sandbox/       # Sandbox de git worktree
+├── sandbox/       # Filesystem Sandbox / Git Worktree
 ├── task/          # Modelos de tarefa
 ├── trajectory/    # Persistência de trajetória
 ├── workspace/     # Helpers de workspace
