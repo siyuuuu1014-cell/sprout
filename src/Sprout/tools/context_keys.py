@@ -74,6 +74,7 @@ class _ProjectNodeScope:
     read_captured: bool = False
     resource_receipts: tuple = ()
     parent_receipts: tuple = ()
+    repair_agent_parent: tuple[str, str] | None = None
 
 
 @dataclass(slots=True, repr=False)

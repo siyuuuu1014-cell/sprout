@@ -29,6 +29,8 @@ def _public_call_lines(case) -> list[str]:
 
 
 def render_acceptance_tests(spec: AcceptanceSpec) -> str:
+    if spec.version != 1:
+        raise ValueError("Extended cases require the isolated acceptance runner")
     lines = [
         '"""Requirement input/output cases generated before implementation."""',
         "import asyncio", "import importlib", "import inspect", "import sys",
@@ -345,6 +347,8 @@ def acceptance_demo_path(task_id: str) -> str:
 
 def render_acceptance_demo(spec: AcceptanceSpec) -> str:
     """A standalone public-call demo with an explicit output oracle, not pytest."""
+    if spec.version != 1:
+        raise ValueError("Extended cases require the isolated acceptance runner")
     case = next((case for case in spec.cases if case.category == "normal"), None)
     if case is None:
         raise ValueError("A minimal demo requires a normal acceptance case")

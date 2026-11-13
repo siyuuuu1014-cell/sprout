@@ -6,7 +6,7 @@ from dataclasses import asdict, replace
 from uuid import NAMESPACE_URL, uuid5
 
 from Sprout.execution.coding_backend import DockerCodingBackend
-from Sprout.execution.function_verification import judge_actual
+from Sprout.execution.function_verification import judge_case
 from Sprout.execution.isolated_case_contract import case_command, planned_cases
 from Sprout.execution.isolated_case_contract import public_demo as public_demo
 from Sprout.execution.models import TestResult
@@ -67,7 +67,7 @@ async def verify_isolated_cases(metadata, runner, *, context, node, acceptance_s
             return {"waiting": True, "waiting_kind": "approval",
                     "pending_approvals": [process.approval_id], "verified": False}
         try:
-            judgement = judge_actual(process, case.expected_output)
+            judgement = judge_case(process, case)
         except (ValueError, TypeError):
             judgement = {"passed": False, "reason": "invalid_actual_output"}
         if input_manifest(context.exported) != before:
@@ -76,7 +76,13 @@ async def verify_isolated_cases(metadata, runner, *, context, node, acceptance_s
         results.append(TestResult(name, judgement["passed"], executed=process.allowed))
         records.append({"kind": kind, "case_id": case.id, "name": name,
                         "passed": judgement["passed"], "exit_code": process.exit_code,
-                        "allowed": process.allowed, "outcome": "passed"
+                        "allowed": process.allowed,
+                        "observed_exception": judgement.get("exception"),
+                        **({"actual_output": judgement["actual"]}
+                           if not judgement["passed"] and "actual" in judgement else {}),
+                        **({"diagnostic": process.stderr[:8192]}
+                           if not judgement["passed"] and process.stderr else {}),
+                        "outcome": "passed"
                         if judgement["passed"] else "check_failed", "command": list(command)})
     passed = all(item.executed and item.passed for item in results)
     return {"waiting": False, "verified": passed, "status": "passed" if passed else "failed",

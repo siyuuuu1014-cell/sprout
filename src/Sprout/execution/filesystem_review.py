@@ -143,7 +143,7 @@ def verification_manifest(payload):
     return expected
 
 
-def verification_status(node, review, task_id, workspace_id):
+def verification_status(node, review, task_id, workspace_id, *, bundle=None):
     from Sprout.orchestration.models import NodeStatus, NodeType
 
     if (node is None or node.task_id != task_id or node.type is not NodeType.EVALUATION
@@ -159,6 +159,17 @@ def verification_status(node, review, task_id, workspace_id):
     payload = checked_changes(review, task_id, workspace_id)
     if proof.get("input_manifest") != verification_manifest(payload):
         return "not_run"
+    if bundle is not None:
+        from Sprout.execution.acceptance_producer import checked_bundle
+
+        try:
+            checked_bundle(bundle)
+        except ValueError:
+            return "not_run"
+        specification = proof.get("specification") or {}
+        if any(specification.get(key) != bundle[key]
+               for key in ("bundle_sha256", "test_sha256", "demo_sha256")):
+            return "not_run"
     tests = proof.get("test_results")
     if proof.get("verified") is True and proof.get("status") == "passed" and tests and all(
             result.get("passed") is True and result.get("executed") is True for result in tests):

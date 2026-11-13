@@ -87,7 +87,7 @@ async def test_native_cli_code_preparation_and_exact_apply(tmp_path, monkeypatch
                      {"path": discovered, "content": "raise RuntimeError('changed')\n"}),
             *response.tool_calls))
     try:
-        prepared = await code_task.prepare(runtime, workspace.id,
+        prepared = await code_task.prepare_manual(runtime, workspace.id,
             message=Message("Simplify echo, preserve behavior and run tests"),
             session=session, principal=task.actor)
         if not decision:

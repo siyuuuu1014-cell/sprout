@@ -219,6 +219,7 @@ def test_real_runners_all_skipped_are_not_passed(tmp_path):
 
 
 async def test_testonly_scope_has_no_write_but_coding_keeps_write(tmp_path, monkeypatch):
+    import json
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
 
@@ -236,7 +237,10 @@ async def test_testonly_scope_has_no_write_but_coding_keeps_write(tmp_path, monk
     planner = AsyncMock()
     monkeypatch.setattr('Sprout.cli.filesystem_preparation.discover_plan', planner)
     monkeypatch.setattr('Sprout.security.local_diagnostics.current', lambda _: object())
-    monkeypatch.delenv('SPROUT_FILESYSTEM_VERIFICATION_SPEC', raising=False)
+
+    case = {"id": "case", "target": "app:echo", "expected_output": 1}
+    specs = {"acceptance": {"cases": [case]}, "regression": {"cases": [case]}}
+    monkeypatch.setenv("SPROUT_FILESYSTEM_VERIFICATION_SPEC", json.dumps(specs))
     for test_only in (True, False):
         planner.return_value = {'reads': ('app.py', 'test_app.py'),
             'writes': () if test_only else ('app.py',), 'execution': ('run_tests',)}
@@ -252,7 +256,7 @@ async def test_testonly_scope_has_no_write_but_coding_keeps_write(tmp_path, monk
                                         session, actor, test_only=test_only)
         scope = runtime.create_task.call_args.kwargs['delegation_scope']
         assert ('file.write' in scope.allowed_actions) is (not test_only)
-        assert 'file.apply' not in scope.allowed_actions
+        assert ('file.apply' in scope.allowed_actions) is (not test_only)
         assert scope.allowed_paths == ('.',)
         assert runtime._cli_code_writes[task.id][3] == (() if test_only else ('app.py',))
         runtime._sandbox_lifecycle.filesystem[task.id].evidence.rmdir()

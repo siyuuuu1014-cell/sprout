@@ -29,6 +29,13 @@ from Sprout.tests.test_r04_b4_cli_auto import (
     rig as rig,
 )
 
+ORDER_TOTAL_REQUEST = (
+    "修复 order_total.py 中的 calculate_order_total，严格按照 SPEC.md 支持生成器等合法可迭代输入，"
+    "不修改 SPEC.md 和现有测试文件。运行 python -m pytest -q，失败时自动修复并重测，"
+    "完成独立验证、Review、Apply 和写回后只读复测。"
+)
+
+
 PERSISTED_CODING_REQUESTS = (
     (
         "请严格按照 SPEC.md 修复当前项目 order_total.py 中的 c"
@@ -118,6 +125,7 @@ def test_test_discussion_is_not_a_write_request(text):
 
 
 @pytest.mark.parametrize("request_text", [
+    pytest.param(ORDER_TOTAL_REQUEST, id="order-total-single-line"),
     PERSISTED_CODING_REQUESTS[0],
     PERSISTED_CODING_REQUESTS[1],
 
@@ -447,3 +455,44 @@ async def test_conflicting_multiline_coding_reports_reason_without_tool_agent(
     assert reply.metadata.get("reason") == "conflicting_constraints"
     agent.run.assert_not_awaited()
     assert not tasks
+
+
+@pytest.mark.parametrize("instruction", [
+    ORDER_TOTAL_REQUEST,
+    ORDER_TOTAL_REQUEST.replace("。运行", "。\n运行"),
+    "修复 app.py，不修改 SPEC.md。",
+    "修复 app.py，不修改 tests/。",
+    "修复 app.py，保留现有测试原样，不修改其他文件。",
+    "修复 app.py，运行测试，写回后只读复测。",
+])
+def test_coding_request_keeps_local_constraints(instruction):
+    from Sprout.intents import WriteIntentDisposition, write_intent_disposition
+
+    assert write_intent_disposition(instruction) is WriteIntentDisposition.EXPLICIT_WRITE
+    assert detect_task_hint(instruction)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(("instruction", "coding"), [
+    (ORDER_TOTAL_REQUEST, True),
+    ("修复 app.py，不修改 README.md。", True),
+    ("修改 src/auth.ts，不修改 tests/。运行测试，完成验收及写回后只读复测。", True),
+    ("修复 cmd/server.go。\n不修改 internal/auth.go。\n运行测试。", True),
+    ("只读分析 src/auth.ts 和 package.json。", False),
+    ("修复 cmd/server.go，取消本次任务，不要执行。", False),
+    ("怎么修改 internal/auth.go 才能处理空令牌？", False),
+    ('引用："修改 src/auth.ts"，请解释。', False),
+    ('{"example":"修复 cmd/server.go"}', False),
+    ("只读分析 app.py，不修改任何文件。", False),
+    ("修复 app.py，取消本次任务，不要执行。", False),
+    ("讨论如何修改 app.py。", False),
+    ('"修复 app.py"，这是引用。', False),
+    ('{"instruction":"修复 app.py"}', False),
+])
+async def test_single_line_coding_dispatch(clarification_runtime, instruction, coding, stream):
+    runtime, tasks, _, agent = clarification_runtime
+    reply = await deliver(runtime, instruction, stream=stream, channel="cli")
+    assert bool(reply.metadata.get("workspace_consent_required")) is coding
+    assert not tasks
+    if coding:
+        agent.run.assert_not_awaited()

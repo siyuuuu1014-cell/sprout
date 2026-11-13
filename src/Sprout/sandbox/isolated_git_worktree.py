@@ -51,6 +51,23 @@ class IsolatedGitWorktreeSandbox(GitWorktreeSandbox):
             raise ValueError("Worktree common directory mismatch")
         return root, gitdir
 
+    async def review_patch(self, ref, revision, *, tracked, added):
+        from Sprout.workspace.authorized_content import relative_label
+
+        tracked = tuple(relative_label(path) for path in tracked)
+        added = tuple(relative_label(path) for path in added)
+        if not tracked and not added:
+            raise ValueError("Review requires explicit paths")
+        base = ("git", "-C", str(ref.root), "diff", "--no-ext-diff", "--binary")
+        patches = []
+        if tracked:
+            patches.append(await self._run(
+                *base, revision, "--", *(":(literal)" + path for path in tracked),
+            ))
+        for path in added:
+            patches.append(await self._run(*base, "--no-index", "--", "/dev/null", path))
+        return "".join(patch.rstrip("\n") + "\n" for patch in patches if patch)
+
     async def _run(self, *args):
         if args[:1] != ("git",) or "-C" not in args:
             raise ValueError("Scoped Git management command required")
@@ -112,6 +129,7 @@ class IsolatedGitWorktreeSandbox(GitWorktreeSandbox):
                 parts.insert(index + 2, "--no-textconv")
             code, stdout, _ = await run_capture(str(executable), *git_args(*pins, *parts),
                                                    env=environment, timeout=30)
-            if code != 0:
+            difference = operation == "diff" and "--no-index" in args[index + 3:]
+            if code != 0 and not (difference and code == 1):
                 raise RuntimeError("Isolated Git management failed")
             return stdout

@@ -9,7 +9,7 @@ from Sprout.evolution.regression_spec import frozen
 from Sprout.evolution.replay_plan import verify_plan
 from Sprout.execution.acceptance import acceptance_demo_path, acceptance_test_path
 from Sprout.execution.coding_container import CodingCommand, coding_node_directory_name
-from Sprout.execution.function_verification import judge_actual
+from Sprout.execution.function_verification import judge_case
 from Sprout.execution.git_transaction_contract import fingerprint
 from Sprout.execution.isolated_auxiliary_evidence import inspect_auxiliary_evidence
 from Sprout.execution.isolated_case_contract import case_command, planned_cases
@@ -106,7 +106,7 @@ async def _inspect(metadata, task_id, node_id, planner, git_plan):
                           read_only_input=True)
         process, observation = await inspect_coding_process(
             metadata, request=request, node=node, slot=slot, baseline=manifest)
-        if judge_actual(process, case.expected_output)["passed"] is not True:
+        if judge_case(process, case)["passed"] is not True:
             raise ValueError("case_actual_does_not_match:" + slot)
         observed.append(observation)
     auxiliary = await inspect_auxiliary_evidence(metadata, context=context, node=node,

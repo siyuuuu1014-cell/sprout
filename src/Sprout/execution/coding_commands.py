@@ -9,9 +9,9 @@ from pathlib import Path
 from Sprout.evolution.coding_assembly import build_coding_session_factory, coding_task_binding
 from Sprout.execution.coding_backend import _coding_capability
 from Sprout.execution.docker_verification import safe_path
-from Sprout.security.approval import ApprovalStatus
 from Sprout.execution.models import SandboxRef
 from Sprout.orchestration.models import NodeStatus, NodeType
+from Sprout.security.approval import ApprovalStatus
 from Sprout.task.models import TaskStatus
 
 
@@ -22,11 +22,11 @@ class PlanBoundCodingCommands:
     files were imported or that acceptance/regression/growth validation passed.
     """
 
-    def __init__(self, runtime, task):
+    def __init__(self, runtime, task, *, factory=None):
         self._metadata = runtime.storage.metadata
         self._approvals = getattr(runtime, "approvals", None)
         self._binding = coding_task_binding(task)
-        self._factory = build_coding_session_factory(runtime, task)
+        self._factory = factory or build_coding_session_factory(runtime, task)
 
     async def approval(self, manager, *, task, node):
         current = await self._metadata.get_task(task.id)
@@ -35,6 +35,9 @@ class PlanBoundCodingCommands:
                 or coding_task_binding(task) != self._binding):
             raise PermissionError("Persisted live coding task required")
         await self._require_owner(task, node)
+        foreground = getattr(self, "foreground_git", None)
+        if foreground is not None:
+            return await foreground.approval(manager, task=current, node=node)
         return await manager.coding_task_capability(current, self._binding)
 
     async def _require_owner(self, task, node):

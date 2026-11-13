@@ -8,7 +8,7 @@ from uuid import NAMESPACE_URL, uuid5
 
 from Sprout.execution.file_access import ConditionalWriteRefused
 from Sprout.execution.file_snapshot import ResourceIdentity
-from Sprout.execution.filesystem_review import render_review
+from Sprout.execution.filesystem_review import render_review, verification_manifest
 from Sprout.execution.git_transaction_contract import fingerprint
 from Sprout.execution.host_acceptance import pin_execution_directory
 from Sprout.sandbox.filesystem import capture_snapshot, checked_label
@@ -25,7 +25,8 @@ def withheld(reason, transaction=None, *, uncertain=False):
             "transaction_id": transaction, "filesystem_prewrite": not uncertain}
 
 
-async def _request_approval(experiment, task, arguments, identity, *, review_text=""):
+async def _request_approval(experiment, task, arguments, identity, *, review_text="",
+                            tool="filesystem.apply"):
     """Request a single-use approval for the exact prepared file plan."""
     runtime = experiment.runtime
     manager = runtime.approvals
@@ -37,23 +38,24 @@ async def _request_approval(experiment, task, arguments, identity, *, review_tex
                 or mode.principal != task.actor):
             raise PermissionError("filesystem_apply_diagnostic_subject_changed")
         approval = await ApprovalManager.request(
-            manager, "filesystem.apply", arguments, request_approval=False,
+            manager, tool, arguments, request_approval=False,
             ttl_seconds=60, **identity)
         mode.records.add(approval.id)
         approved = True
     else:
         automatic = getattr(experiment, "automatic", False)
         approval = await manager.request(
-            "filesystem.apply", arguments, request_approval=not automatic, **identity)
+            tool, arguments, request_approval=not automatic, **identity)
         approved = automatic or await experiment.confirm_apply(arguments, review_text)
     result = await manager.decide(
         approval.id, approved, principal=task.actor, decided_by=task.actor.user_id, channel="cli",
-        reason="Foreground Filesystem exact Apply plan" if getattr(experiment, "automatic", False)
+        reason=("Foreground Filesystem exact Apply plan" if tool == "filesystem.apply"
+                else "Foreground Git exact Apply plan") if getattr(experiment, "automatic", False)
         else None,
     )
     if (getattr(experiment, "automatic", False) and not isinstance(manager, DiagnosticApprovals)
             and result.status is ApprovalStatus.APPROVED):
-        report(runtime, "Approval", "AUTO-APPROVED: filesystem.apply")
+        report(runtime, "Approval", f"AUTO-APPROVED: {tool}")
     return result
 
 
@@ -84,6 +86,8 @@ async def execute(experiment, evidence, payload):
         return withheld("filesystem_apply_reconciliation_required", transaction,
                         uncertain=old["phase"] in {"WRITE_STARTED", "PARTIAL", "UNKNOWN"})
 
+    bundle = task.metadata.get("filesystem_acceptance_v1")
+    post_test = bundle is not None
     scope = task.delegation_scope.bind_paths(str(workspace.root))
     versions = dict(payload["sources"])
     requests, changes, files = {}, {}, []
@@ -114,6 +118,8 @@ async def execute(experiment, evidence, payload):
     plan = {"version": 1, "files": files}
     arguments = {"action": "filesystem.apply", "task": task.id, "workspace": workspace.id,
                  "changeset": digest, "transaction": transaction, "files": files}
+    if post_test:
+        arguments["post_apply_bundle_sha256"] = bundle["bundle_sha256"]
     identity = dict(task_id=task.id, requested_by=task.actor.user_id, source=task.source,
                     session_id=session_id, resource_scope=transaction)
     authorize = experiment._authorize_source(task, workspace)
@@ -122,15 +128,17 @@ async def execute(experiment, evidence, payload):
         if list(pin.identity) != list(payload["workspace_identity"]):
             return withheld("filesystem_apply_workspace_changed")
 
-        def check_source(label, expected):
+        def capture(label, limit=256 * 1024):
             target = workspace.root / label
 
             def check():
                 pin.check()
                 authorize(target)
 
-            snapshot = capture_snapshot(workspace.root, target, check,
-                                        limit=0 if expected is None else 256 * 1024)
+            return capture_snapshot(workspace.root, target, check, limit=limit)
+
+        def check_source(label, expected):
+            snapshot = capture(label, limit=0 if expected is None else 256 * 1024)
             if expected is None:
                 return snapshot.reason == "snapshot_not_found"
             return (snapshot.ok and snapshot.digest == expected["sha256"]
@@ -151,11 +159,39 @@ async def execute(experiment, evidence, payload):
                   "owner": frame.guard_owner, "target": str(workspace.root),
                   "principal": asdict(task.actor), "plan": plan, "plan_sha256": fingerprint(plan),
                   "session_id": session_id, "approval_id": approval.id}
+        if post_test:
+            record.update(bundle_sha256=bundle["bundle_sha256"],
+                          manifest=verification_manifest(payload), post_apply_required=True)
         if not await store.claim_apply_transaction(record, digest):
             return withheld("filesystem_apply_claim_refused", transaction)
         report(runtime, "Apply", f"transaction {transaction}: claimed")
 
-        pending = None
+        pending, verification, written = None, None, {}
+
+        async def write(label, identity, expected, data, *, undo=False):
+            async def resolve():
+                await runtime._project_analysis_subject(frame)
+                pin.check()
+                row = await store.get_apply_transaction(transaction)
+                grant = await manager.store.get_approval(approval.id)
+                state = "WRITTEN" if undo else "WRITE_STARTED"
+                if (row is None or row["physical_state"] != "active"
+                        or row["record"]["owner"] != frame.guard_owner
+                        or row["files"][label]["status"] != state
+                        or grant is None or grant.status is not ApprovalStatus.CONSUMED
+                        or (not undo and grant.expires_at is not None
+                            and grant.expires_at <= datetime.now(UTC))
+                        or grant.arguments_fingerprint != manager.fingerprint(arguments)):
+                    raise PermissionError("filesystem_apply_permit_changed")
+                return requests[label], workspace, label, identity, expected, data
+
+            permit = object()
+            runtime._filesystem_apply_permits[permit] = resolve
+            try:
+                return await broker._conditional_apply_write(permit)
+            finally:
+                runtime._filesystem_apply_permits.pop(permit, None)
+
         try:
             if not await manager.is_approved("filesystem.apply", arguments, **identity):
                 await store.update_apply_transaction(
@@ -178,29 +214,15 @@ async def execute(experiment, evidence, payload):
                     raise RuntimeError("filesystem_apply_write_start_refused")
                 pending = label
 
-                async def resolve(label=label, item=item):
-                    await runtime._project_analysis_subject(frame)
-                    pin.check()
-                    row = await store.get_apply_transaction(transaction)
-                    grant = await manager.store.get_approval(approval.id)
-                    if (row is None or row["physical_state"] != "active"
-                            or row["record"]["owner"] != frame.guard_owner
-                            or row["files"][label]["status"] != "WRITE_STARTED"
-                            or grant is None or grant.status is not ApprovalStatus.CONSUMED
-                            or (grant.expires_at is not None
-                                and grant.expires_at <= datetime.now(UTC))
-                            or grant.arguments_fingerprint != manager.fingerprint(arguments)):
-                        raise PermissionError("filesystem_apply_permit_changed")
-                    before = ResourceIdentity(**item["identity"]) if item["identity"] else None
-                    return (requests[label], workspace, label, before, item["before"],
-                            changes[label]["after"]["content"].encode("utf-8"))
-
-                permit = object()
-                runtime._filesystem_apply_permits[permit] = resolve
-                try:
-                    result = await broker._conditional_apply_write(permit)
-                finally:
-                    runtime._filesystem_apply_permits.pop(permit, None)
+                expected_identity = (ResourceIdentity(**item["identity"])
+                                     if item["identity"] else None)
+                result = await write(label, expected_identity, item["before"],
+                                     changes[label]["after"]["content"].encode("utf-8"))
+                if post_test:
+                    observed = capture(label)
+                    if not observed.ok or observed.digest != item["after"]:
+                        raise OSError("filesystem_apply_readback_changed")
+                    written[label] = observed
                 if not await store.update_apply_transaction(
                     transaction, frame.guard_owner,
                     outcome={"path": label, "status": "WRITTEN", "after": result["sha256"]},
@@ -212,10 +234,20 @@ async def execute(experiment, evidence, payload):
                 versions.pop(label)
                 operation = "updated" if item["identity"] else "created"
                 report(runtime, "Apply", f"file {operation} and verified: {label}")
-            if not await store.update_apply_transaction(transaction, frame.guard_owner):
+            if post_test:
+                verification = await experiment.verify_after_apply(
+                    task, frame.node, record["manifest"], capture,
+                )
+                if verification.get("verified") is not True:
+                    raise ValueError("filesystem_post_apply_verification_failed")
+            if not await store.update_apply_transaction(
+                    transaction, frame.guard_owner,
+                    **({"verification": verification} if post_test else {}),
+            ):
                 raise OSError("filesystem_apply_settlement_unconfirmed")
             report(runtime, "Apply", f"verified {len(files)} file(s)")
-            return {"applied": True, "transaction_id": transaction, "files": len(files)}
+            return {"applied": True, "transaction_id": transaction, "files": len(files),
+                    **({"verification": verification} if post_test else {})}
         except BaseException as exc:
             reason = f"{type(exc).__name__}:{str(exc)[:160]}"
             try:
@@ -225,6 +257,24 @@ async def execute(experiment, evidence, payload):
                         transaction, frame.guard_owner,
                         outcome={"path": pending, "status": status, "after": None},
                         reason=reason))
+                if (post_test and pending is None and written
+                        and all(changes[label]["before"] is not None for label in written)):
+                    restored = {}
+                    for label, observed in reversed(tuple(written.items())):
+                        before = changes[label]["before"]
+                        await write(label, observed.identity, observed.digest,
+                                    before["content"].encode("utf-8"), undo=True)
+                        actual = capture(label)
+                        if not actual.ok or actual.digest != before["sha256"]:
+                            raise OSError("filesystem_apply_rollback_unconfirmed")
+                        restored[label] = actual.digest
+                    settled = await store.update_apply_transaction(
+                        transaction, frame.guard_owner, reason=reason,
+                        verification=verification, restored=restored,
+                    )
+                    if settled and isinstance(exc, Exception):
+                        return {"applied": False, "filesystem_apply_failed": True,
+                                "error": reason, "transaction_id": transaction}
                 await asyncio.shield(store.update_apply_transaction(
                     transaction, frame.guard_owner, reason=reason))
             except Exception:

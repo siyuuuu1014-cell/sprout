@@ -18,6 +18,43 @@ class AcceptanceCase:
     category: str = "normal"
 
 
+# Exact builtin types. The worker never resolves types from model-supplied import paths.
+ACCEPTANCE_EXCEPTIONS = frozenset({
+    "ValueError", "TypeError", "KeyError", "IndexError", "ZeroDivisionError",
+    "OverflowError", "RuntimeError", "AssertionError",
+})
+
+
+@dataclass(frozen=True, slots=True)
+class ExtendedAcceptanceCase(AcceptanceCase):
+    iterable_args: tuple[tuple[int | str, str], ...] = ()
+    expected_exception: str | None = None
+
+
+def _iterable_args(raw, args, kwargs):
+    if not isinstance(raw, list):
+        raise ValueError("Iterable arguments must be an array of descriptors")
+    descriptors = {}
+    for item in raw:
+        if not isinstance(item, dict) or item.keys() != {"argument", "kind"}:
+            raise ValueError("Iterable descriptor needs argument and kind")
+        argument, kind = item["argument"], item["kind"]
+        if type(argument) is int and 0 <= argument < len(args):
+            value = args[argument]
+        elif type(argument) is str and argument in kwargs:
+            value = kwargs[argument]
+        else:
+            raise ValueError("Iterable argument is absent")
+        if not isinstance(value, list):
+            raise ValueError("Iterable argument must reference a JSON array, not an element")
+        if kind not in ("generator", "iterator"):
+            raise ValueError("Iterable kind must be generator or iterator")
+        if argument in descriptors:
+            raise ValueError("Iterable argument descriptor must be unique")
+        descriptors[argument] = kind
+    return tuple(descriptors.items())
+
+
 @dataclass(frozen=True, slots=True)
 class AcceptanceSpec:
     cases: tuple[AcceptanceCase, ...]
@@ -27,6 +64,9 @@ class AcceptanceSpec:
     def from_payload(cls, payload: object) -> AcceptanceSpec:
         if not isinstance(payload, dict) or not isinstance(payload.get("cases"), list):
             raise ValueError("Acceptance design must contain a cases array")
+        version = payload.get("version")
+        if "version" in payload and (type(version) is not int or version not in (1, 2)):
+            raise ValueError("Unsupported acceptance version")
         cases = []
         ids = set()
         for item in payload["cases"]:
@@ -42,8 +82,13 @@ class AcceptanceSpec:
                 r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*:[A-Za-z_]\w*", target,
             ):
                 raise ValueError("Acceptance target must be an importable module:function")
-            if "expected_output" not in item:
-                raise ValueError(f"Case {case_id} needs an explicit expected_output")
+            if ("expected_output" in item) == ("expected_exception" in item):
+                raise ValueError(f"Case {case_id} needs exactly one expected outcome")
+            exception = item.get("expected_exception")
+            if "expected_exception" in item and (
+                not isinstance(exception, str) or exception not in ACCEPTANCE_EXCEPTIONS
+            ):
+                raise ValueError("Unsupported expected exception type")
             args = item.get("args", [])
             kwargs = item.get("kwargs", {})
             if not isinstance(args, list) or not isinstance(kwargs, dict):
@@ -52,21 +97,44 @@ class AcceptanceSpec:
             if category not in {"normal", "boundary", "invalid"}:
                 raise ValueError("Unknown acceptance case category")
             ids.add(case_id)
-            cases.append(AcceptanceCase(
-                case_id, target, tuple(args), kwargs, item["expected_output"], category,
-            ))
+            iterable_args = _iterable_args(item.get("iterable_args", []), args, kwargs)
+            if iterable_args or exception:
+                if version == 1:
+                    raise ValueError("Extended cases require acceptance version 2")
+                version = 2
+                cases.append(ExtendedAcceptanceCase(
+                    case_id, target, tuple(args), kwargs, item.get("expected_output"),
+                    category, iterable_args, exception,
+                ))
+            else:
+                cases.append(AcceptanceCase(
+                    case_id, target, tuple(args), kwargs, item["expected_output"], category,
+                ))
         if not cases:
             raise ValueError("At least one concrete acceptance case is required")
         if len(cases) > 30:
             raise ValueError("Acceptance design is limited to 30 cases")
         # Reject non-JSON inputs, including NaN, before generating executable tests.
         json.dumps(payload, allow_nan=False)
-        return cls(tuple(cases))
+        return cls(tuple(cases), version or 1)
 
     def to_payload(self) -> dict[str, object]:
-        return {"version": self.version, "cases": [
-            {**asdict(case), "args": list(case.args)} for case in self.cases
-        ]}
+        cases = []
+        for case in self.cases:
+            payload = {**asdict(case), "args": list(case.args)}
+            if isinstance(case, ExtendedAcceptanceCase):
+                payload.pop("iterable_args")
+                payload.pop("expected_exception")
+                if case.iterable_args:
+                    payload["iterable_args"] = [
+                        {"argument": argument, "kind": kind}
+                        for argument, kind in case.iterable_args
+                    ]
+                if case.expected_exception is not None:
+                    payload.pop("expected_output")
+                    payload["expected_exception"] = case.expected_exception
+            cases.append(payload)
+        return {"version": self.version, "cases": cases}
 
 
 def acceptance_prompt(instruction: str) -> str:

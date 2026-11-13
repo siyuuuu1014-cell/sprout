@@ -1,11 +1,14 @@
 """Local filesystem Task assembly over existing guarded nodes and coding backend."""
 
 import asyncio
+import json
 from dataclasses import replace
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
+from Sprout.execution.acceptance_producer import check_preparation
 from Sprout.execution.coding_backend import _CODING_PROCESS, _coding_capability
+from Sprout.execution.coding_command_tool import IsolatedCodingCommandTool
 from Sprout.execution.coding_session import CodingNodeSession
 from Sprout.execution.filesystem_review import (
     capture_changes,
@@ -14,6 +17,7 @@ from Sprout.execution.filesystem_review import (
 )
 from Sprout.execution.host_acceptance import pin_execution_directory
 from Sprout.execution.isolated_acceptance import verify_isolated_cases
+from Sprout.execution.isolated_auxiliary import run_auxiliary_checks
 from Sprout.orchestration.models import (
     ExecutionGraph,
     ExecutionNode,
@@ -25,7 +29,7 @@ from Sprout.orchestration.service import SequentialOrchestrator
 from Sprout.sandbox.filesystem import FilesystemSandbox, capture_snapshot
 from Sprout.security.access import AccessDecision, ActionRequest, ActionType
 from Sprout.security.approval import ApprovalStatus
-from Sprout.security.local_diagnostics import report
+from Sprout.security.local_diagnostics import coding_approval, report
 from Sprout.task.models import TaskStatus
 from Sprout.tools.context_keys import _current_project_node
 from Sprout.workspace.classifier import classify
@@ -58,7 +62,7 @@ class FilesystemExperiment:
             raise PermissionError("filesystem_experiment_replay_unavailable")
         nodes = []
         kinds = [NodeType.READ, NodeType.SANDBOX, NodeType.AGENT, NodeType.APPROVAL]
-        if self.verification:
+        if self.verification or "filesystem_acceptance_v1" in task.metadata:
             kinds.append(NodeType.EVALUATION)
         kinds.append(NodeType.APPLY)
         if getattr(self, "test_only", False):
@@ -75,6 +79,25 @@ class FilesystemExperiment:
                 if kind is NodeType.AGENT else {"filesystem_apply": True}
                 if kind is NodeType.APPLY else {},
             ))
+        if "filesystem_acceptance_v1" in task.metadata and not getattr(self, "test_only", False):
+            read, sandbox, agent, review, evaluation, apply = nodes
+            nodes = [read, sandbox]
+            for index in range(runtime._verify_loops()):
+                previous = nodes[-1]
+                suffix = f":{index}" if index else ""
+                agent_metadata = {**agent.metadata, "filesystem_independent_repair": True}
+                if index:
+                    agent_metadata["previous_evaluation_node_id"] = previous.id
+                coding = replace(agent, id=agent.id + suffix, dependencies=(previous.id,),
+                                 metadata=agent_metadata)
+                check = replace(
+                    evaluation, id=evaluation.id + f":candidate:{index}",
+                    dependencies=(coding.id,), metadata={"foreground_repair_round": index},
+                )
+                nodes.extend((coding, check))
+            nodes.extend((replace(review, dependencies=(nodes[-1].id,),
+                                  metadata={"filesystem_review_after_evaluation": True}),
+                          evaluation, apply))
         graph = ExecutionGraph(task_id=task.id, nodes=tuple(nodes), entry_node_ids=(nodes[0].id,))
         plan = ReadPlan(task_id=task.id, resources=tuple(
             ResourceRef(self.workspace.id, name) for name in self.reads))
@@ -113,6 +136,13 @@ class FilesystemExperiment:
         overrides = self.runtime._file_broker._classify_overrides
         authorize = self._authorize_source(task, workspace)
         ref, receipts = self.sandbox.create(self.reads, authorize, overrides=overrides)
+        if "filesystem_acceptance_v1" in task.metadata:
+            bundle = task.metadata["filesystem_acceptance_v1"]
+            check_preparation(bundle, task.instruction, task.metadata["coding_preparation_v1"])
+            if bundle["source_files"] != {
+                label: snapshot.digest for label, snapshot in self.sandbox.sources.items()
+            }:
+                raise PermissionError("filesystem_acceptance_source_changed")
         self.before = {}
         writes = self.runtime._cli_code_writes[task.id][3]
         with pin_execution_directory(workspace.root) as pin:
@@ -154,6 +184,17 @@ class FilesystemExperiment:
     async def review(self, task, node):
         current = await self._subject(task, node)
         store = self.runtime._metadata_or_raise()
+        if node.metadata.get("filesystem_review_after_evaluation"):
+            for prior in reversed(await store.list_execution_nodes(task.id)):
+                output = prior.metadata.get("output") or {}
+                if (prior.type is NodeType.EVALUATION and prior.status is NodeStatus.COMPLETED
+                        and prior.metadata.get("execution_guard", {}).get("state") == "completed"
+                        and prior.metadata.get("foreground_repair_round") is not None
+                        and output.get("verified") is True and "filesystem_review" in output):
+                    evidence = output["filesystem_review"]
+                    checked_changes(evidence, current.id, current.workspace_id)
+                    return {"filesystem_review": evidence}
+            raise PermissionError("filesystem_verified_candidate_missing")
         agent = await store.get_execution_node(node.dependencies[0])
         guard = agent.metadata.get("execution_guard", {}) if agent else {}
         if (agent is None or agent.task_id != current.id or agent.type is not NodeType.AGENT
@@ -188,7 +229,8 @@ class FilesystemExperiment:
                 command["import"] = {"id": import_id, "signature": imported["signature"],
                                      "status": imported["state"],
                                      "changed_paths": import_result.get("changed_paths", [])}
-        if execution is None and "run_tests" in plan.get("execution", ()):
+        if (execution is None and "run_tests" in plan.get("execution", ())
+                and node.metadata.get("foreground_repair_round") is None):
             raise PermissionError("filesystem_requested_test_command_missing")
         report(self.runtime, "ChangeSet", "capturing...")
         review = capture_changes(
@@ -201,19 +243,38 @@ class FilesystemExperiment:
     async def verify(self, task, node):
         current = await self._subject(task, node)
         store = self.runtime._metadata_or_raise()
-        review = await store.get_execution_node(node.dependencies[0])
-        if (review is None or review.task_id != task.id or review.type is not NodeType.APPROVAL
-                or review.status is not NodeStatus.COMPLETED
-                or review.metadata.get("execution_guard", {}).get("state") != "completed"):
-            raise PermissionError("filesystem_verification_review_unavailable")
-        evidence = review.metadata["output"]["filesystem_review"]
+        round_index = node.metadata.get("foreground_repair_round")
+        if round_index is not None:
+            # Use the same identity representation before and after SQLite persistence.
+            evidence = json.loads(json.dumps((await self.review(task, node))["filesystem_review"]))
+        else:
+            review = await store.get_execution_node(node.dependencies[0])
+            if (review is None or review.task_id != task.id or review.type is not NodeType.APPROVAL
+                    or review.status is not NodeStatus.COMPLETED
+                    or review.metadata.get("execution_guard", {}).get("state") != "completed"):
+                raise PermissionError("filesystem_verification_review_unavailable")
+            evidence = review.metadata["output"]["filesystem_review"]
         payload = checked_changes(evidence, current.id, current.workspace_id)
         count = len(payload["changes"])
         report(self.runtime, "ChangeSet", f"captured: {count} file(s)")
-        report(self.runtime, "Review", f"completed: {count} file(s)")
-        if payload["conflicts"] or not payload["changes"]:
+        if round_index is None:
+            report(self.runtime, "Review", f"completed: {count} file(s)")
+        if payload["conflicts"] or (round_index is None and not payload["changes"]):
             return {"status": "not_run", "verified": False}
-        frozen = self.verification
+        if "filesystem_acceptance_v1" in current.metadata:
+            bundle = current.metadata["filesystem_acceptance_v1"]
+            acceptance, regression = check_preparation(
+                bundle, current.instruction, current.metadata["coding_preparation_v1"],
+            )
+            specs = {"acceptance": acceptance.to_payload(), "regression": regression.to_payload()}
+            specification = {
+                "source": "producer-v1",
+                **{key: bundle[key] for key in ("bundle_sha256", "test_sha256", "demo_sha256")},
+            }
+        else:
+            specs = self.verification["specs"]
+            specification = {key: value for key, value in self.verification.items()
+                             if key != "specs"}
         session = CodingNodeSession(
             store, self, self.runtime._file_broker, evidence=self.evidence,
             original=self.workspace.root, image=self.image, oracle_paths=(".git",),
@@ -230,13 +291,37 @@ class FilesystemExperiment:
             return grant.status is ApprovalStatus.APPROVED
 
         report(self.runtime, "Verification", "started")
-        with _coding_capability(check):
+        auxiliary = None
+        tool = IsolatedCodingCommandTool(
+            self, task=current, node=node, sandbox=self.sandbox.ref, filesystem_root_only=True,
+        )
+        with (coding_approval(self.runtime.approvals, tool, _current_project_node()),
+              _coding_capability(check)):
+            if round_index is not None:
+                host_test = current.metadata["filesystem_plan_v1"].get("host_test")
+                argv = tuple(host_test["argv"]) if host_test else ("python", "-m", "pytest", "-q")
+                if argv not in {("python", "-m", "pytest", "-q"),
+                                ("python", "-m", "unittest", "-q")}:
+                    raise PermissionError("filesystem_test_plan_changed")
+                auxiliary = await run_auxiliary_checks(
+                    store, self, context=context, node=node, commands=(("test", argv),),
+                )
+                if auxiliary.get("waiting"):
+                    return auxiliary
             result = await verify_isolated_cases(
                 store, self, context=context, node=node,
-                acceptance_spec=frozen["specs"]["acceptance"],
-                regression_spec=frozen["specs"]["regression"],
+                acceptance_spec=specs["acceptance"], regression_spec=specs["regression"],
                 expected_manifest=manifest,
             )
+        cases = result.get("results", [])
+        if auxiliary and not result.get("waiting"):
+            result = {**result, "results": cases + auxiliary["results"],
+                      "test_results": result["test_results"] + auxiliary["test_results"]}
+            if not auxiliary["verified"]:
+                result.update(status="failed", verified=False)
+        if (specification["source"] == "producer-v1" and not result.get("waiting")
+                and result.get("demo_hash") != specification["demo_sha256"]):
+            raise PermissionError("filesystem_acceptance_demo_changed")
         return {
             "status": result.get("status", "incomplete"),
             "verified": result.get("verified") is True,
@@ -248,10 +333,43 @@ class FilesystemExperiment:
             "changeset_sha256": evidence["fingerprint"],
             "input_manifest": manifest,
             "image": self.image,
-            "specification": {key: value for key, value in frozen.items() if key != "specs"},
+            "specification": specification,
+            "cases": cases,
+            **({"filesystem_review": evidence, "results": result.get("results", []),
+                "repair": {"round": round_index, "task_id": task.id, "node_id": node.id,
+                           "bundle_sha256": specification["bundle_sha256"],
+                           "changed_files": [change["path"] for change in payload["changes"]],
+                           "candidate_manifest": manifest}}
+               if round_index is not None else {}),
             **({key: result[key] for key in ("waiting", "waiting_kind", "pending_approvals")
                 if key in result} if result.get("waiting") else {}),
         }
+
+    async def verify_after_apply(self, task, node, expected, capture):
+        from Sprout.execution.post_apply_verification import verify_written_candidate
+
+        current = await self._subject(task, node)
+        bundle = current.metadata["filesystem_acceptance_v1"]
+        acceptance, regression = check_preparation(
+            bundle, current.instruction, current.metadata["coding_preparation_v1"],
+        )
+        session = CodingNodeSession(
+            self.runtime._metadata_or_raise(), self, self.runtime._file_broker,
+            evidence=self.evidence, original=self.workspace.root, image=self.image,
+            oracle_paths=(".git",), sandbox=self.sandbox.ref, task=current, node=node,
+        )
+
+        async def check(manager, actor, workspace, source):
+            if (actor, workspace, source) != (current.actor, current.workspace_id, current.source):
+                return False
+            grant = await self.approval(manager, task=current, node=node)
+            return grant.status is ApprovalStatus.APPROVED
+
+        with _coding_capability(check):
+            return await verify_written_candidate(
+                self.runtime, session, expected, capture, acceptance=acceptance.to_payload(),
+                regression=regression.to_payload(), bundle_sha256=bundle["bundle_sha256"],
+            )
 
     async def _subject(self, task, node):
         scope = _current_project_node()

@@ -22,20 +22,29 @@ def _parts(value):
 
 
 class IsolatedModelPathGuard:
-    def __init__(self, sandbox, task):
-        payload = verify_plan(task.metadata.get("replay_plan"))
-        if payload["schema_version"] != 5 or payload["execution_mode"] != "code":
-            raise ValueError("V5 coding plan required for model tools")
+    def __init__(self, sandbox, task, *, planned_paths=None):
         self.root = sandbox.root.resolve()
         self.sandbox = sandbox
-        paths = (*payload["oracle_paths"], acceptance_test_path(task.id),
-                 acceptance_demo_path(task.id), acceptance_test_path(payload["source_task_id"]),
-                 acceptance_demo_path(payload["source_task_id"]))
-        self.protected = tuple(_parts(path) for path in paths)
+        paths = ()
+        self.selected = None
+        if planned_paths is None:
+            payload = verify_plan(task.metadata.get("replay_plan"))
+            if payload["schema_version"] != 5 or payload["execution_mode"] != "code":
+                raise ValueError("V5 coding plan required for model tools")
+            paths = (*payload["oracle_paths"], acceptance_test_path(payload["source_task_id"]),
+                     acceptance_demo_path(payload["source_task_id"]))
+        else:
+            self.selected = tuple(_parts(path) for path in planned_paths)
+        self.protected = tuple(_parts(path) for path in (
+            *paths, acceptance_test_path(task.id), acceptance_demo_path(task.id),
+        ))
 
     def allows(self, name):
         try:
             parts = _parts(name)
+            if self.selected is not None and not any(
+                    parts == path[:len(parts)] for path in self.selected):
+                return False
             if any(part in EXCLUDED for part in parts):
                 return False
             if any(parts[:len(prefix)] == prefix for prefix in self.protected):

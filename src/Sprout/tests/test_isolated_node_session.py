@@ -18,6 +18,7 @@ def executor(tmp_path, *, factory=None):
     instance._metadata = SimpleNamespace(list_execution_nodes=AsyncMock(return_value=[sandbox]))
     instance._isolated_coding_required = True
     instance._coding_session_factory = factory
+    instance._foreground_git = None
     instance._process_broker = SimpleNamespace(run=AsyncMock())
     instance._static_check_commands = AsyncMock(side_effect=AssertionError("No host Git checks"))
     return instance
@@ -48,7 +49,10 @@ async def test_required_auxiliary_checks_are_not_silently_omitted(tmp_path, key)
 
 
 @pytest.mark.parametrize("auxiliary_passed", [None, True, False])
-async def test_session_evaluation_reuses_existing_completion_report(tmp_path, auxiliary_passed):
+@pytest.mark.parametrize("confirmed_failure", [False, True])
+async def test_session_evaluation_reuses_existing_completion_report(
+    tmp_path, auxiliary_passed, confirmed_failure, monkeypatch,
+):
     spec = AcceptanceSpec.from_payload({"cases": [
         {"id": "ok", "target": "app:run", "expected_output": 1}]}).to_payload()
     output = {"status": "passed", "waiting": False, "acceptance_spec": spec,
@@ -71,11 +75,26 @@ async def test_session_evaluation_reuses_existing_completion_report(tmp_path, au
         "acceptance_spec": spec, "isolated_design": True,
         "acceptance_fingerprint": fingerprint}}))
     instance._file_broker = SimpleNamespace(read_text=AsyncMock())
+    scope = SimpleNamespace(local_evaluation_result=None)
+    if auxiliary_passed is False:
+        instance._foreground_git = SimpleNamespace(
+            acceptance=SimpleNamespace(to_payload=lambda: spec))
+        instance._check_model_publication = AsyncMock()
+        monkeypatch.setattr("Sprout.tools.context_keys._current_project_node", lambda: scope)
+        scope.runtime = SimpleNamespace(_verification_hosts={})
+        if confirmed_failure:
+            output["results"] = [{"allowed": True, "exit_code": 0}]
+            session.verify_auxiliary.return_value["results"] = [{"allowed": True, "exit_code": 1}]
     task = Task(metadata={"acceptance_spec": spec})
     node = ExecutionNode(task_id=task.id, metadata=(
         {"build_commands": ["required"]} if auxiliary_passed is not None else {}))
     result = await instance._evaluation(node, SimpleNamespace(root=tmp_path), task)
     assert result["verification_report"]["verified"] is (auxiliary_passed is not False)
+    if auxiliary_passed is False and confirmed_failure:
+        assert scope.local_evaluation_result is result
+        instance._check_model_publication.assert_awaited_once()
+    else:
+        assert scope.local_evaluation_result is None
     if auxiliary_passed is not None:
         session.verify_auxiliary.assert_awaited_once_with(node.metadata)
     session.verify.assert_awaited_once_with(acceptance_spec=spec, regression_spec=spec,

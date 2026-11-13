@@ -20,6 +20,8 @@ def _digest(value):
 
 
 async def claim(db, record, snapshot):
+    if type(record) is dict and record.get("version") == 4:
+        return await _claim_git_review(db, record, snapshot)
     if type(record) is dict and record.get("version") == 3:
         return await _claim_filesystem(db, record, snapshot)
     keys = {"version", "id", "task_id", "workspace_id", "proposal_id", "node_id", "owner",
@@ -119,7 +121,11 @@ async def claim(db, record, snapshot):
 
 async def _claim_filesystem(db, record, snapshot):
     """Bind the shared ledger to exact settled nodes instead of a Git proposal."""
-    from Sprout.execution.filesystem_review import checked_changes, verification_status
+    from Sprout.execution.filesystem_review import (
+        checked_changes,
+        verification_manifest,
+        verification_status,
+    )
     from Sprout.orchestration.models import ExecutionNode, NodeStatus, NodeType
 
     task_id = record["task_id"]
@@ -162,9 +168,19 @@ async def _claim_filesystem(db, record, snapshot):
             or verification_status(verified, evidence, task_id, workspace_id) != "passed"):
         return False
     authority = await db.fetchone(
-        "SELECT actor_json,delegation_scope_json FROM tasks WHERE id=?", (task_id,))
+        "SELECT actor_json,delegation_scope_json,metadata_json FROM tasks WHERE id=?", (task_id,))
     if authority is None or json.loads(authority["actor_json"]) != json.loads(
             _encode(record["principal"])):
+        return False
+    metadata = json.loads(authority["metadata_json"])
+    bundle = metadata.get("filesystem_acceptance_v1")
+    post_test = bundle is not None
+    if (bool(record.get("post_apply_required")) != post_test
+            or (post_test and (record.get("manifest") != verification_manifest(payload)
+                              or record.get("bundle_sha256") != bundle["bundle_sha256"]
+                              or verification_status(
+                                  verified, evidence, task_id, workspace_id, bundle=bundle,
+                              ) != "passed"))):
         return False
     stored = {**record, "operation": "apply_v1", "changeset_sha256": snapshot,
               "authority_actor_json": authority["actor_json"],
@@ -201,6 +217,98 @@ async def _claim_filesystem(db, record, snapshot):
     ) == 1
 
 
+async def _claim_git_review(db, record, review):
+    """Use the existing Apply ledger with the settled foreground Git Review as source."""
+    task_id = record["task_id"]
+    approval_id = f"{task_id}:approval"
+    evaluation_id = review.get("evaluation_node_id")
+    settled = []
+    for node_id, kind in ((approval_id, "approval"), (evaluation_id, "evaluation")):
+        row = await db.fetchone(
+            "SELECT metadata_json FROM execution_nodes WHERE id=? AND task_id=? "
+            "AND status='completed' AND type=?", (node_id, task_id, kind),
+        )
+        if row is None:
+            return False
+        settled.append(row["metadata_json"])
+    reviewed, evaluated = map(json.loads, settled)
+    authority = await db.fetchone(
+        "SELECT actor_json,delegation_scope_json,metadata_json FROM tasks WHERE id=?", (task_id,),
+    )
+    if authority is None:
+        return False
+    metadata = json.loads(authority["metadata_json"])
+    files = record["plan"]["files"]
+    from base64 import b64decode
+
+    from Sprout.execution.node_result_source import payload_digest
+
+    if (reviewed.get("output") != review
+            or record["session_id"] != metadata.get("session_id")
+            or not set(review["files_changed"]) <= set(
+                metadata.get("coding_preparation_v1", {}).get("writes", ()))
+            or record["manifest"] != review["input_manifest"]
+            or any(value.get("execution_guard", {}).get("state") != "completed"
+                   for value in (reviewed, evaluated))
+            or (evaluated.get("output") or {}).get("verified") is not True
+            or payload_digest(evaluated["output"]) != record["verification_sha256"]
+            or record["verification_sha256"] != review["verification_sha256"]
+            or record["bundle_sha256"] != review["bundle_sha256"]
+            or record["bundle_sha256"] != metadata["host_acceptance_v2"]["bundle_sha256"]
+            or record["git_baseline"] != review["git_baseline"]
+            or record["git_baseline"] != metadata["host_acceptance_v2"]["repository"]["revision"]
+            or record["review_diff_sha256"] != hashlib.sha256(
+                review["diff"].encode("utf-8")).hexdigest()
+            or record["plan_sha256"] != fingerprint(record["plan"])
+            or [item["path"] for item in files] != review["files_changed"]
+            or not 0 < len(files) <= 64
+            or any(not _digest(item["before"]) or not _digest(item["after"])
+                   or item["before"] != metadata["git_acceptance_v1"]["source_files"].get(
+                       item["path"])
+                   or item["after"] != review["input_manifest"].get(item["path"])
+                   or relative_label(item["path"]) != item["path"]
+                   or hashlib.sha256(b64decode(item["before_data"], validate=True)).hexdigest()
+                   != item["before"] for item in files)
+            or json.loads(authority["actor_json"]) != json.loads(_encode(record["principal"]))):
+        return False
+    stored = {**record, "operation": "apply_v1",
+              "authority_actor_json": authority["actor_json"],
+              "authority_scope_json": authority["delegation_scope_json"],
+              "review_node_json": settled[0], "evaluation_node_json": settled[1],
+              "evaluation_node_id": evaluation_id}
+    initial = {"phase": "CLAIMED", "files": {}, "reason": ""}
+    return await db.execute(
+        "INSERT OR IGNORE INTO isolated_git_transactions "
+        "(id,proposal_id,workspace_id,owner,state,record_json,result_json,operation) "
+        "SELECT ?,?,?,?,'active',?,?,'apply_v1' WHERE EXISTS ("
+        "SELECT 1 FROM tasks t JOIN workspaces w ON w.id=t.workspace_id "
+        "JOIN execution_nodes a ON a.task_id=t.id "
+        "JOIN execution_nodes r ON r.task_id=t.id "
+        "JOIN execution_nodes e ON e.task_id=t.id "
+        "WHERE t.id=? AND w.id=? AND w.root=? AND t.status='running' AND t.source='cli' "
+        "AND t.actor_json=? AND t.delegation_scope_json=? AND t.metadata_json=? "
+        "AND a.id=? AND a.type='apply' AND a.status='running' "
+        "AND json_extract(a.metadata_json,'$.execution_guard.owner')=? "
+        "AND json_extract(a.metadata_json,'$.execution_guard.state')='active' "
+        "AND r.id=? AND r.status='completed' AND r.metadata_json=? "
+        "AND e.id=? AND e.status='completed' AND e.metadata_json=?)",
+        (record["id"], record["proposal_id"], record["workspace_id"], record["owner"],
+         _encode(stored), _encode(initial), task_id, record["workspace_id"], record["target"],
+         authority["actor_json"], authority["delegation_scope_json"], authority["metadata_json"],
+         record["node_id"], record["owner"], approval_id, settled[0], evaluation_id, settled[1]),
+    ) == 1
+
+
+def _requires_retest(record):
+    return record["version"] == 4 or record.get("post_apply_required") is True
+
+
+def _verified_apply(record, verification):
+    return (isinstance(verification, dict) and verification.get("verified") is True
+            and verification.get("input_manifest") == record["manifest"]
+            and verification.get("bundle_sha256") == record["bundle_sha256"])
+
+
 async def observe(db, identifier):
     row = await db.fetchone("SELECT * FROM isolated_git_transactions WHERE id=? "
                             "AND operation='apply_v1'", (identifier,))
@@ -210,7 +318,8 @@ async def observe(db, identifier):
             **json.loads(row["result_json"])}
 
 
-async def transition(db, identifier, owner, *, start=None, outcome=None, reason=""):
+async def transition(db, identifier, owner, *, start=None, outcome=None, reason="",
+                     verification=None, restored=None):
     """CAS the complete prior observation. No caller-supplied phase overrides.
 
     start identifies one planned file; outcome is its independently observed
@@ -222,6 +331,9 @@ async def transition(db, identifier, owner, *, start=None, outcome=None, reason=
     previous = {k: old[k] for k in ("phase", "files", "reason")}
     new = json.loads(_encode(previous))
     files = {x["path"]: x for x in old["record"]["plan"]["files"]}
+    requires_retest = _requires_retest(old["record"])
+    if (verification is not None or restored is not None) and not requires_retest:
+        return False
     if start is not None:
         live = await db.fetchone(
             "SELECT 1 FROM tasks t JOIN execution_nodes n ON n.task_id=t.id "
@@ -246,7 +358,7 @@ async def transition(db, identifier, owner, *, start=None, outcome=None, reason=
                 or status not in {"WRITTEN", "REJECTED", "UNKNOWN"}):
             return False
         expected = files[path]["after"] if status == "WRITTEN" else files[path]["before"]
-        rejected_v2 = status == "REJECTED" and old["record"]["version"] in {2, 3}
+        rejected_v2 = status == "REJECTED" and old["record"]["version"] in {2, 3, 4}
         if rejected_v2:
             if outcome["after"] is not None and not _digest(outcome["after"]):
                 raise ValueError("Observed refusal digest invalid")
@@ -256,19 +368,34 @@ async def transition(db, identifier, owner, *, start=None, outcome=None, reason=
         new["phase"] = "UNKNOWN" if status == "UNKNOWN" else "WRITE_STARTED"
     else:
         statuses = [x["status"] for x in new["files"].values()]
-        if "WRITE_STARTED" in statuses:
+        if restored is not None:
+            written = {path: files[path]["before"] for path, item in new["files"].items()
+                       if item["status"] == "WRITTEN"}
+            if restored != written or {"WRITE_STARTED", "UNKNOWN"}.intersection(statuses):
+                return False
+            new["phase"] = "ROLLED_BACK" if written else "FAILED"
+            new["restored"] = restored
+            if verification is not None:
+                new["verification"] = verification
+        elif "WRITE_STARTED" in statuses:
             new["phase"] = "UNKNOWN"
         elif "UNKNOWN" in statuses:
             new["phase"] = "UNKNOWN"
         elif len(statuses) == len(files) and all(x == "WRITTEN" for x in statuses):
-            new["phase"] = "COMPLETED"
+            if requires_retest and not _verified_apply(old["record"], verification):
+                new["phase"] = "PARTIAL"
+            else:
+                new["phase"] = "COMPLETED"
+                if requires_retest:
+                    new["verification"] = verification
         elif "WRITTEN" in statuses:
             new["phase"] = "PARTIAL"
         else:
             new["phase"] = "FAILED"
     new["reason"] = str(reason)[:2048]
     physical = ("uncertain" if new["phase"] in {"UNKNOWN", "PARTIAL"} else
-                "completed" if new["phase"] in {"COMPLETED", "FAILED"} else "active")
+                "completed" if new["phase"] in {"COMPLETED", "FAILED", "ROLLED_BACK"}
+                else "active")
     live_sql = ""
     live_args = ()
     if start is not None:
@@ -282,7 +409,7 @@ async def transition(db, identifier, owner, *, start=None, outcome=None, reason=
         live_args = (old["record"]["task_id"], old["record"]["node_id"],
                      old["record"]["authority_actor_json"],
                      old["record"]["authority_scope_json"], owner)
-    if start is not None and old["record"]["version"] == 3:
+    if start is not None and old["record"]["version"] in {3, 4}:
         record = old["record"]
         live_sql += (
             " AND EXISTS (SELECT 1 FROM execution_nodes r JOIN execution_nodes e "
@@ -291,7 +418,8 @@ async def transition(db, identifier, owner, *, start=None, outcome=None, reason=
             "AND r.metadata_json=? AND e.metadata_json=?)"
         )
         task_id = record["task_id"]
-        live_args += (task_id, f"{task_id}:approval", f"{task_id}:evaluation",
+        evaluation_id = record.get("evaluation_node_id", f"{task_id}:evaluation")
+        live_args += (task_id, f"{task_id}:approval", evaluation_id,
                       record["review_node_json"], record["evaluation_node_json"])
     return await db.execute(
         "UPDATE isolated_git_transactions SET result_json=?,state=? WHERE id=? AND owner=? "
@@ -332,10 +460,14 @@ async def reconcile_filesystem(db):
         "JOIN tasks t ON t.id=json_extract(g.record_json,'$.task_id') "
         "JOIN execution_nodes n ON n.id=json_extract(g.record_json,'$.node_id') "
         "AND n.task_id=t.id WHERE g.operation='apply_v1' AND g.state='completed' "
-        "AND json_extract(g.record_json,'$.version')=3 "
+        "AND json_extract(g.record_json,'$.version') IN (3,4) "
         "AND json_extract(g.result_json,'$.phase')='COMPLETED' "
         "AND g.workspace_id=t.workspace_id AND t.status='running' AND n.type='apply' "
-        "AND json_extract(t.metadata_json,'$.filesystem_experiment')=1 "
+        "AND ((json_extract(g.record_json,'$.version')=3 "
+        "AND json_extract(t.metadata_json,'$.filesystem_experiment')=1) "
+        "OR (json_extract(g.record_json,'$.version')=4 "
+        "AND json_extract(t.metadata_json,'$.host_acceptance_v2.bundle_sha256')="
+        "json_extract(g.record_json,'$.bundle_sha256'))) "
         "AND json_extract(t.metadata_json,'$.session_id')="
         "json_extract(g.record_json,'$.session_id') "
         "AND json_extract(n.metadata_json,'$.execution_guard.owner')=g.owner"
@@ -345,6 +477,9 @@ async def reconcile_filesystem(db):
         record, result = json.loads(row["record_json"]), json.loads(row["result_json"])
         plan, observed = record["plan"], result["files"]
         files = plan["files"]
+        verification = result.get("verification")
+        if _requires_retest(record) and not _verified_apply(record, verification):
+            continue
         if (not files or fingerprint(plan) != record["plan_sha256"]
                 or len(observed) != len(files) or any(
                     observed.get(item["path"]) != {
@@ -359,6 +494,8 @@ async def reconcile_filesystem(db):
             }
             metadata["output"] = {"applied": True, "transaction_id": row["id"],
                                   "files": len(files), "recovered": True}
+            if _requires_retest(record):
+                metadata["output"]["verification"] = verification
             settled = _encode(metadata)
         elif (row["node_status"] == "completed" and guard["state"] == "completed"
               and metadata.get("output", {}).get("applied") is True

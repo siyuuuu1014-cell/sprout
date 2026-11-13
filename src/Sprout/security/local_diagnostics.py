@@ -185,10 +185,14 @@ def coding_approval(manager, tool, scope):
                   and type(tool._handler) in {FilesystemExperiment, FilesystemTestRun}
                   and mode.runtime._sandbox_lifecycle.filesystem.get(scope.task.id)
                   is tool._handler and bool(tool._handler.image))
+    git = getattr(getattr(tool, "_handler", None), "foreground_git", None)
+    foreground_git = (scope is not None and git is not None and git.commands is tool._handler
+                      and git.runtime is scope.runtime and git.task.id == scope.task.id
+                      and git.owner is asyncio.current_task())
     if (not mode.active() or scope is None or scope.runtime is not mode.runtime
             or scope.task.actor != mode.principal or scope.session_id != mode.session_id
             or type(tool) is not IsolatedCodingCommandTool
-            or (not filesystem and (
+            or (not filesystem and not foreground_git and (
                 not getattr(scope.runtime, "_isolated_coding_required", False)
                 or type(tool._handler) is not PlanBoundCodingCommands
                 or tool._handler._metadata is not scope.runtime.storage.metadata))):

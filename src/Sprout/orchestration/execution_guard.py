@@ -80,6 +80,15 @@ class NodeExecutionGuard:
         failed = (not is_waiting and running.type.value == "agent"
                   and running.metadata.get("filesystem_test_loop") is True
                   and isinstance(output, dict) and output.get("filesystem_tests_failed") is True)
+        git_apply = (running.type.value == "apply"
+                     and running.metadata.get("foreground_git_apply") is True
+                     and isinstance(output, dict))
+        failed = failed or (git_apply and not is_waiting and output.get("git_apply_failed") is True)
+        failed = failed or (
+            not is_waiting and running.type.value == "apply"
+            and running.metadata.get("filesystem_apply") is True
+            and isinstance(output, dict) and output.get("filesystem_apply_failed") is True
+        )
         prewrite = (is_waiting and running.type.value == "apply"
                     and running.metadata.get("filesystem_apply") is True
                     and output.get("filesystem_prewrite") is True)

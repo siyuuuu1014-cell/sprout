@@ -1,4 +1,5 @@
 import asyncio
+import os
 from dataclasses import asdict, replace
 
 import pytest
@@ -15,7 +16,8 @@ from Sprout.workspace.models import Workspace
 
 @pytest.mark.parametrize(
     "mode", ["completed", "partial", "interrupted", "unknown", "missing_review",
-             "missing_evaluation", "cross_task", "wrong_plan", "wrong_session", "wrong_workspace"],
+             "missing_evaluation", "cross_task", "wrong_plan", "wrong_session", "wrong_workspace",
+             "retested", "retest_missing", "wrong_retest"],
 )
 async def test_filesystem_apply_ledger_claim_and_reopen(tmp_path, mode):
     root = tmp_path / "source"
@@ -23,9 +25,25 @@ async def test_filesystem_apply_ledger_claim_and_reopen(tmp_path, mode):
     (root / "app.py").write_text("before", encoding="utf-8")
     workspace = Workspace("workspace", root)
     actor = Principal("owner", authenticated=True, source="cli")
+    metadata = {"filesystem_experiment": True, "session_id": "session"}
+    if mode in {"retested", "retest_missing", "wrong_retest"}:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        from Sprout.execution.acceptance_producer import produce
+        from Sprout.tests.test_acceptance_producer import inputs
+
+        entries, producer_plan, design = inputs()
+        model = SimpleNamespace(chat=AsyncMock(
+            return_value=SimpleNamespace(text=json.dumps(design))))
+        bundle = await produce(model, "Fix double.", producer_plan, entries)
+        metadata.update(filesystem_acceptance_v1=bundle,
+                        coding_preparation_v1={"execution": []})
+    else:
+        bundle = None
     task = Task(workspace_id=workspace.id, actor=actor, source="cli",
-                status=TaskStatus.RUNNING,
-                metadata={"filesystem_experiment": True, "session_id": "session"})
+                status=TaskStatus.RUNNING, metadata=metadata)
     with FilesystemSandbox(root) as sandbox:
         ref, _ = sandbox.create(("app.py",), lambda _: None)
         before = dict(sandbox.sources)
@@ -54,6 +72,9 @@ async def test_filesystem_apply_ledger_claim_and_reopen(tmp_path, mode):
                 "owner": "guard", "verified": True, "status": "passed",
                 "changeset_sha256": digest, "input_manifest": verification_manifest(payload),
                 "test_results": [{"passed": True, "executed": True}],
+                **({"specification": {key: bundle[key] for key in (
+                    "bundle_sha256", "test_sha256", "demo_sha256",
+                )}} if bundle is not None else {}),
             }),
             (NodeType.APPLY, None),
         ):
@@ -78,6 +99,9 @@ async def test_filesystem_apply_ledger_claim_and_reopen(tmp_path, mode):
                   "node_id": f"{task.id}:apply", "owner": "guard", "target": str(root),
                   "principal": asdict(actor), "plan": plan, "plan_sha256": fingerprint(plan),
                   "session_id": "session", "approval_id": "test-reference"}
+        if bundle is not None:
+            record.update(post_apply_required=True, bundle_sha256=bundle["bundle_sha256"],
+                          manifest=verification_manifest(payload))
         if mode == "wrong_session":
             record["session_id"] = "unrelated"
         if mode == "wrong_workspace":
@@ -90,7 +114,7 @@ async def test_filesystem_apply_ledger_claim_and_reopen(tmp_path, mode):
             assert await store.get_apply_transaction("txn") is None
             return
         assert sorted(claims) == [False, True]
-        for item in plan["files"] if mode == "completed" else plan["files"][:1]:
+        for item in plan["files"] if mode == "completed" or bundle else plan["files"][:1]:
             assert await store.update_apply_transaction("txn", "guard", start=item["path"])
             if mode != "interrupted":
                 assert await store.update_apply_transaction(
@@ -99,7 +123,12 @@ async def test_filesystem_apply_ledger_claim_and_reopen(tmp_path, mode):
                              "status": "UNKNOWN" if mode == "unknown" else "WRITTEN",
                              "after": None if mode == "unknown" else item["after"]})
         if mode not in {"interrupted", "unknown"}:
-            assert await store.update_apply_transaction("txn", "guard")
+            verification = None
+            if mode in {"retested", "wrong_retest"}:
+                verification = {"verified": True, "input_manifest": record["manifest"],
+                                "bundle_sha256": record["bundle_sha256"] if mode == "retested"
+                                else "0" * 64}
+            assert await store.update_apply_transaction("txn", "guard", verification=verification)
     finally:
         store.close()
         other.close()
@@ -107,16 +136,19 @@ async def test_filesystem_apply_ledger_claim_and_reopen(tmp_path, mode):
     try:
         row = await reopened.get_apply_transaction("txn")
         assert row["phase"] == {"completed": "COMPLETED", "partial": "PARTIAL",
-                                "interrupted": "WRITE_STARTED", "unknown": "UNKNOWN"}[mode]
+                                "interrupted": "WRITE_STARTED", "unknown": "UNKNOWN",
+                                "retested": "COMPLETED", "retest_missing": "PARTIAL",
+                                "wrong_retest": "PARTIAL"}[mode]
         assert not await reopened.claim_apply_transaction({**record, "id": "duplicate"}, digest)
         assert not await reopened.update_apply_transaction("txn", "guard", start="test_app.py")
-        assert await reopened.reconcile_filesystem_apply() == (1 if mode == "completed" else 0)
+        completed = mode in {"completed", "retested"}
+        assert await reopened.reconcile_filesystem_apply() == int(completed)
         assert await reopened.reconcile_filesystem_apply() == 0
         recovered = await reopened.get_task(task.id)
         assert recovered.status is (
-            TaskStatus.COMPLETED if mode == "completed" else TaskStatus.RUNNING)
+            TaskStatus.COMPLETED if completed else TaskStatus.RUNNING)
         node = await reopened.get_execution_node(record["node_id"])
-        if mode == "completed":
+        if completed:
             assert node.status is NodeStatus.COMPLETED
             assert node.metadata["output"]["transaction_id"] == "txn"
         else:
@@ -157,3 +189,113 @@ async def test_normal_filesystem_approval_waits_for_exact_human_decision(decisio
         "filesystem.apply", arguments, **{**identity, "session_id": "other"})
     assert await manager.is_approved("filesystem.apply", arguments, **identity) is decision
     assert not await manager.is_approved("filesystem.apply", arguments, **identity)
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native FileBroker")
+async def test_filesystem_post_apply_failure_restores_original(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from Sprout.execution import filesystem_apply
+    from Sprout.execution.acceptance_producer import produce
+    from Sprout.execution.file_broker import FileBroker
+    from Sprout.security.approval import ApprovalManager
+    from Sprout.security.engine import PolicyEngine
+    from Sprout.storage.local.memory.operational import MemoryOperationalStore
+    from Sprout.task.models import DelegationScope
+    from Sprout.tests.test_acceptance_producer import inputs
+
+    root = tmp_path / "source"
+    root.mkdir()
+    target = root / "app.py"
+    target.write_bytes(b"before")
+    (root / "unrelated.txt").write_bytes(b"leave intact")
+    workspace = Workspace("workspace", root)
+    actor = Principal("owner", authenticated=True, source="cli")
+    entries, plan, design = inputs()
+    model = SimpleNamespace(chat=AsyncMock(return_value=SimpleNamespace(text=json.dumps(design))))
+    bundle = await produce(model, "Fix double.", plan, entries)
+    task = Task(
+        workspace_id=workspace.id, actor=actor, source="cli", status=TaskStatus.RUNNING,
+        delegation_scope=DelegationScope(
+            allowed_paths=("app.py",),
+            allowed_actions=frozenset({"file.read", "file.write", "file.apply"}),
+        ),
+        metadata={"filesystem_experiment": True, "session_id": "session",
+                  "filesystem_acceptance_v1": bundle},
+    )
+    manager = ApprovalManager(MemoryOperationalStore())
+    broker = FileBroker(PolicyEngine())
+    permits = {}
+
+    async def resolve(permit):
+        return await permits[permit]()
+
+    broker._apply_resolver = resolve
+    store = open_metadata_store(str(tmp_path / "metadata.db"))
+    try:
+        await store.save_workspace(workspace)
+        await store.save_task(task)
+        with FilesystemSandbox(root) as sandbox:
+            ref, _ = sandbox.create(("app.py",), lambda _: None)
+            (ref.root / "app.py").write_bytes(b"after")
+            review = capture_changes(
+                sandbox, sandbox.sources, task.id, workspace.id, lambda _: None
+            )
+            payload = review["payload"]
+        for kind, output, dependencies in (
+            (NodeType.APPROVAL, {"filesystem_review": review}, ()),
+            (NodeType.EVALUATION, {
+                "task_id": task.id, "workspace_id": workspace.id,
+                "node_id": f"{task.id}:evaluation", "owner": "guard",
+                "verified": True, "status": "passed",
+                "changeset_sha256": review["fingerprint"],
+                "input_manifest": verification_manifest(payload),
+                "test_results": [{"passed": True, "executed": True}],
+                "specification": {key: bundle[key] for key in (
+                    "bundle_sha256", "test_sha256", "demo_sha256",
+                )},
+            }, (f"{task.id}:approval",)),
+            (NodeType.APPLY, None, (f"{task.id}:evaluation",)),
+        ):
+            node = ExecutionNode(id=f"{task.id}:{kind.value}", task_id=task.id, type=kind,
+                                 dependencies=dependencies)
+            await store.save_execution_node(node)
+            assert await store.claim_execution_node(node, "guard", "")
+            active = await store.get_execution_node(node.id)
+            if output is not None:
+                settled = replace(active, status=NodeStatus.COMPLETED,
+                                  metadata={**active.metadata, "output": output})
+                assert await store.finish_execution_node(settled, "guard", "completed")
+        frame = SimpleNamespace(node=active, guard_owner="guard")
+        monkeypatch.setattr(filesystem_apply, "_current_project_node", lambda: frame)
+        runtime = SimpleNamespace(
+            _project_analysis_subject=AsyncMock(return_value=(task, workspace)),
+            _sessions=SimpleNamespace(require_owner=AsyncMock(), frozen_principal=lambda _: actor),
+            session_workspace_id=lambda _: workspace.id,
+            _metadata_or_raise=lambda: store, _file_broker=broker, approvals=manager,
+            _policy_engine=PolicyEngine(), _filesystem_apply_permits=permits,
+            _check_cli_write_target=lambda *_: None,
+        )
+
+        async def fail_retest(_task, _node, manifest, capture):
+            assert capture("app.py").data == b"after"
+            return {"verified": False, "bundle_sha256": bundle["bundle_sha256"],
+                    "input_manifest": manifest}
+
+        experiment = SimpleNamespace(
+            task=task, workspace=workspace, runtime=runtime, owner=asyncio.current_task(),
+            automatic=True, _authorize_source=lambda *_: lambda _: None,
+            verify_after_apply=fail_retest,
+        )
+        runtime._sandbox_lifecycle = SimpleNamespace(filesystem={task.id: experiment})
+        output = await filesystem_apply.execute(experiment, review, payload)
+        assert output["filesystem_apply_failed"]
+        transaction = await store.get_apply_transaction(output["transaction_id"])
+        assert transaction["phase"] == "ROLLED_BACK"
+        assert not transaction["verification"]["verified"]
+        assert target.read_bytes() == b"before"
+        assert (root / "unrelated.txt").read_bytes() == b"leave intact"
+        assert await store.reconcile_filesystem_apply() == 0
+    finally:
+        store.close()

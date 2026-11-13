@@ -80,31 +80,40 @@ class SequentialOrchestrator:
         if budget is not None and budget.max_duration_seconds > 0:
             deadline = time.monotonic() + budget.max_duration_seconds
 
-        await self._update_task_status(graph.task_id, TaskStatus.RUNNING, recorder)
-        await self._record(recorder, "task.started", graph.task_id)
+        current = await self._metadata.get_task(graph.task_id)
+        if current is not None and current.status is TaskStatus.RUNNING:
+            await self._record(recorder, "task.resumed", graph.task_id)
+        else:
+            await self._update_task_status(graph.task_id, TaskStatus.RUNNING, recorder)
+            await self._record(recorder, "task.started", graph.task_id)
 
         statuses = {node.id: node.status for node in nodes}
         nodes = list(nodes)
         index = 0
         while index < len(nodes):
             node = nodes[index]
-            if node.status in {NodeStatus.COMPLETED, NodeStatus.SKIPPED}:
+            if node.status is NodeStatus.SKIPPED:
                 index += 1
                 continue
-            if not self._dependencies_completed(node, statuses):
+            if node.status is not NodeStatus.COMPLETED and not self._dependencies_completed(
+                    node, statuses):
                 return await self._abort(
                     recorder, node, graph.task_id, "Dependencies are not completed"
                 )
 
-            if deadline is not None and time.monotonic() > deadline:
+            if (node.status is not NodeStatus.COMPLETED and deadline is not None
+                    and time.monotonic() > deadline):
                 await self._record(recorder, "task.budget_exceeded", graph.task_id)
                 return await self._abort(
                     recorder, node, graph.task_id, "Task budget exceeded (duration)"
                 )
 
-            outcome = await self._run_node(
-                node, graph.task_id, handler, recorder, resume_key=graph.dispatch_key,
-            )
+            if node.status is NodeStatus.COMPLETED:
+                outcome = NodeResult(node.id, NodeStatus.COMPLETED, node.metadata.get("output"))
+            else:
+                outcome = await self._run_node(
+                    node, graph.task_id, handler, recorder, resume_key=graph.dispatch_key,
+                )
             statuses[node.id] = outcome.status
 
             if outcome.status is NodeStatus.WAITING:
@@ -145,6 +154,14 @@ class SequentialOrchestrator:
                 and isinstance(outcome.output, dict)
                 else None
             )
+            if (node.metadata.get("foreground_repair_round") is not None
+                    and evaluation_status == "failed"
+                    and (index + 1 == len(nodes) or nodes[index + 1].type is not NodeType.AGENT)):
+                error = "foreground_repair_budget_exhausted"
+                await self._update_task_status(graph.task_id, TaskStatus.FAILED, recorder)
+                await self._record(recorder, "task.failed", graph.task_id,
+                                   {"node_id": node.id, "reason": error})
+                return TaskResult(task_id=graph.task_id, status=TaskStatus.FAILED, error=error)
             # Withheld checks cannot be repaired by rewriting code. Preserve
             # their incomplete status for the shared apply gate, never green it.
             if evaluation_status in {"passed", "not_verified", "partially_verified"}:
@@ -154,8 +171,9 @@ class SequentialOrchestrator:
                     NodeType.EVALUATION,
                 }:
                     skipped = nodes[index]
-                    statuses[skipped.id] = NodeStatus.SKIPPED
-                    await self._skip_node(skipped, graph.task_id, recorder)
+                    if statuses[skipped.id] not in {NodeStatus.COMPLETED, NodeStatus.SKIPPED}:
+                        statuses[skipped.id] = NodeStatus.SKIPPED
+                        await self._skip_node(skipped, graph.task_id, recorder)
                     index += 1
                 continue
             index += 1

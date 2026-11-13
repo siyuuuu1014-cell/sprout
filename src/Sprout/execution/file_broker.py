@@ -64,11 +64,13 @@ class FileBroker:
 
     async def enumerate_readable(
         self, sandbox=None, relative_directory=None, *, subject=None, limits=None,
+        exclude_path=None,
     ):
         """B1-bound scoped names, no approval consumption or content reads.
 
         Each visited directory and visible child needs an exact server grant.
         Revocation is checked before accesses and publication, not linearized.
+        The host may prune validated relative entries before publishing or descending.
         """
         from dataclasses import replace
 
@@ -158,6 +160,8 @@ class FileBroker:
                             or path.parent != directory
                             or any(item.relative_path == entry.relative_path for item in visible)):
                         raise PermissionError("directory_result_invalid")
+                    if exclude_path is not None and exclude_path(entry.relative_path):
+                        continue
                     if not await authorize(path):
                         continue  # No denied name, count or identity is published.
                     checked.append(path)
@@ -561,6 +565,7 @@ class FileBroker:
         path = relative_label(path)
         target = workspace.root / path
         create = identity is None and old_sha is None
+        delete = data is None
         if (type(request) is not ActionRequest or not request.actor.authenticated
                 or not request.actor.source or not request.task_id
                 or request.action not in {ActionType.FILE_WRITE, ActionType.FILE_APPLY}
@@ -569,9 +574,12 @@ class FileBroker:
                 or request.resource.kind != classify(
                     target, workspace_root=workspace.root, overrides=self._classify_overrides)
                 or (create and (request.action is not ActionType.FILE_APPLY
-                                or workspace.kind is not WorkspaceKind.LOCAL_DIRECTORY))
+                                or workspace.kind not in {
+                                    WorkspaceKind.LOCAL_DIRECTORY, WorkspaceKind.GIT_REPOSITORY}))
+                or (delete and (create or request.action is not ActionType.FILE_APPLY
+                                or workspace.kind is not WorkspaceKind.GIT_REPOSITORY))
                 or (not create and type(identity) is not ResourceIdentity)
-                or type(data) is not bytes):
+                or (not delete and type(data) is not bytes)):
             raise PermissionError("conditional_apply_subject_invalid")
         expected = (request, workspace, path, identity, old_sha, data)
         # Policy remains authoritative. SANDBOX_ONLY is not host-write authority.
@@ -589,9 +597,10 @@ class FileBroker:
         def authorize():
             from dataclasses import replace
 
+            effect = ActionType.FILE_DELETE if delete else ActionType.FILE_WRITE
             denied_write = (request.action is ActionType.FILE_APPLY and (
-                not request.scope.permits("file.write", target.as_posix())
-                or self._policy.decide(replace(request, action=ActionType.FILE_WRITE)).decision
+                not request.scope.permits(effect.value, target.as_posix())
+                or self._policy.decide(replace(request, action=effect)).decision
                 is AccessDecision.DENY))
             if (denied_write or request.scope.is_expired()
                     or not request.scope.permits(request.action.value, target.as_posix())
@@ -606,10 +615,16 @@ class FileBroker:
         if create:
             result = file_operation(
                 workspace.root, target, "conditional_create", authorize, content=data)
+        elif delete:
+            result = file_operation(workspace.root, target, "conditional_delete", authorize,
+                                    content=(identity, old_sha, authorize))
         else:
             result = file_operation(workspace.root, target, "conditional_write", authorize,
                                     content=(identity, old_sha, data, authorize))
-        if (result != {"sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}
+        observed = {"sha256": None, "size": 0} if delete else {
+            "sha256": hashlib.sha256(data).hexdigest(), "size": len(data),
+        }
+        if (result != observed
                 or await resolve(permit) != expected):
             raise PermissionError("conditional_apply_result_unconfirmed")
         return result

@@ -3,9 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 
-from Sprout.orchestration.models import ExecutionGraph, ExecutionNode, NodeBudget, NodeType
+import pytest
+
+from Sprout.orchestration.models import (
+    ExecutionGraph,
+    ExecutionNode,
+    NodeBudget,
+    NodeStatus,
+    NodeType,
+)
 from Sprout.orchestration.terminal.local import LocalOrchestratorBackend
 from Sprout.storage.local.sqlite.driver import SqliteDatabase
 from Sprout.storage.local.sqlite.metadata import SqliteMetadataStore
@@ -28,6 +37,76 @@ def test_local_orchestrator_backend_executes_graph(tmp_path: Path) -> None:
         asyncio.run(run())
     finally:
         store.close()
+
+
+def test_foreground_repair_exhaustion_stops_before_review(tmp_path: Path) -> None:
+    store = SqliteMetadataStore(SqliteDatabase(tmp_path / "metadata.db"))
+    node = ExecutionNode(task_id="task", type=NodeType.EVALUATION,
+                         metadata={"foreground_repair_round": 1})
+    review = ExecutionNode(task_id="task", type=NodeType.APPROVAL, dependencies=(node.id,))
+    graph = ExecutionGraph(task_id="task", nodes=(node, review), entry_node_ids=(node.id,))
+    called = []
+
+    async def handler(step):
+        called.append(step.id)
+        return {"status": "failed", "verified": False}
+
+    async def run():
+        await store.save_task(Task(id="task", workspace_id="fixture"))
+        result = await LocalOrchestratorBackend(store).execute(graph, handler=handler)
+        assert result.status is TaskStatus.FAILED
+        assert result.error == "foreground_repair_budget_exhausted"
+        assert called == [node.id]
+        persisted = await store.get_execution_node(node.id)
+        assert persisted.metadata["output"]["status"] == "failed"
+
+    try:
+        asyncio.run(run())
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("previous_status", ["passed", "failed"])
+async def test_foreground_repair_uses_settled_evaluation_after_reopen(
+    tmp_path: Path, previous_status: str,
+) -> None:
+    database = tmp_path / "metadata.db"
+    task = Task(id="task", workspace_id="fixture", status=TaskStatus.RUNNING)
+    first = ExecutionNode(id="first", task_id=task.id, type=NodeType.EVALUATION,
+                          metadata={"foreground_repair_round": 0})
+    repair = ExecutionNode(id="repair", task_id=task.id, type=NodeType.AGENT,
+                           dependencies=(first.id,))
+    second = ExecutionNode(id="second", task_id=task.id, type=NodeType.EVALUATION,
+                           dependencies=(repair.id,), metadata={"foreground_repair_round": 1})
+    review = ExecutionNode(id="review", task_id=task.id, type=NodeType.APPROVAL,
+                           dependencies=(second.id,))
+    graph = ExecutionGraph(task_id=task.id, nodes=(first, repair, second, review),
+                           entry_node_ids=(first.id,))
+    original = SqliteMetadataStore(SqliteDatabase(database))
+    try:
+        await original.save_task(task)
+        await original.save_execution_node(replace(first, status=NodeStatus.COMPLETED, metadata={
+            **first.metadata, "output": {"status": previous_status},
+        }))
+    finally:
+        original.close()
+
+    called = []
+
+    async def handler(node):
+        called.append(node.id)
+        return {"status": "passed"}
+
+    reopened = SqliteMetadataStore(SqliteDatabase(database))
+    try:
+        result = await LocalOrchestratorBackend(reopened).execute(graph, handler=handler)
+        assert result.status is TaskStatus.COMPLETED
+        expected = ["review"] if previous_status == "passed" else ["repair", "second", "review"]
+        assert called == expected
+        stored = await reopened.get_execution_node(first.id)
+        assert stored.metadata["output"] == {"status": previous_status}
+    finally:
+        reopened.close()
 
 
 def test_local_orchestrator_enforces_node_timeout(tmp_path: Path) -> None:
