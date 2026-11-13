@@ -83,7 +83,8 @@ def file_operation(
     root: Path, target: Path, operation: str, authorize: Callable[[], None],
     *, content: str = "", newline: str | None = None,
 ):
-    if operation in {"conditional_write", "conditional_create"} and os.name != "nt":
+    if (operation in {"conditional_write", "conditional_create", "conditional_delete"}
+            and os.name != "nt"):
         raise FileBoundaryError("conditional_write_platform_unavailable")
     if os.name == "nt":
         return _windows(root, target, operation, authorize, content, newline)
@@ -130,17 +131,23 @@ def _conditional_write_fd(fd, options):
     Windows secure-open holds no SHARE_WRITE/DELETE throughout this operation.
     Any exception after write-start is an uncertain effect to the caller.
     """
+    if not isinstance(options, tuple) or len(options) != 4:
+        raise ConditionalWriteRefused("conditional_write_options_invalid")
+    expected, old_digest, data, check = options
+    if type(data) is not bytes or len(data) > 16 * 1024 * 1024:
+        raise ConditionalWriteRefused("conditional_write_options_invalid")
+    _check_conditional_fd(fd, expected, old_digest, check)
+    return _write_and_verify_fd(fd, data)
+
+
+def _check_conditional_fd(fd, expected, old_digest, check):
     import hashlib
 
     from Sprout.execution.file_snapshot import ResourceIdentity
 
-    if not isinstance(options, tuple) or len(options) != 4:
-        raise ConditionalWriteRefused("conditional_write_options_invalid")
-    expected, old_digest, data, check = options
-    if (type(expected) is not ResourceIdentity or type(data) is not bytes
-            or len(data) > 16 * 1024 * 1024 or not callable(check)
+    if (type(expected) is not ResourceIdentity or not callable(check)
             or type(old_digest) is not str or len(old_digest) != 64):
-        raise ConditionalWriteRefused("conditional_write_options_invalid")
+        raise ConditionalWriteRefused("conditional_file_options_invalid")
     before = ResourceIdentity.from_stat(os.fstat(fd))
     if before != expected or before.size > 16 * 1024 * 1024:
         raise ConditionalWriteRefused("conditional_write_identity_changed")
@@ -154,7 +161,6 @@ def _conditional_write_fd(fd, options):
             or hashlib.sha256(old).hexdigest() != old_digest):
         raise ConditionalWriteRefused("conditional_write_version_changed")
     check()  # Final authority check on the same exclusive, verified handle.
-    return _write_and_verify_fd(fd, data)
 
 
 def _write_and_verify_fd(fd, data):
@@ -457,6 +463,9 @@ def _windows(root, target, operation, authorize, content, newline):
     from ctypes import wintypes as w
 
     creating = operation == "conditional_create"
+    deleting = operation == "conditional_delete"
+    if deleting and (type(content) is not tuple or len(content) != 3):
+        raise ConditionalWriteRefused("conditional_delete_options_invalid")
     if creating and (type(content) is not bytes or len(content) > 16 * 1024 * 1024):
         raise ConditionalWriteRefused("conditional_create_options_invalid")
     _win_volume(root)
@@ -480,6 +489,8 @@ def _windows(root, target, operation, authorize, content, newline):
             except FileNotFoundError:
                 if creating:
                     raise ConditionalWriteRefused("conditional_create_parent_missing") from None
+                if deleting:
+                    raise ConditionalWriteRefused("conditional_delete_parent_missing") from None
                 if operation != "write":
                     return _missing(operation, authorize)
                 authorize()
@@ -488,13 +499,15 @@ def _windows(root, target, operation, authorize, content, newline):
                 _win_directory(parent, stack)
         authorize()  # Recheck before OPEN_ALWAYS may create a leaf.
         access = {"conditional_write": 0xC0000000, "conditional_create": 0xC0000000,
-                  "write": 0x40000000,
+                  "conditional_delete": 0x80010000, "write": 0x40000000,
                   "read": 0x80000000, "snapshot": 0x80000000,
                   "delete": 0x10080, "probe": 0x80, "exists": 0x80}[operation]
         disposition = 1 if creating else 4 if operation == "write" else 3
         try:
             handle = _win_open(parent / relative[-1], access, disposition=disposition)
         except FileNotFoundError:
+            if deleting:
+                raise ConditionalWriteRefused("conditional_delete_target_missing") from None
             if operation == "snapshot":
                 return _missing(operation, authorize)
             return "" if operation == "read" else False
@@ -528,6 +541,13 @@ def _windows(root, target, operation, authorize, content, newline):
             ))
             handle = None  # Ownership transferred to the CRT fd.
             try:
+                if deleting:
+                    _check_conditional_fd(fd, *content)
+                    delete = w.BOOL(True)
+                    if not kernel.SetFileInformationByHandle(
+                            msvcrt.get_osfhandle(fd), 4, ctypes.byref(delete), 4):
+                        raise FileBoundaryError("conditional_delete_unconfirmed")
+                    return {"sha256": None, "size": 0}
                 return _stream(fd, operation, content, newline)
             finally:
                 os.close(fd)

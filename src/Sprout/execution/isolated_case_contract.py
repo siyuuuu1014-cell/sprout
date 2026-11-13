@@ -4,13 +4,34 @@ import base64
 import json
 from pathlib import Path
 
-from Sprout.execution import function_worker
+from Sprout.execution import function_worker, function_worker_extended
+from Sprout.strategy.acceptance import ExtendedAcceptanceCase
+
+
+def _invocation(case):
+    payload = {"target": case.target, "args": case.args, "kwargs": case.kwargs}
+    worker = function_worker
+    if isinstance(case, ExtendedAcceptanceCase):
+        payload["iterable_args"] = case.iterable_args
+        worker = function_worker_extended
+    return payload, worker
+
+
+def _worker_source(worker, target):
+    source = Path(worker.__file__).read_text(encoding="utf-8")
+    if target.startswith("src."):
+        source = source.replace(
+            '    module, function = request["target"].split(":")',
+            '    sys.path.insert(0, "/workspace/src")\n'
+            '    module, function = request["target"].removeprefix("src.").split(":")',
+        )
+    return source
 
 
 def public_demo(case):
-    inputs = json.dumps({"target": case.target, "args": case.args, "kwargs": case.kwargs},
-                       allow_nan=False)
-    return Path(function_worker.__file__).read_text(encoding="utf-8").replace(
+    payload, worker = _invocation(case)
+    inputs = json.dumps(payload, allow_nan=False)
+    return _worker_source(worker, case.target).replace(
         'request = json.loads(base64.b64decode(sys.argv[1], validate=True))',
         f"request = json.loads({inputs!r})")
 
@@ -29,8 +50,8 @@ def planned_cases(acceptance, regression, phase):
 
 
 def case_command(kind, case, demo_source):
-    payload = {"target": case.target, "args": case.args, "kwargs": case.kwargs}
+    payload, worker = _invocation(case)
     encoded = base64.b64encode(json.dumps(payload, allow_nan=False).encode()).decode()
     source = (demo_source if kind == "poc"
-              else Path(function_worker.__file__).read_text(encoding="utf-8"))
+              else _worker_source(worker, case.target))
     return ("python", "-I", "-c", source, encoded)

@@ -149,7 +149,7 @@ class FilesystemTestRun(FilesystemExperiment):
             self.runtime._file_broker, evidence=self.evidence, original=self.workspace.root,
             image=self.image, oracle_paths=('.git',), sandbox=self.sandbox.ref,
             task=task, node=node)
-        context, _ = await session.prepare()
+        context, manifest = await session.prepare()
         framework = choose_framework(self.sandbox.sources, self.test_files)
         command = runner_command(framework, self.test_files)
         async def check(manager, actor, workspace, source):
@@ -174,7 +174,28 @@ class FilesystemTestRun(FilesystemExperiment):
                                   process.stdout, process.stderr)
         result['framework'] = framework
         report(self.runtime, 'Tests', result['status'])
-        return {'test_execution': result, 'status': result['status'], 'verified': False}
+        output = {'test_execution': result, 'input_manifest': manifest,
+                  'status': result['status'], 'verified': False}
+        bundle = getattr(self, "spec_probe", None)
+        if bundle is not None and result["status"] == "passed":
+            from Sprout.execution.acceptance_producer import checked_bundle
+            from Sprout.execution.isolated_acceptance import verify_isolated_cases
+
+            if bundle != task.metadata.get("filesystem_spec_probe_v1"):
+                raise PermissionError("spec_probe_binding_changed")
+            if bundle["source_files"] != manifest:
+                raise PermissionError("spec_probe_source_changed")
+            acceptance, regression = checked_bundle(bundle)
+            with _coding_capability(check):
+                output["spec_probe"] = await verify_isolated_cases(
+                    session.metadata, self, context=context, node=node,
+                    acceptance_spec=acceptance.to_payload(),
+                    regression_spec=regression.to_payload(),
+                    expected_manifest=manifest,
+                )
+            report(self.runtime, "Verification", "specification probe: " +
+                   output["spec_probe"].get("status", "unconfirmed"))
+        return output
 
 
 async def run_prepared(runtime, task, owned, principal):
@@ -190,7 +211,140 @@ async def run_prepared(runtime, task, owned, principal):
     output = (node.metadata.get('output') or {}) if node else {}
     proof = output.get('test_execution') if isinstance(output, dict) else None
     return {'task_id': task.id, 'task_status': result.status.value,
-            'tests': proof, 'error': result.error}
+            'tests': proof, 'input_manifest': output.get('input_manifest'),
+            'spec_probe': output.get('spec_probe'), 'error': result.error}
+
+
+def conditional_repair_request(text):
+    """Recognize a request to repair only after a problem is reproduced."""
+    from Sprout.intents import _project_write_cancelled, project_clauses, project_request_text
+
+    request = project_request_text(text).strip()
+    if any(mark in request for mark in ('"', "“", "”", "‘", "’", "`", "?", "？")):
+        return False
+    clauses = project_clauses(request)
+    if not clauses or not re.match(r"^(?:请)?(?:先)?(?:检查|分析|排查)", clauses[0]):
+        return False
+    for index, (condition, action) in enumerate(zip(clauses[:-1], clauses[1:], strict=True)):
+        if (re.fullmatch(r"(?:如果|若)(?:发现|找到|复现)(?:可复现的)?(?:功能)?(?:问题|缺陷)",
+                         condition)
+                and re.fullmatch(r"(?:请)?(?:就|直接|自动|进行)*修复", action)):
+            remaining = clauses[:index] + clauses[index + 2:]
+            break
+    else:
+        return False
+    # The explicit no-defect branch is conditional, unlike a global write veto.
+    negative = re.search(
+        r"(?:如果|若)(?:没有发现|未发现|找不到)(?:可复现的)?(?:功能)?(?:问题|缺陷)"
+        r"[^。；;\n]*?(?:不要|不)(?:修改|改动)(?:任何)?(?:项目)?文件[。.]?$", request,
+    )
+    if negative is not None:
+        suffix = project_clauses(negative[0])
+        if remaining[-len(suffix):] == suffix:
+            remaining = remaining[:-len(suffix)]
+    return not (_project_write_cancelled(remaining) or any(
+        re.match(r"^(?:请)?(?:不要|不)(?:改动|写入)(?:任何)?(?:项目)?文件", clause)
+        for clause in remaining
+    ))
+
+
+def spec_probe_failures(probe):
+    results = (probe or {}).get("results", ())
+    regression = [case for case in results if case.get("kind") == "regression"]
+    if (not regression or any(case.get("passed") is not True for case in regression)
+            or any(case.get("allowed") is not True or case.get("exit_code") != 0
+                   for case in results)):
+        return []
+    return [case for case in results if case.get("kind") == "acceptance"
+            and case.get("passed") is False
+            and ("actual_output" in case or case.get("observed_exception"))]
+
+
+def spec_probe_found_defect(probe):
+    return bool(spec_probe_failures(probe))
+
+
+async def dispatch_conditional_repair(runtime, message, session, principal, foreground, provider):
+    from Sprout.agent.base import AgentResult
+    from Sprout.message.models import OutboundMessage
+
+    metadata = {"intent": "tool"}
+    content = "这项检查需要在已绑定工作区的本地交互式 CLI 中运行。"
+    if (foreground and provider is not None and principal is not None
+            and principal.authenticated and principal.source == message.channel == "cli"):
+        owned = await runtime._sessions.require_owner(session.id, principal)
+        workspace_id = runtime.session_workspace_id(owned)
+        if runtime._sessions.frozen_principal(owned) != principal:
+            raise PermissionError("conditional_repair_subject_changed")
+        if workspace_id:
+            baseline = replace(message, content="只运行当前项目的全部测试，不修改任何文件。",
+                               metadata={})
+            try:
+                task = await provider(message=baseline, session=owned, principal=principal)
+                if task is not None:
+                    proof = await run_prepared(runtime, task, owned, principal)
+                    tests = proof["tests"] or {}
+                    metadata.update(task_id=task.id, test_execution=tests)
+                    if (proof["task_status"] == "completed"
+                            and tests.get("status") == "failed"
+                            and tests.get("exit_code") == 1
+                            and type(tests.get("failed")) is int and tests["failed"] > 0):
+                        current = await runtime._sessions.require_owner(owned.id, principal)
+                        if (runtime._sessions.frozen_principal(current) != principal
+                                or runtime.session_workspace_id(current) != workspace_id
+                                or task.workspace_id != workspace_id):
+                            raise PermissionError("conditional_repair_subject_changed")
+                        coding = replace(message, metadata={
+                            **message.metadata, "workspace_id": workspace_id,
+                        })
+                        async def prepare_repair(**request):
+                            return await provider(**request, reproduced_failure=proof)
+
+                        return await runtime._handle_task(
+                            coding, current, principal=principal, foreground=True,
+                            code_task_provider=prepare_repair,
+                        )
+                    if proof["task_status"] == "completed" and tests.get("status") == "passed":
+                        probe_task = await provider(
+                            message=replace(message, metadata={}), session=owned,
+                            principal=principal, spec_probe=True,
+                        )
+                        probe = (await run_prepared(runtime, probe_task, owned, principal)
+                                 if probe_task is not None else {})
+                        observed = probe.get("spec_probe") or {}
+                        if (probe.get("task_status") == "completed"
+                                and spec_probe_found_defect(observed)):
+                            current = await runtime._sessions.require_owner(owned.id, principal)
+                            if (runtime._sessions.frozen_principal(current) != principal
+                                    or runtime.session_workspace_id(current) != workspace_id
+                                    or probe_task.workspace_id != workspace_id):
+                                raise PermissionError("conditional_repair_subject_changed")
+                            frozen = probe_task.metadata["filesystem_spec_probe_v1"]
+
+                            async def prepare_verified_repair(**request):
+                                return await provider(**request, reproduced_spec=(frozen, observed))
+
+                            return await runtime._handle_task(
+                                replace(message, metadata={**message.metadata,
+                                                           "workspace_id": workspace_id}),
+                                current, principal=principal, foreground=True,
+                                code_task_provider=prepare_verified_repair,
+                            )
+                        if observed.get("verified") is True:
+                            content = (f"现有测试 {tests.get('passed')} 项通过。"
+                                       "独立规格用例也通过，本次未复现问题，未修改项目文件。")
+                        else:
+                            content = (f"现有测试 {tests.get('passed')} 项通过，但独立规格检查"
+                                       "未能确认缺陷，未修改项目文件。")
+                    else:
+                        reason = proof.get("error") or tests.get("status", "无执行结果")
+                        content = f"无法确认测试复现了功能缺陷（{reason}），未修改项目文件。"
+                else:
+                    content = "测试准备已取消，未修改项目文件。"
+            except PermissionError as exc:
+                content = f"检查或修复未能启动（{exc}）。"
+    await runtime._persist_turns(session, message, AgentResult(content=content, metadata=metadata))
+    return OutboundMessage(content, message.channel, session.id, message.id, metadata)
 
 
 async def dispatch(runtime, message, session, principal, foreground, provider):

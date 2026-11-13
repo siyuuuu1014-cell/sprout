@@ -17,20 +17,47 @@ from Sprout.strategy.acceptance import AcceptanceSpec
 from Sprout.task.models import DelegationScope, TaskExecutionMode
 
 
-async def prepare_filesystem(runtime, workspace, message, owned, principal, *, test_only=False):
+def _unavailable_language(root):
+    """Identify language-specific projects before resolving a Python image."""
+    if (root / "pyproject.toml").is_file():
+        return None
+    if (root / "go.mod").is_file():
+        return "Go"
+    if (root / "package.json").is_file():
+        return "Node/TypeScript"
+    return None
+
+
+async def prepare_filesystem(
+    runtime, workspace, message, owned, principal, *, test_only=False, reproduced_failure=None,
+    spec_probe=False, reproduced_spec=None,
+):
     if (not isinstance(runtime._orchestrator_backend, LocalOrchestratorBackend)
             or not principal.authenticated or principal.source != "cli"
             or runtime.session_workspace_id(owned) != workspace.id):
         raise PermissionError("filesystem_experiment_local_foreground_required")
     try:
-        from Sprout.cli.filesystem_preparation import discover_plan, preflight
+        from Sprout.cli.filesystem_preparation import discover_plan, preflight, preparation_record
 
+        language = _unavailable_language(workspace.root)
+        if language:
+            raise PermissionError(f"filesystem_coding_language_unsupported: {language}")
         image = await preflight(runtime, workspace, owned, principal)
-        plan = await discover_plan(runtime, workspace, message, owned, principal)
+        raw_spec = os.getenv("SPROUT_FILESYSTEM_VERIFICATION_SPEC", "")
+        captured = []
+        plan = await discover_plan(
+            runtime, workspace, message, owned, principal,
+            on_evidence=captured.extend if (
+                spec_probe or reproduced_spec is not None or not test_only and not raw_spec
+            ) else None,
+            **({"reproduced_failure": reproduced_failure} if reproduced_failure else {}),
+            **({"spec_probe": True} if spec_probe else {}),
+            **({"reproduced_spec": reproduced_spec} if reproduced_spec is not None else {}),
+        )
         reads, writes = plan["reads"], plan["writes"]
         typer.echo("[Planning] read: " + ", ".join(reads))
         operations = [{"path": path, "operation": "update" if path in reads else "create"}
-                      for path in writes]
+                      for path in (() if spec_probe else writes)]
         for operation in operations:
             typer.echo(f"[Planning] {operation['operation']}: {operation['path']}")
         for execution in plan.get("execution", ()):
@@ -52,8 +79,32 @@ async def prepare_filesystem(runtime, workspace, message, owned, principal, *, t
             test_run = {"argv": ["python", "-m", framework, "-q"], "cwd": ".",
                         "workspace_id": workspace.id, "image": image, "repair_attempts": 1}
         frozen = None
-        raw_spec = os.getenv("SPROUT_FILESYSTEM_VERIFICATION_SPEC", "")
-        if raw_spec and not test_only:
+        automatic_bundle = None
+        probe_bundle = None
+        if spec_probe or reproduced_spec is not None:
+            from Sprout.execution.acceptance_producer import (
+                bind_probe_plan,
+                check_preparation,
+                produce,
+            )
+            from Sprout.llm.orchestrator import ModelOrchestrationError
+            from Sprout.security.local_diagnostics import report
+
+            try:
+                if spec_probe:
+                    report(runtime, "Acceptance", "generating read-only specification probe")
+                    probe_bundle = await produce(
+                        runtime.models.default(), message.content, plan, captured, spec_probe=True,
+                    )
+                    check_preparation(probe_bundle, message.content, plan)
+                else:
+                    automatic_bundle = bind_probe_plan(
+                        *reproduced_spec, requirement=message.content, plan=plan,
+                    )
+                    check_preparation(automatic_bundle, message.content, plan)
+            except (ValueError, ModelOrchestrationError) as exc:
+                raise PermissionError(f"filesystem_spec_probe_unavailable: {exc}") from exc
+        elif raw_spec and not test_only:
             if not image or len(raw_spec) > 24 * 1024:
                 raise ValueError("Pinned image and bounded Host verification spec required")
             bundle = json.loads(raw_spec)
@@ -67,6 +118,24 @@ async def prepare_filesystem(runtime, workspace, message, owned, principal, *, t
                 "sha256": hashlib.sha256(json.dumps(specs, sort_keys=True).encode()).hexdigest(),
                 "frozen_at": datetime.now(UTC).isoformat(),
             }
+        elif not test_only:
+            from Sprout.execution.acceptance_producer import check_preparation, produce
+            from Sprout.llm.orchestrator import ModelOrchestrationError
+            from Sprout.security.local_diagnostics import report
+
+            if not image:
+                raise PermissionError("acceptance_docker_image_unavailable")
+            report(runtime, "Acceptance", "generating")
+            try:
+                automatic_bundle = await produce(
+                    runtime.models.default(), message.content, plan, captured,
+                )
+                check_preparation(automatic_bundle, message.content, plan)
+            except ValueError as exc:
+                raise PermissionError(f"filesystem_acceptance_failed: {exc}") from exc
+            except ModelOrchestrationError as exc:
+                raise PermissionError("filesystem_acceptance_model_unavailable") from exc
+            report(runtime, "Acceptance", f"frozen: {automatic_bundle['bundle_sha256']}")
     except (EOFError, KeyboardInterrupt):
         return None
     except PermissionError:
@@ -86,19 +155,28 @@ async def prepare_filesystem(runtime, workspace, message, owned, principal, *, t
         actions.add("file.write")
     if image:
         actions.add("process.run")
-    if frozen:
+    if frozen or automatic_bundle:
         actions.add("file.apply")
     scope = DelegationScope(allowed_paths=(".",), allowed_actions=frozenset(actions),
                             issued_by="cli:" + principal.user_id)
     evidence_parent = safe_path(Path(tempfile.gettempdir()))
     if evidence_parent.is_relative_to(workspace.root):
         raise PermissionError("filesystem_experiment_evidence_overlaps_workspace")
+    prepared = preparation_record(plan, adapter="filesystem", state="ready")
+    if spec_probe:
+        writes = ()
+        prepared = {**prepared, "writes": []}
+    if automatic_bundle:
+        prepared["write_evidence"] = automatic_bundle["write_evidence"]
     task = await runtime.create_task(
         workspace.id, message.content, actor=principal, source="cli",
         delegation_scope=scope, execution_mode=TaskExecutionMode.CODE,
         _filesystem_foreground=True,
         metadata={"session_id": owned.id, "filesystem_experiment": True,
                   "cli_write_paths": list(writes),
+                  **({"filesystem_spec_probe_v1": probe_bundle} if probe_bundle else {}),
+                  **({"filesystem_acceptance_v1": automatic_bundle} if automatic_bundle else {}),
+                  "coding_preparation_v1": prepared,
                   "filesystem_plan_v1": {"reads": list(reads), "operations": operations,
                       "execution": list(plan.get("execution", ())),
                       "actions": list(plan.get("actions", ())),
@@ -115,10 +193,11 @@ async def prepare_filesystem(runtime, workspace, message, owned, principal, *, t
         runtime, task, workspace, reads, image, evidence, verification=frozen)
     if test_only:
         experiment.test_files = tests
+        experiment.spec_probe = probe_bundle
 
     # This is a live Host-owned experiment, never a persisted or model option.
     experiment.automatic = True
-    if not test_only and "run_tests" in plan.get("execution", ()):
+    if not test_only and not automatic_bundle and "run_tests" in plan.get("execution", ()):
         async def post_apply_tests():
             fresh = await runtime._sessions.require_owner(owned.id, principal)
             test_message = replace(

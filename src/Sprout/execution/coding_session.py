@@ -24,7 +24,7 @@ class CodingNodeSession:
     """
 
     def __init__(self, metadata, runner, file_broker, *, evidence, original, image,
-                 oracle_paths, sandbox, task, node, regression_spec=None):
+                 oracle_paths, sandbox, task, node, regression_spec=None, selected_paths=None):
         self.metadata, self.runner, self.file_broker = metadata, runner, file_broker
         self.evidence, self.original, self.image = evidence, original, image
         if not oracle_paths:
@@ -34,6 +34,7 @@ class CodingNodeSession:
                         if isinstance(source_id, str) and source_id else ())
         self.oracle_paths = tuple(dict.fromkeys((*oracle_paths, acceptance_test_path(task.id),
                                                acceptance_demo_path(task.id), *source_paths)))
+        self.selected_paths = selected_paths
         self.sandbox = sandbox
         self.task, self.node = task, node
         self.regression_spec = (AcceptanceSpec.from_payload(regression_spec).to_payload()
@@ -57,7 +58,7 @@ class CodingNodeSession:
             raise ValueError("Linked coding node directory")
         exported = directory / "coding-input"
         manifest = export_input(target, exported, original, exclude_paths=self.oracle_paths,
-                                manifest_only=True)
+                                manifest_only=True, selected_paths=self.selected_paths)
         contract = {"task_id": self.task.id, "node_id": self.node.id, "baseline": manifest,
                     "target": str(target), "image": self.image,
                     "oracle_paths": list(self.oracle_paths)}
@@ -71,7 +72,8 @@ class CodingNodeSession:
         if not exported.exists():
             if seal.exists():
                 raise ValueError("Missing export with existing seal; cannot recreate")
-            actual = export_input(target, exported, original, exclude_paths=self.oracle_paths)
+            actual = export_input(target, exported, original, exclude_paths=self.oracle_paths,
+                                  selected_paths=self.selected_paths)
             if actual != manifest:
                 raise ValueError("Source changed while exporting")
             with seal.open("x", encoding="utf-8") as stream:

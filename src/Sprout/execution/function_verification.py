@@ -12,23 +12,50 @@ from Sprout.execution import function_worker
 from Sprout.execution.docker_verification import DockerVerificationBackend, image_ready
 from Sprout.execution.verification_backend import VerificationRequest
 from Sprout.execution.verification_run import input_manifest
+from Sprout.strategy.acceptance import ExtendedAcceptanceCase
 
 MAX_OUTPUT_BYTES = 64 * 1024
 
 
-def judge_actual(process, expected):
-    """Treat stdout as an untrusted actual value, not a self-reported pass verdict."""
+def _actual(process):
+    """Read an actual observation only from a successful, unmodified transport."""
     if (process.allowed is not True or type(process.exit_code) is not int
             or process.exit_code != 0 or process.error or process.redactions
             or len(process.stdout.encode("utf-8")) > MAX_OUTPUT_BYTES):
         raise ValueError("Actual output unavailable, transformed, or oversized")
     def reject_constant(value):
         raise ValueError("Nonfinite JSON value")
-    actual = json.loads(process.stdout, parse_constant=reject_constant)
-    # JSON canonical equality keeps booleans distinct from integers; object order is irrelevant.
+    return json.loads(process.stdout, parse_constant=reject_constant)
+
+
+def _compare(actual, expected):
+    # Canonical JSON keeps booleans distinct from integers and ignores object order.
     def canonical(value):
         return json.dumps(value, sort_keys=True, allow_nan=False)
+
     return {"actual": actual, "passed": canonical(actual) == canonical(expected)}
+
+
+def judge_actual(process, expected):
+    return _compare(_actual(process), expected)
+
+
+def judge_case(process, case):
+    if not isinstance(case, ExtendedAcceptanceCase):
+        return judge_actual(process, case.expected_output)
+    actual = _actual(process)
+    if not isinstance(actual, dict):
+        raise ValueError("Invalid extended function observation")
+    outcome = actual.get("outcome")
+    if outcome == "returned" and actual.keys() == {"outcome", "value"}:
+        if case.expected_exception:
+            return {"actual": actual["value"], "passed": False}
+        return _compare(actual["value"], case.expected_output)
+    if (outcome == "raised" and actual.keys() == {"outcome", "exception"}
+            and isinstance(actual["exception"], str)):
+        return {"exception": actual["exception"],
+                "passed": actual["exception"] == case.expected_exception}
+    raise ValueError("Invalid extended function observation")
 
 
 class FunctionVerificationRun:
@@ -37,6 +64,8 @@ class FunctionVerificationRun:
 
     async def execute(self, runtime, *, task_id, original, exported, image, case, oracle_paths,
                       purpose="acceptance"):
+        if isinstance(case, ExtendedAcceptanceCase):
+            raise ValueError("Extended cases require the isolated acceptance runner")
         if purpose not in {"acceptance", "regression"}:
             raise ValueError("Explicit function measurement purpose required")
         if not oracle_paths:

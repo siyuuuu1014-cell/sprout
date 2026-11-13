@@ -105,10 +105,11 @@ async def test_code_preparation_uses_owned_session_workspace(tmp_path, monkeypat
     from unittest.mock import AsyncMock
 
     from Sprout.cli.code_task import prepare
+    from Sprout.gateway.identity import Principal
     from Sprout.message.models import Message
     from Sprout.workspace.models import Workspace
 
-    principal = object()
+    principal = Principal("owner", authenticated=True, source="cli")
     owned = SimpleNamespace(id="session")
     root = tmp_path / "gone" if case == "missing" else tmp_path
     workspace = Workspace("bound", root)
@@ -232,6 +233,362 @@ async def test_original_project_requests_dispatch_before_analysis(automatic, str
     assert runtime.session_workspace_id(prepare.call_args.kwargs["session"]) == workspace.id
 
 
+DELIVERY_CODING_REQUEST = (
+    "请分析当前项目，读取 SPEC.md，然后修复 delivery.py 中的配送费计算，"
+    "不要修改规格和现有测试。运行 pytest 并完成验证、审查、写回和复测。"
+)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_analysis_then_edit_enters_coding_provider(automatic, stream):
+    from unittest.mock import AsyncMock
+
+    from Sprout.message.models import Message
+
+    runtime, session = automatic.rig.runtime, automatic.rig.session
+    workspace, principal = automatic.rig.workspace, automatic.rig.principal
+    await runtime._remember_session_workspace(session.id, workspace.id)
+    analyze = AsyncMock(side_effect=AssertionError("read-only analysis took the edit"))
+    prepare = AsyncMock(return_value=None)
+    message = Message(DELIVERY_CODING_REQUEST, session_id=session.id, channel="cli")
+    options = dict(principal=principal, foreground=True, analysis_task_provider=analyze,
+                   code_task_provider=prepare)
+    if stream:
+        reply = next(chunk.outbound for chunk in [
+            chunk async for chunk in runtime.handle_stream(message, **options)
+        ] if chunk.outbound)
+    else:
+        reply = await runtime.handle(message, **options)
+    assert reply.content == "code_task_cancelled"
+    analyze.assert_not_awaited()
+    prepare.assert_awaited_once()
+    assert prepare.call_args.kwargs["message"].content == DELIVERY_CODING_REQUEST
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+async def test_repl_wires_composite_request_to_coding_preparation(cli, monkeypatch, terminal):
+    from unittest.mock import AsyncMock
+
+    from Sprout.cli import code_task
+
+    runtime, session = cli.rig.runtime, cli.rig.session
+    await runtime._remember_session_workspace(session.id, cli.rig.workspace.id)
+    cli.state.inputs = [DELIVERY_CODING_REQUEST]
+    cli.state.terminal = terminal
+    prepare = AsyncMock(return_value=None)
+    monkeypatch.setattr(code_task, "prepare", prepare)
+
+    await cli.run()
+
+    prepare.assert_awaited_once()
+    assert prepare.call_args.args == (runtime, cli.rig.workspace.id)
+    assert prepare.call_args.kwargs["message"].content == DELIVERY_CODING_REQUEST
+    assert "code_task_cancelled" in cli.state.display
+    assert not cli.state.prompts
+
+
+@pytest.mark.parametrize("instruction", [
+    "只分析项目，读取 SPEC.md，不要修改任何文件。",
+    "先分析项目，然后修改方案。",
+    "分析项目，读取 SPEC.md，然后修复 delivery.py。取消本次任务。",
+    "分析项目，然后修复 delivery.py 吗？",
+])
+def test_inspection_does_not_admit_read_only_or_ambiguous_requests(instruction):
+    assert not detect_task_hint(instruction)
+
+
+@pytest.mark.parametrize("approved", [False, True])
+async def test_foreground_git_uses_exact_task_capability_without_prompt(approved):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from Sprout.runtime.foreground_git_coding import ForegroundGitCoding
+    from Sprout.security.approval import ApprovalStatus
+
+    before = ApprovalStatus.PENDING if approved else ApprovalStatus.REJECTED
+    grant = SimpleNamespace(id="grant", status=before, tool="coding_task_capability_v1")
+    settled = SimpleNamespace(status=ApprovalStatus.APPROVED, tool=grant.tool)
+    manager = SimpleNamespace(coding_task_capability=AsyncMock(return_value=grant),
+                              decide=AsyncMock(return_value=settled))
+    assembly = object.__new__(ForegroundGitCoding)
+    assembly.runtime = SimpleNamespace(approvals=manager)
+    assembly.commands = SimpleNamespace(_binding="frozen-binding")
+    actor = SimpleNamespace(user_id="operator")
+    task = SimpleNamespace(actor=actor)
+    node = SimpleNamespace(id="verification")
+    assembly.subject = AsyncMock(return_value=task)
+
+    result = await assembly.approval(manager, task=task, node=node)
+
+    manager.coding_task_capability.assert_awaited_once_with(
+        task, "frozen-binding", request_approval=False)
+    assert result is (settled if approved else grant)
+    if approved:
+        manager.decide.assert_awaited_once_with(
+            "grant", True, principal=actor, decided_by="operator", channel="cli",
+            reason="Foreground Git isolated Coding")
+    else:
+        manager.decide.assert_not_awaited()
+
+
+async def test_cli_prefers_settled_apply_evidence_to_the_agent_draft(capsys):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from Sprout.cli.commands import chat
+    from Sprout.orchestration.models import ExecutionNode, NodeStatus, NodeType
+    from Sprout.task.models import TaskStatus
+
+    agent = ExecutionNode(task_id="task", type=NodeType.AGENT, status=NodeStatus.COMPLETED,
+                          metadata={"output": {"content": "I could not execute pytest."}})
+    apply = ExecutionNode(task_id="task", type=NodeType.APPLY, status=NodeStatus.COMPLETED,
+                          metadata={"execution_guard": {"state": "completed"}, "output": {
+                              "applied": True, "transaction_id": "transaction", "verification": {
+                                  "verified": True,
+                                  "pytest": {"results": [{
+                                      "exit_code": 0, "passed": True,
+                                      "output": "........ [100%]\n13 passed in 0.05s\n",
+                                  }]},
+                                  "cases": {"results": [
+                                      {"kind": "acceptance", "passed": True},
+                                      {"kind": "regression", "passed": True},
+                                      {"kind": "poc", "passed": True},
+                                  ]},
+                              },
+                          }})
+    runtime = SimpleNamespace(
+        get_task=AsyncMock(return_value=SimpleNamespace(status=TaskStatus.COMPLETED)),
+        storage=SimpleNamespace(metadata=SimpleNamespace(
+            list_execution_nodes=AsyncMock(return_value=[agent, apply]))),
+    )
+
+    await chat._continue_foreground_task(runtime, {"task_id": "task"}, "operator")
+
+    output = capsys.readouterr().out
+    assert "13 passed in 0.05s" in output
+    assert "Acceptance 1/1" in output
+    assert "I could not execute pytest" not in output
+
+
+def test_delivery_plan_keeps_the_spec_and_tests_out_of_write_scope():
+    plan = plan_files(("delivery.py", "SPEC.md", "tests/test_delivery.py"),
+                      DELIVERY_CODING_REQUEST)
+    assert plan["writes"] == ("delivery.py",)
+    assert plan["execution"] == ("run_tests",)
+
+
+async def test_cli_failed_verification_uses_runtime_state_instead_of_agent_draft(capsys):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from Sprout.cli.commands import chat
+    from Sprout.orchestration.models import ExecutionNode, NodeStatus, NodeType
+    from Sprout.task.models import TaskStatus
+
+    agent = ExecutionNode(task_id="task", type=NodeType.AGENT, status=NodeStatus.COMPLETED,
+                          metadata={"output": {"content": "I already wrote back the file."}})
+    runtime = SimpleNamespace(
+        get_task=AsyncMock(return_value=SimpleNamespace(status=TaskStatus.FAILED)),
+        storage=SimpleNamespace(metadata=SimpleNamespace(
+            list_execution_nodes=AsyncMock(return_value=[agent]))),
+    )
+    await chat._continue_foreground_task(runtime, {"task_id": "task"}, "operator")
+    output = capsys.readouterr().out
+    assert "failed" in output
+    assert "already wrote back" not in output
+    assert "写回" in output or "write-back" in output
+
+
+DISCOVER_AND_REPAIR = (
+    "检查当前项目，结合项目规格和现有测试，找出一个可复现的功能问题。"
+    "如果发现问题，直接修复并运行验证；验证通过后写回项目，再复测一次。"
+    "保留现有规格和测试。如果没有发现可复现的问题，就说明检查了什么，不要改动文件。"
+)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("exit_code, failures, status, spec_mismatch, repair", [
+    (0, 0, "passed", False, False), (0, 0, "passed", True, True),
+    (1, 1, "failed", False, True), (2, 0, "failed", False, False),
+])
+async def test_conditional_repair_requires_reproduced_failure(
+    automatic, monkeypatch, stream, exit_code, failures, status, spec_mismatch, repair,
+):
+    from unittest.mock import AsyncMock
+
+    from Sprout.message.models import Message, OutboundMessage
+
+    runtime, session = automatic.rig.runtime, automatic.rig.session
+    workspace, principal = automatic.rig.workspace, automatic.rig.principal
+    await runtime._remember_session_workspace(session.id, workspace.id)
+    baseline_result = {"task_id": "baseline", "task_status": "completed",
+                       "tests": {"exit_code": exit_code, "failed": failures, "status": status}}
+    probe_result = {**baseline_result, "spec_probe": {"results": [
+        {"kind": "acceptance", "allowed": True, "exit_code": 0,
+         "passed": not spec_mismatch, "actual_output": 10},
+        {"kind": "regression", "allowed": True, "exit_code": 0, "passed": True},
+    ], "verified": not spec_mismatch}}
+    baseline = AsyncMock(side_effect=[baseline_result, probe_result])
+    monkeypatch.setattr("Sprout.runtime.isolated_test_run.run_prepared", baseline)
+    analyze = AsyncMock(side_effect=AssertionError("unconditional analysis route"))
+    from types import SimpleNamespace
+
+    bundle = {"bundle_sha256": "frozen"}
+    prepare = AsyncMock(return_value=SimpleNamespace(
+        id="baseline", workspace_id=workspace.id, metadata={"filesystem_spec_probe_v1": bundle},
+    ))
+    coding = AsyncMock(return_value=OutboundMessage(
+        "coding started", "cli", session.id, "request", {"intent": "task"}))
+    monkeypatch.setattr(runtime, "_handle_task", coding)
+    message = Message(DISCOVER_AND_REPAIR, session_id=session.id, channel="cli")
+    options = dict(principal=principal, foreground=True,
+                   analysis_task_provider=analyze, code_task_provider=prepare)
+    if stream:
+        reply = next(chunk.outbound for chunk in [
+            chunk async for chunk in runtime.handle_stream(message, **options)
+        ] if chunk.outbound)
+    else:
+        reply = await runtime.handle(message, **options)
+    assert baseline.await_count == (2 if status == "passed" else 1)
+    analyze.assert_not_awaited()
+    assert execution_request(prepare.await_args_list[0].kwargs["message"].content)
+    if status == "passed":
+        assert prepare.await_args_list[1].kwargs["spec_probe"] is True
+    if repair:
+        coding.assert_awaited_once()
+        assert coding.call_args.args[0].content == DISCOVER_AND_REPAIR
+        if spec_mismatch:
+            repair_provider = coding.call_args.kwargs["code_task_provider"]
+            await repair_provider(message=message, session=session, principal=principal)
+            frozen, observed = prepare.await_args.kwargs["reproduced_spec"]
+            assert frozen is bundle
+            assert observed == probe_result["spec_probe"]
+    else:
+        coding.assert_not_awaited()
+        assert reply.metadata["test_execution"]["exit_code"] == exit_code
+
+
+def test_multimodule_probe_can_check_all_sources_before_narrowing_write_plan():
+    paths = ("checkout.py", "shipping.py", "tests/test_checkout.py", "SPEC.md")
+    plan = plan_files(paths, DISCOVER_AND_REPAIR, spec_probe=True)
+    assert plan["reads"] == tuple(sorted(paths))
+    assert plan["writes"] == ("checkout.py", "shipping.py")
+    narrowed = plan_files(paths, DISCOVER_AND_REPAIR, repair_targets=("shipping.py",))
+    assert narrowed["writes"] == ("shipping.py",)
+
+
+def test_conditional_repair_plan_requires_a_single_source_target():
+    assert plan_files(("billing.py", "tests/test_billing.py", "SPEC.md"),
+                      DISCOVER_AND_REPAIR)["writes"] == ("billing.py",)
+    with pytest.raises(PermissionError, match="filesystem_planning_ambiguous_source_target"):
+        plan_files(("billing.py", "unrelated.py", "tests/test_billing.py"), DISCOVER_AND_REPAIR)
+
+
+def test_conditional_repair_does_not_override_cancellation():
+    from Sprout.runtime.isolated_test_run import conditional_repair_request
+
+    assert conditional_repair_request(DISCOVER_AND_REPAIR)
+    assert not conditional_repair_request("只分析项目，不修改任何文件。")
+    assert not conditional_repair_request(DISCOVER_AND_REPAIR + "取消本次任务。")
+    assert not conditional_repair_request("不要改动任何文件。" + DISCOVER_AND_REPAIR)
+    assert not conditional_repair_request(
+        DISCOVER_AND_REPAIR.replace("如果发现问题", "不要改动文件。如果发现问题")
+    )
+
+
+@pytest.mark.parametrize("choice, error", [
+    ({"path": "shipping.py", "line": 2}, None),
+    ({"path": "unrelated.py", "line": 2}, "not_supported_by_evidence"),
+    ({"path": "shipping.py", "line": 99}, "not_supported_by_evidence"),
+    ({}, "failed_test_unmapped"),
+    (None, "baseline_changed"),
+])
+async def test_multimodule_repair_target_uses_failed_test_dependency_chain(choice, error):
+    import json
+    from unittest.mock import AsyncMock
+
+    from Sprout.cli.repair_target import select_repair_targets
+    from Sprout.llm.messages import LLMResponse
+    from Sprout.workspace.authorized_content import AuthorizedEntry
+
+    contents = {
+        "tests/test_checkout.py": b"from checkout import total",
+        "checkout.py": b"from shipping import fee\ndef total(): return fee()",
+        "shipping.py": b"def fee():\n    return 0",
+        "unrelated.py": b"def other():\n    return 0",
+    }
+    entries = [AuthorizedEntry.synthetic(path, data) for path, data in contents.items()]
+    manifest = {e.relative_path: e.digest for e in entries}
+    if choice is None:
+        manifest["shipping.py"] = "stale"
+    evidence = {"task_status": "completed", "input_manifest": manifest,
+                "tests": {"framework": "pytest", "exit_code": 1,
+                          "stdout": "FAILED tests/test_checkout.py::test_remote - assert 0 == 3"}}
+    model = AsyncMock()
+    reply = {"tests/test_checkout.py::test_remote": [choice]} if choice else {}
+    model.chat.return_value = LLMResponse(content=json.dumps(reply))
+    args = (model, DISCOVER_AND_REPAIR, list(contents), (), entries, evidence)
+    if error:
+        with pytest.raises(PermissionError, match=error):
+            await select_repair_targets(*args)
+    else:
+        targets = await select_repair_targets(*args)
+        assert targets == ("shipping.py",)
+        plan = plan_files(contents, DISCOVER_AND_REPAIR, repair_targets=targets)
+        assert plan["writes"] == targets
+        prompt = json.loads(model.chat.call_args.args[0][1].content)
+        assert set(prompt["candidate_sources"]) == {"checkout.py", "shipping.py"}
+        assert "assert 0 == 3" in prompt["pytest_failure"]
+
+
+async def test_pytest_repair_retains_one_root_cause_per_failed_test():
+    import json
+    from unittest.mock import AsyncMock
+
+    from Sprout.cli.repair_target import select_repair_targets
+    from Sprout.llm.messages import LLMResponse
+    from Sprout.workspace.authorized_content import AuthorizedEntry
+
+    entries = [AuthorizedEntry.synthetic(path, source) for path, source in {
+        "tests/test_totals.py": b"from totals import total",
+        "tests/test_fees.py": b"from fees import fee",
+        "totals.py": b"from fees import fee\ndef total(): return fee()",
+        "fees.py": b"def fee(): return 0",
+    }.items()]
+    failure = {"task_status": "completed",
+               "input_manifest": {entry.relative_path: entry.digest for entry in entries},
+               "tests": {"framework": "pytest", "exit_code": 1, "stdout":
+                         "FAILED tests/test_totals.py::test_member - assert 0 == 1\n"
+                         "FAILED tests/test_fees.py::test_remote - assert 0 == 3"}}
+    model = AsyncMock()
+    model.chat.return_value = LLMResponse(content=json.dumps({
+        "tests/test_totals.py::test_member": [{"path": "totals.py", "line": 2}],
+        "tests/test_fees.py::test_remote": [{"path": "fees.py", "line": 1}],
+    }))
+    args = (model, DISCOVER_AND_REPAIR, list(failure["input_manifest"]), (), entries, failure)
+    assert await select_repair_targets(*args) == ("fees.py", "totals.py")
+    model.chat.return_value = LLMResponse(
+        content='{"tests/test_totals.py::test_member":[{"path":"totals.py","line":2}]}',
+    )
+    with pytest.raises(PermissionError, match="filesystem_repair_failed_test_unmapped"):
+        await select_repair_targets(*args)
+
+
+def test_spec_probe_needs_observed_acceptance_mismatch_and_passing_regression():
+    from Sprout.runtime.isolated_test_run import spec_probe_found_defect
+
+    failure = {"kind": "acceptance", "passed": False, "allowed": True, "exit_code": 0,
+               "outcome": "check_failed", "actual_output": 10}
+    regression = {"kind": "regression", "passed": True, "allowed": True, "exit_code": 0}
+    demo = {**regression, "kind": "poc"}
+    assert spec_probe_found_defect({"results": [failure, regression, demo]})
+    assert not spec_probe_found_defect({"results": [failure, demo]})
+    assert not spec_probe_found_defect({"results": [failure, {**regression, "passed": False}]})
+    assert not spec_probe_found_defect({"results": [
+        {**failure, "exit_code": 2}, regression, demo,
+    ]})
+
+
 def test_composite_plan_preserves_edit_and_test_targets():
     plan = plan_files(("app.py", "test_app.py"),
                       "修改代码、补充测试、运行测试、修复失败的测试，最后 Review。")
@@ -249,3 +606,53 @@ def test_source_review_routes_without_writes():
     assert explicit_request(text)
     assert not detect_task_hint(text)
     assert _project_analyze_tool_call(Message(text), "workspace") is not None
+
+
+def test_daily_feature_request_routes_to_coding():
+    assert detect_task_hint(
+        "为当前项目新增优先标签功能。根据项目规格，在新模块中实现共用的优先标签逻辑，"
+        "接入包裹和收据两个入口，补充测试并保留默认行为。运行全部测试，验证通过后写回并复测。"
+    )
+    assert not detect_task_hint("讨论如何为当前项目新增优先标签功能。")
+    assert not detect_task_hint("为当前项目新增优先标签功能。取消本次任务，不要执行。")
+
+
+async def test_structural_plan_preserves_source_and_test_operations():
+    import json
+    from unittest.mock import AsyncMock
+
+    from Sprout.cli.filesystem_preparation import _plan_structural_edit
+    from Sprout.llm.messages import LLMResponse
+    from Sprout.workspace.authorized_content import AuthorizedEntry
+    from Sprout.workspace.models import ResourceKind
+
+    source = "src/catalog/labels.py"
+    test = "tests/test_labels.py"
+    new = "src/catalog/priority.py"
+    entries = [
+        AuthorizedEntry.synthetic(source, b"def label(code): return code"),
+        AuthorizedEntry.synthetic(test, b"def test_label(): pass", ResourceKind.TEST),
+    ]
+    model = AsyncMock()
+    model.chat.return_value = LLMResponse(content=json.dumps({
+        "update": [source, test], "create": [new],
+    }))
+    request = "新增标签功能，在新模块中实现。补充测试。"
+    plan = await _plan_structural_edit(model, request, [source, test], (), entries)
+    assert plan["writes"] == tuple(sorted([source, test, new]))
+    assert plan["reads"] == (source, test)
+    assert plan["execution"] == ("run_tests",)
+    with pytest.raises(PermissionError, match="filesystem_planning_target_unresolved"):
+        await _plan_structural_edit(model, "重构标签，保留现有测试。", [source, test], (), entries)
+
+
+@pytest.mark.parametrize(("manifest", "language"), [
+    ("package.json", "Node/TypeScript"), ("go.mod", "Go"),
+])
+def test_non_python_project_reports_its_missing_adapter(tmp_path, manifest, language):
+    from Sprout.cli.filesystem_task import _unavailable_language
+
+    (tmp_path / manifest).touch()
+    assert _unavailable_language(tmp_path) == language
+    (tmp_path / "pyproject.toml").touch()
+    assert _unavailable_language(tmp_path) is None

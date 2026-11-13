@@ -193,6 +193,7 @@ class NodeExecutor:
         self._changes = changes
         self._coding_dispatch = coding_dispatch
         self._isolated_coding_required = isolated_coding_required
+        self._foreground_git = None
         self._coding_session_factory = coding_session_factory
         self._coding_commands = coding_commands
         self._local_acceptance = local_acceptance
@@ -314,11 +315,16 @@ class NodeExecutor:
             if scope is not None:
                 experiment = scope.runtime._sandbox_lifecycle.filesystem.get(task.id)
                 if experiment is not None:
-                    return await experiment.verify(task, node)
+                    measured = await experiment.verify(task, node)
+                    if node.metadata.get("foreground_repair_round") is not None:
+                        await self._publish_repair_evidence(node, workspace, task, scope, measured)
+                    return measured
                 return await evaluate(scope.runtime, scope,
                                       lambda: self._evaluation(node, workspace, task))
             return await self._evaluation(node, workspace, task)
         if node.type is NodeType.APPROVAL:
+            if self._foreground_git is not None:
+                return await self._foreground_git.review(node)
             from Sprout.tools.context_keys import _current_project_node
 
             scope = _current_project_node()
@@ -326,6 +332,10 @@ class NodeExecutor:
                 return await scope.runtime._sandbox_lifecycle.filesystem[task.id].review(task, node)
             return await self._approval(workspace, task)
         if node.type is NodeType.APPLY:
+            if self._foreground_git is not None:
+                from Sprout.execution.foreground_git_apply import execute
+
+                return await execute(self._foreground_git, node)
             if task.metadata.get("filesystem_experiment"):
                 from Sprout.execution.filesystem_review import apply_gate, verification_status
 
@@ -342,7 +352,10 @@ class NodeExecutor:
                 evaluation_id = f"{task.id}:evaluation"
                 if evidence and evaluation_id in node.dependencies:
                     evaluated = await self._metadata.get_execution_node(evaluation_id)
-                    verification = verification_status(evaluated, evidence, task.id, workspace.id)
+                    verification = verification_status(
+                        evaluated, evidence, task.id, workspace.id,
+                        bundle=task.metadata.get("filesystem_acceptance_v1"),
+                    )
                 if verification == "passed":
                     from Sprout.execution.filesystem_apply import execute
                     from Sprout.execution.filesystem_review import checked_changes
@@ -434,6 +447,30 @@ class NodeExecutor:
         if (guard.get("resume_key") and isinstance(output, dict)
                 and output.get("waiting") is True and output.get("pending_approvals")):
             nodes = [item for item in nodes if item.id != node.id]
+        experiment = scope.runtime._sandbox_lifecycle.filesystem.get(task.id)
+        repair_backend = (self._foreground_git is not None or (
+            experiment is not None and "filesystem_acceptance_v1" in task.metadata))
+        independent = node.type is NodeType.EVALUATION and (
+            node.metadata.get("foreground_repair_round") is not None)
+        repairing = (node.type is NodeType.AGENT and
+                     node.metadata.get("previous_evaluation_node_id") in node.dependencies)
+        if repair_backend and (independent or repairing):
+            # The independent runner consumes the sandbox snapshot, and the repair model
+            # consumes its verified observations. Neither consumes prior Agent text.
+            from Sprout.execution.node_result_source import payload_digest
+
+            if independent:
+                parents = [n for n in nodes if n.id in node.dependencies]
+                if (len(parents) != 1 or parents[0].type is not NodeType.AGENT
+                        or parents[0].task_id != task.id
+                        or parents[0].status is not NodeStatus.COMPLETED
+                        or parents[0].metadata.get("execution_guard", {}).get("state")
+                        != "completed"):
+                    raise PermissionError("repair_candidate_agent_not_settled")
+                parent = parents[0]
+                scope.repair_agent_parent = (
+                    parent.id, payload_digest(parent.metadata.get("output")))
+            nodes = [item for item in nodes if item.type is not NodeType.AGENT]
         admitted = await scope.runtime._admit_node_products(scope, nodes)
         if (not admitted and (node.dependencies or node.result_ref is not None
                 or any(item.task_id != current.id or item.result_ref is not None
@@ -442,6 +479,14 @@ class NodeExecutor:
             raise PermissionError("node_artifact_provenance_unavailable")
         # Registry identity, not a flag carried in the model's metadata.
         scope.runtime._node_publications[node.id] = scope
+
+    async def _publish_repair_evidence(self, node, workspace, task, scope, measured):
+        records = measured.get("results", [])
+        if (measured.get("status") == "failed" and records
+                and all(r["allowed"] and type(r["exit_code"]) is int for r in records)):
+            # Publish executed failures as repair feedback, never as Apply evidence.
+            await self._check_model_publication(node, workspace, task)
+            scope.local_evaluation_result = measured
 
     async def _publish_node_model(self, node, workspace, task, agent, message, context):
         # Recheck after all asynchronous preparation, before handing ANY text
@@ -623,12 +668,16 @@ class NodeExecutor:
                 and callable(getattr(getattr(self, "_coding_commands", None), "execute", None))):
             allowed = set(node.metadata.get("tool_names") or ())
             if not allowed or "isolated_coding_command" in allowed:
+                planned_paths = (self._foreground_git.paths
+                                 if self._foreground_git is not None else None)
                 sandbox_tools.append(IsolatedCodingCommandTool(
-                    self._coding_commands, task=task, node=node, sandbox=sandbox_ref))
+                    self._coding_commands, task=task, node=node, sandbox=sandbox_ref,
+                    planned_paths=planned_paths))
         host_test = None
         command_tool = None
-        if experiment is not None and experiment.image:
-            filesystem_plan = task.metadata.get("filesystem_plan_v1", {})
+        filesystem_plan = task.metadata.get("filesystem_plan_v1", {})
+        independent_repair = node.metadata.get("filesystem_independent_repair") is True
+        if experiment is not None and experiment.image and not independent_repair:
             host_test = filesystem_plan.get("host_test")
             command_tool = IsolatedCodingCommandTool(
                 experiment, task=task, node=node, sandbox=sandbox_ref, filesystem_root_only=True,
@@ -663,7 +712,7 @@ class NodeExecutor:
                     "Write only these exact sandbox-relative paths: "
                     + json.dumps(task.metadata["cli_write_paths"], ensure_ascii=False))
             if experiment.image:
-                if host_test is not None:
+                if independent_repair or host_test is not None:
                     plan += (" Runtime will run the frozen test command after editing. "
                              "Focus on completing the requested edits before answering.")
                 elif "run_tests" in filesystem_plan.get("execution", ()):
@@ -856,6 +905,10 @@ class NodeExecutor:
     ) -> dict:
         """Run a read-only planning pass before the first edit round."""
         await self._check_model_publication(node, workspace, task)
+        if self._foreground_git is not None:
+            plan = self._foreground_git.plan
+            return {"plan": json.dumps({key: plan[key] for key in ("reads", "writes", "execution")},
+                                       ensure_ascii=False), "node_id": node.id}
         if prompt is not None:
             raise PermissionError("node_artifact_provenance_unavailable")
         nodes = await self._metadata.list_execution_nodes(task.id)
@@ -914,7 +967,9 @@ class NodeExecutor:
             raise RuntimeError("Acceptance tests require an isolated Git worktree")
         previous = node.metadata.get("output") or {}
         if self._isolated_coding_required:
-            payload = task.metadata.get("acceptance_spec")
+            payload = (self._foreground_git.acceptance.to_payload()
+                       if self._foreground_git is not None
+                       else task.metadata.get("acceptance_spec"))
             if payload is None:
                 return {"waiting": True, "waiting_kind": "configuration",
                         "reason": "frozen_source_acceptance_required"}
@@ -1212,6 +1267,12 @@ class NodeExecutor:
             return tools, resources
         if sandbox is None:
             raise ValueError("Isolated model tools require a managed sandbox")
+        if self._foreground_git is not None:
+            selected = self._foreground_git.plan["reads"]
+            # These concrete tools use the node and FileBroker's exact-path handoff.
+            return ([tool for tool in tools
+                     if type(tool) in {SandboxReadTool, SandboxWriteTool, SandboxEditTool}],
+                    tuple(item for item in resources if item["path"] in selected))
         guard = IsolatedModelPathGuard(sandbox, task)
         return ([IsolatedModelTool(tool, guard) for tool in tools],
                 tuple(item for item in resources if guard.allows(item["path"])))
@@ -1233,7 +1294,8 @@ class NodeExecutor:
             }
         provider = (IsolatedGitWorktreeSandbox if self._isolated_coding_required
                     else GitWorktreeSandbox)
-        ref = await provider(workspace).create()
+        ref = (await self._foreground_git.allocate(scope.node) if self._foreground_git is not None
+               else await provider(workspace).create())
         if not self._isolated_coding_required:
             from Sprout.tools.context_keys import _current_project_node
 
@@ -1283,7 +1345,9 @@ class NodeExecutor:
             if design.get("isolated_design") is not True:
                 return {"waiting": True, "waiting_kind": "configuration",
                         "reason": "isolated_design_protocol_required", "status": "unverified"}
-            pinned = AcceptanceSpec.from_payload(task.metadata.get("acceptance_spec")).to_payload()
+            pinned = (self._foreground_git.acceptance.to_payload()
+                      if self._foreground_git is not None else
+                      AcceptanceSpec.from_payload(task.metadata.get("acceptance_spec")).to_payload())
             fingerprint = sha256(json.dumps(pinned, sort_keys=True).encode()).hexdigest()
             if (design.get("acceptance_spec") != pinned
                     or design.get("acceptance_fingerprint") != fingerprint):
@@ -1312,6 +1376,8 @@ class NodeExecutor:
                         measured["status"] = "failed"
                 measured["verification_report"] = build_verification_report(
                     self._test_results_from(measured), measured).to_payload()
+                if scope is not None and self._foreground_git is not None:
+                    await self._publish_repair_evidence(node, workspace, task, scope, measured)
             return measured
 
         planned: list[tuple[str, tuple[str, ...]]] = [
@@ -1991,6 +2057,17 @@ class NodeExecutor:
                     f"- status: {feedback.get('status', 'unknown')}",
                 ]
             )
+            repair = feedback.get("repair")
+            if isinstance(repair, dict):
+                lines.append("Frozen candidate and repair round: " + json.dumps(
+                    repair, ensure_ascii=False))
+            review = feedback.get("filesystem_review")
+            if isinstance(review, dict):
+                from Sprout.execution.filesystem_review import render_review
+
+                candidate_diff = render_review(review, task.id, workspace.id,
+                                               verification_status="failed")
+                lines.append("Current candidate diff:\n" + candidate_diff[:_NODE_OUTPUT_LIMIT])
             failed = feedback.get("failed_commands") or []
             if failed:
                 lines.append(f"- failed commands: {', '.join(map(str, failed))}")
@@ -2000,9 +2077,14 @@ class NodeExecutor:
                     continue
                 command = " ".join(map(str, item.get("command", [])))
                 lines.append(
-                    f"- {command}: exit {item.get('exit_code', '?')} "
+                    f"- {item.get('name') or command}: exit {item.get('exit_code', '?')} "
                     f"(passed={item.get('passed', False)})"
                 )
+                if item.get("passed") is False:
+                    for key in ("actual_output", "observed_exception", "diagnostic"):
+                        if item.get(key) is not None:
+                            lines.append(f"  {key}: " + json.dumps(
+                                item[key], ensure_ascii=False)[:_NODE_OUTPUT_LIMIT])
             test_results = feedback.get("test_results") or []
             for item in test_results:
                 if not isinstance(item, dict):

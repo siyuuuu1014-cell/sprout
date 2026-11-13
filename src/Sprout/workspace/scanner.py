@@ -6,7 +6,7 @@ import json
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from Sprout.task.models import Task
 from Sprout.workspace.classification import ResourceClassifier
@@ -124,7 +124,22 @@ _DEFAULT_EXCLUDES = (
     ".pytest_tmp",
     ".pytest-tmp",
     ".workbuddy",
+    ".mypy_cache",
+    ".tox",
+    ".cache",
+    ".next",
+    ".turbo",
+    ".ssh",
+    ".sprout",
+    ".codex",
+    ".agents",
 )
+
+
+def excluded_project_path(relative_path: str) -> bool:
+    """Lexically exclude generated and private components from project discovery."""
+    parts = PurePosixPath(relative_path.replace("\\", "/")).parts
+    return any(part.casefold() in _DEFAULT_EXCLUDES for part in parts)
 
 _KIND_PRIORITY = {
     ResourceKind.SOURCE: 3,
@@ -472,8 +487,7 @@ class WorkspaceScanner:
             path.resolve().relative_to(root.resolve())
         except ValueError:
             return True
-        parts = relative.parts
-        return any(part.casefold() in _DEFAULT_EXCLUDES for part in parts)
+        return excluded_project_path(relative.as_posix())
 
     @staticmethod
     def _relevance_score(path: Path, instruction: str) -> int:

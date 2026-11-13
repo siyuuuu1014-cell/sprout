@@ -1485,6 +1485,18 @@ async def _continue_foreground_task(runtime: Any, metadata: dict, user: str) -> 
         typer.echo(ui.key_value("status", task.status.value))
 
     nodes = await runtime.storage.metadata.list_execution_nodes(task_id)
+    if task.status.value == "completed" and _render_post_apply_verification(nodes, task_id):
+        _print_session_separator()
+        return
+    if task.status.value == "failed":
+        apply_nodes = [node for node in nodes if node.type.value == "apply"]
+        if all(node.status.value in {"pending", "ready", "skipped"} for node in apply_nodes):
+            typer.echo(_L("任务失败，未执行写回。", "Task failed; no write-back was executed."))
+        else:
+            typer.echo(_L("任务失败。请查看 Apply 事务结果。",
+                          "Task failed. See the Apply transaction result."))
+        _print_session_separator()
+        return
     response = next(
         (
             str(output.get("content") or "")
@@ -1498,6 +1510,44 @@ async def _continue_foreground_task(runtime: Any, metadata: dict, user: str) -> 
     if response:
         _render_cli_markdown(response)
     _print_session_separator()
+
+
+def _render_post_apply_verification(nodes, task_id: str) -> bool:
+    for node in reversed(nodes):
+        if (node.task_id != task_id or node.type.value != "apply"
+                or node.status.value != "completed"
+                or node.metadata.get("execution_guard", {}).get("state") != "completed"):
+            continue
+        output = node.metadata.get("output") or {}
+        verification = output.get("verification") or {}
+        if (output.get("applied") is not True or not output.get("transaction_id")
+                or verification.get("verified") is not True):
+            continue
+
+        for result in (verification.get("pytest") or {}).get("results", ()):
+            if result.get("passed") is not True or result.get("exit_code") != 0:
+                continue
+            label = _L("写回后 Docker pytest", "Post-Apply Docker pytest")
+            summary = next(
+                (line.strip() for line in reversed(result.get("output", "").splitlines())
+                 if re.search(r"\b\d+ passed\b", line)),
+                "",
+            )
+            summary = "".join(char for char in summary[:240] if char.isprintable())
+            typer.echo(f"{label} (exit 0)" + (f" · {summary}" if summary else ""))
+
+        checks = (verification.get("cases") or {}).get("results", ())
+        counts = []
+        for kind, label in (("acceptance", "Acceptance"), ("regression", "Regression"),
+                            ("poc", "Demo")):
+            cases = [case for case in checks if case.get("kind") == kind]
+            if cases:
+                passed = sum(case.get("passed") is True for case in cases)
+                counts.append(f"{label} {passed}/{len(cases)}")
+        if counts:
+            typer.echo(" · ".join(counts))
+        return True
+    return False
 
 
 def _workspace_consent_text(key: str, **values: object) -> str:

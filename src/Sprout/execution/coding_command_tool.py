@@ -22,12 +22,13 @@ class IsolatedCodingCommandTool:
                       "required": ["command"]})
 
     def __init__(self, handler, *, task, node, sandbox, filesystem_root_only=False,
-                 retry_failed_tests=False, require_test_command=False):
+                 retry_failed_tests=False, require_test_command=False, planned_paths=None):
         self._handler, self._task, self._node = handler, task, node
         self._sandbox = sandbox
         if filesystem_root_only and sandbox.kind != "filesystem_experiment":
             raise ValueError("Filesystem experiment sandbox required")
-        self._guard = None if filesystem_root_only else IsolatedModelPathGuard(sandbox, task)
+        self._guard = (None if filesystem_root_only else IsolatedModelPathGuard(
+            sandbox, task, planned_paths=planned_paths))
         self._used = False
         self._retry_enabled = filesystem_root_only and retry_failed_tests
         self._retry_command = None

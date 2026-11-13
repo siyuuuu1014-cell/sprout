@@ -1845,7 +1845,17 @@ class Runtime:
                     raise PermissionError("node_tool_sandbox_unavailable")
                 # The isolated adapter validates relative_cwd and import paths
                 # against the same persisted sandbox before dispatch.
-                if experiment is not None:
+                foreground = getattr(tool._handler, "foreground_git", None)
+                if foreground is not None:
+                    await foreground.subject(scope.node)
+                    if sandbox != foreground.sandbox or "process.run" not in paths.allowed_actions:
+                        raise PermissionError("foreground_git_command_subject_changed")
+                    target = foreground.plan["writes"][0]
+                    resource = ResourceRef(workspace.id, (sandbox.root / target).as_posix(),
+                                           kind=classify(target))
+                    paths = task.delegation_scope.bind_paths(str(sandbox.root)).narrow(
+                        scope.task.delegation_scope.bind_paths(str(sandbox.root)))
+                elif experiment is not None:
                     resource = ResourceRef(workspace.id, workspace.root.as_posix(),
                                            kind=classify(workspace.root))
                 return ActionRequest(task_id=task.id, actor=task.actor,
@@ -1958,7 +1968,7 @@ class Runtime:
         if (registered is None or sandbox != registered[0]
                 or tool._broker is not self._file_broker
                 or path not in task.metadata.get("required_paths", ())
-                or "host_acceptance_v1" not in task.metadata):
+                or not ({"host_acceptance_v1", "host_acceptance_v2"} & task.metadata.keys())):
             return False
         await self._node_tool_request(tool, arguments)
         captured = await self._file_broker.read_text(
@@ -2147,11 +2157,14 @@ class Runtime:
         discovered = paths is None
         identities = None
         if discovered:
+            from Sprout.workspace.scanner import excluded_project_path
+
             sandbox = SandboxRef(frame.node_scope.workspace.id, "restricted_analysis",
                                  frame.node_scope.workspace.root)
             directory = Path(subject.resource.path)
             listing = await self._file_broker.enumerate_readable(
                 sandbox, directory.relative_to(sandbox.root).as_posix(), subject=subject,
+                exclude_path=excluded_project_path,
             )
             if not listing.ok:
                 admission = self._online_analysis_requests.get(frame.node_scope.node.id)
@@ -2826,6 +2839,10 @@ class Runtime:
         parents = []
         parent_ids = set(scope.node.dependencies) | set(scope.parent_receipts)
         for dependency in sorted(parent_ids):
+            if scope.repair_agent_parent and dependency == scope.repair_agent_parent[0]:
+                parents.append({"node_id": dependency,
+                                "output_digest": scope.repair_agent_parent[1]})
+                continue
             parent = self._node_products.get((scope.task.id, dependency))
             if parent is None or len(parent) != 7:
                 return  # Missing transitive inputs cannot acquire a new origin.
@@ -2936,7 +2953,9 @@ class Runtime:
             found = True
             admitted_ids.add(node.id)
             paths.update(record[4])
-        if any(dependency not in admitted_ids for dependency in scope.node.dependencies):
+        repair_parent = getattr(scope, "repair_agent_parent", None)
+        structural = {repair_parent[0]} if repair_parent else set()
+        if set(scope.node.dependencies) - admitted_ids - structural:
             raise PermissionError("node_artifact_provenance_unavailable")
         # Re-capture to authorize and verify READ content before every publication.
         if paths:
@@ -3252,7 +3271,7 @@ class Runtime:
     # -- online path ---------------------------------------------------------
     async def _dispatch_project_analysis(
         self, message, session, *, principal, analysis_task, classification,
-        analysis_task_provider=None, reply_to=None, on_capture=None,
+        analysis_task_provider=None, reply_to=None, on_capture=None, on_evidence=None,
     ):
         """Admit an explicit host reference; routing hints confer no authority.
 
@@ -3265,11 +3284,12 @@ class Runtime:
             explicit_request,
             source_review_request,
         )
-        from Sprout.runtime.isolated_test_run import execution_request
+        from Sprout.runtime.isolated_test_run import conditional_repair_request, execution_request
 
         if (analysis_task is None and analysis_task_provider is not None
                 and principal is not None and principal.authenticated and principal.source == "cli"
-                and (execution_request(message.content) or detect_task_hint(message.content))):
+                and (execution_request(message.content) or detect_task_hint(message.content)
+                     or conditional_repair_request(message.content))):
             return None
         from Sprout.runtime.dialogue import (
             analysis_followup,
@@ -3419,6 +3439,8 @@ class Runtime:
                 admission["content_project"] = lambda analysis, view: python_metrics(
                     view.get(paths[0]))
                 admission["code_metrics"] = True
+            if on_evidence is not None:
+                admission["content_project"] = lambda analysis, view: tuple(view.entries)
             self._online_analysis_requests[node.id] = admission
             graph = ExecutionGraph(task_id=task.id, nodes=(node,), entry_node_ids=(node.id,))
             result = await SequentialOrchestrator(store).execute(
@@ -3451,6 +3473,8 @@ class Runtime:
             await self._session_store.save_session(current_session)
             if on_capture is not None:
                 on_capture(admission["analysis_data"])
+            if on_evidence is not None:
+                on_evidence(admission["projected_data"])
             reason = ""
         except PermissionError as exc:
             content = reason = str(exc)
@@ -3706,18 +3730,40 @@ class Runtime:
                 },
             )
         report(self, "Task", f"created: {task.id}")
+        if code_task_provider is not None:
+            current_session = await self._sessions.require_owner(session.id, principal)
+            current_session.metadata = {
+                **current_session.metadata, "last_code_task_id": task.id}
+            await self._session_store.save_session(current_session)
+            if self._awaits_internal_acceptance(task):
+                content = f"Task {task.id}: prepared (awaiting_internal_acceptance)"
+                report(self, "Task", f"{task.id}: prepared (awaiting_internal_acceptance)")
+                await self._persist_turns(session, message, AgentResult(content=content))
+                return OutboundMessage(
+                    content, message.channel, session.id, message.id,
+                    {"intent": "task", "task_id": task.id, "task_status": task.status.value,
+                     "preparation_status": "awaiting_internal_acceptance"},
+                )
         if foreground:
-            if code_task_provider is not None:
-                current_session = await self._sessions.require_owner(session.id, principal)
-                current_session.metadata = {
-                    **current_session.metadata, "last_code_task_id": task.id}
-                await self._session_store.save_session(current_session)
             experiment = self._sandbox_lifecycle.filesystem.get(task.id)
             post_apply = getattr(experiment, "post_apply_tests", None)
             result = await self.execute(task)
             report(self, "Task", f"{task.id}: {result.status.value}")
             content = f"Task {task.id}: {result.status.value}"
             review_text = ""
+            if "host_acceptance_v2" in task.metadata:
+                review_node = await self._metadata_or_raise().get_execution_node(
+                    f"{task.id}:approval")
+                review = (review_node.metadata.get("output") or {}) if review_node else {}
+                if review.get("status") == "reviewed":
+                    review_text = "Git Review complete\n" + review["diff"]
+                applied = await self._metadata_or_raise().get_execution_node(f"{task.id}:apply")
+                applied_output = (applied.metadata.get("output") or {}) if applied else {}
+                if applied_output.get("applied") is True:
+                    content += f"\nGit Apply transaction: {applied_output['transaction_id']}"
+                    content += "\nPost-Apply pytest, Acceptance and Regression passed."
+                if result.error:
+                    content += f" ({result.error})"
             if task.metadata.get("filesystem_experiment") and (
                     result.status is TaskStatus.COMPLETED or result.error in {
                         "filesystem_verification_required", "filesystem_source_conflict_at_review",
@@ -3769,7 +3815,9 @@ class Runtime:
                 review_text = render_review(
                     review, task.id, task.workspace_id,
                     verification_status=verification_status(
-                        evaluated, review, task.id, task.workspace_id),
+                        evaluated, review, task.id, task.workspace_id,
+                        bundle=task.metadata.get("filesystem_acceptance_v1"),
+                    ),
                 )
             elif (result.error or "").startswith("filesystem_test_"):
                 content += f" ({result.error.split(':', 1)[0]})"
@@ -3921,8 +3969,17 @@ class Runtime:
         :meth:`_workspace_request_from_agent`, runs after the agent and handles
         the case this gate cannot see.
         """
-        from Sprout.runtime.isolated_test_run import dispatch, execution_request
+        from Sprout.runtime.isolated_test_run import (
+            conditional_repair_request,
+            dispatch,
+            dispatch_conditional_repair,
+            execution_request,
+        )
 
+        if conditional_repair_request(message.content or "") and message.channel == "cli":
+            return await dispatch_conditional_repair(
+                self, message, session, principal, foreground, code_task_provider,
+            ), None
         if execution_request(message.content or ""):
             return await dispatch(self, message, session, principal, foreground,
                                   code_task_provider), None
@@ -5373,7 +5430,7 @@ class Runtime:
         _filesystem_foreground: bool = False,
     ) -> Task:
         """Create and persist a task without starting orchestration yet."""
-        if metadata and "host_acceptance_v1" in metadata:
+        if metadata and {"host_acceptance_v1", "host_acceptance_v2"} & metadata.keys():
             raise PermissionError("host_acceptance_requires_explicit_host_binding")
         store = self.storage.metadata
         if store is None:
@@ -5410,7 +5467,9 @@ class Runtime:
         await store.save_task(task)
         return task
 
-    async def bind_task_acceptance(self, task_id, *, principal, spec, test_path, demo_path):
+    async def bind_task_acceptance(
+        self, task_id, *, principal, spec=None, test_path=None, demo_path=None, git_executable=None,
+    ):
         """Explicit Python host input, before any graph exists. No Scope expansion."""
         from dataclasses import asdict
 
@@ -5426,10 +5485,16 @@ class Runtime:
                 or task.source != principal.source
                 or task.execution_mode is not TaskExecutionMode.CODE
                 or task.status is not TaskStatus.CREATED or task.delegation_scope.is_expired()
-                or task.metadata.get("host_acceptance_v1")
+                or {"host_acceptance_v1", "host_acceptance_v2"} & task.metadata.keys()
                 or await store.list_execution_nodes(task_id)):
             raise PermissionError("host_acceptance_subject_unavailable")
         workspace = await store.get_workspace(task.workspace_id)
+        if "git_acceptance_v1" in task.metadata:
+            if any(value is not None for value in (spec, test_path, demo_path)):
+                raise PermissionError("git_acceptance_replacement_forbidden")
+            return await self._bind_frozen_git_acceptance(task, workspace, git_executable)
+        if git_executable is not None:
+            raise PermissionError("git_acceptance_bundle_required")
         spec = AcceptanceSpec.from_payload(spec)
         test_path, demo_path = relative_label(test_path), relative_label(demo_path)
         if test_path == demo_path:
@@ -5457,6 +5522,62 @@ class Runtime:
                    "test_path": test_path, "demo_path": demo_path, "resources": resources}
         binding["sha256"] = payload_digest(binding)
         bound = replace(task, metadata={**task.metadata, "host_acceptance_v1": binding})
+        await store.save_task(bound)
+        return bound
+
+    async def _bind_frozen_git_acceptance(self, task, workspace, executable):
+        from Sprout.execution.acceptance_producer import check_git_coverage, check_preparation
+        from Sprout.execution.git_acceptance_binding import (
+            capture_artifacts,
+            capture_installation,
+            capture_repository,
+        )
+        from Sprout.execution.host_acceptance import binding_subject
+        from Sprout.execution.node_result_source import payload_digest
+        from Sprout.workspace.models import WorkspaceKind
+
+        if (workspace is None or workspace.kind is not WorkspaceKind.GIT_REPOSITORY
+                or task.source != "cli" or not self._awaits_internal_acceptance(task)
+                or not executable):
+            raise PermissionError("git_acceptance_binding_unavailable")
+        plan = task.metadata["coding_preparation_v1"]
+        bundle = task.metadata["git_acceptance_v1"]
+        acceptance, regression = check_preparation(bundle, task.instruction, plan)
+        check_git_coverage(acceptance, task.instruction)
+        session = await self._sessions.require_owner(task.metadata["session_id"], task.actor)
+        if (self._sessions.frozen_principal(session) != task.actor
+                or self.session_workspace_id(session) != workspace.id):
+            raise PermissionError("git_acceptance_session_changed")
+        repository = capture_repository(workspace.root)
+        installation = capture_installation(workspace.root, executable)
+
+        def capture(_analysis, view):
+            return {entry.relative_path: entry.digest for entry in view.entries}
+
+        captured = await self._capture_preparation(
+            replace(workspace, manifest=None), actor=task.actor, source=task.source,
+            scope=task.delegation_scope, instruction="Recheck frozen Git source inputs",
+            metadata={"required_paths": plan["reads"], "session_id": session.id},
+            parent=task, project=capture,
+        )
+        # Explicit Windows selections use the normalized Scope spelling, while
+        # discovery records the original directory-entry spelling.
+        expected = {path.casefold(): digest for path, digest in bundle["source_files"].items()}
+        actual = {path.casefold(): digest for path, digest in captured.items()}
+        if (len(expected) != len(bundle["source_files"]) or len(actual) != len(captured)
+                or expected != actual or repository != capture_repository(workspace.root)):
+            raise PermissionError("git_acceptance_source_changed")
+        artifacts = capture_artifacts(workspace.root, acceptance, regression, bundle)
+        store = self._metadata_or_raise()
+        if (task != await store.get_task(task.id)
+                or workspace != await store.get_workspace(task.workspace_id)
+                or await store.list_execution_nodes(task.id)):
+            raise PermissionError("host_acceptance_subject_changed")
+        binding = {"version": 2, "subject": binding_subject(task, workspace),
+                   "bundle_sha256": bundle["bundle_sha256"], "artifacts": artifacts,
+                   "repository": repository, "git_installation": installation}
+        binding["sha256"] = payload_digest(binding)
+        bound = replace(task, metadata={**task.metadata, "host_acceptance_v2": binding})
         await store.save_task(bound)
         return bound
 
@@ -6043,7 +6164,10 @@ class Runtime:
         evaluated = await self._metadata_or_raise().get_execution_node(f"{task.id}:evaluation")
         text = render_review(
             review, task.id, task.workspace_id,
-            verification_status=verification_status(evaluated, review, task.id, task.workspace_id),
+            verification_status=verification_status(
+                evaluated, review, task.id, task.workspace_id,
+                bundle=task.metadata.get("filesystem_acceptance_v1"),
+            ),
         )
         from Sprout.execution.filesystem_apply import transaction_summary
 
@@ -6104,6 +6228,10 @@ class Runtime:
                         "new_submission": False, "worker_started": False,
                         "submission_ids": [record["id"] for record in records],
                         "next_action": "Observe existing submissions; no automatic retry"}
+            if self._awaits_internal_acceptance(task):
+                raise ValueError("awaiting_internal_acceptance")
+            if "host_acceptance_v2" in task.metadata:
+                raise ValueError("foreground_git_local_only")
             if task.metadata.get("replay_plan"):
                 raise ValueError("Isolated experiments require dedicated coding-submit admission")
             if task.status not in {TaskStatus.CREATED, TaskStatus.READY}:
@@ -6205,12 +6333,22 @@ class Runtime:
             raise ValueError("Coding tasks require Git; initialize Git yourself first")
         return replace(task, metadata=execution_metadata(task.metadata, task.execution_mode))
 
+    @staticmethod
+    def _awaits_internal_acceptance(task: Task) -> bool:
+        preparation = task.metadata.get("coding_preparation_v1")
+        return (isinstance(preparation, dict) and preparation.get("version") == 1
+                and preparation.get("adapter") == "git"
+                and preparation.get("state") == "awaiting_internal_acceptance")
+
     async def _isolated_execution_wait(self, task: Task) -> TaskResult | None:
         """Apply the same fail-closed admission to initial and resumed execution.
 
         A callable dispatcher is only a necessary condition, not commissioning
         or write authority; node-level binding and validation remain mandatory.
         """
+        if self._awaits_internal_acceptance(task):
+            return TaskResult(task_id=task.id, status=task.status,
+                              error="awaiting_internal_acceptance")
         if not getattr(self, "_isolated_coding_required", False):
             return None
         if callable(getattr(self, "_isolated_coding_dispatch", None)):
@@ -6233,14 +6371,12 @@ class Runtime:
         *,
         artifact_snapshot: ArtifactSnapshot | None,
         backend=None,
+        foreground_git_resume=False,
     ) -> TaskResult:
         """Run a task through the V0.1 project execution pipeline."""
         metadata = self.storage.metadata
         if metadata is None:
             raise RuntimeError("MetadataStore is not configured")
-        isolated_wait = await self._isolated_execution_wait(task)
-        if isolated_wait is not None:
-            return isolated_wait
         execution_backend = backend or self._orchestrator_for(metadata)
         authoritative = await metadata.get_task(task.id)
         if authoritative is not None:
@@ -6254,13 +6390,37 @@ class Runtime:
                     TaskStatus.ROLLED_BACK,
                 }:
                     return TaskResult(task_id=task.id, status=task.status)
+        isolated_wait = await self._isolated_execution_wait(task)
+        if isolated_wait is not None:
+            return isolated_wait
         workspace = await metadata.get_workspace(task.workspace_id)
         if workspace is None:
             raise LookupError(f"Workspace not found: {task.workspace_id}")
 
         task = self._task_for_execution(task, workspace)
+        foreground_git = None
+        if "host_acceptance_v2" in task.metadata:
+            from Sprout.orchestration.terminal import LocalOrchestratorBackend
+            from Sprout.runtime.foreground_git_coding import ForegroundGitCoding
 
-        if task.execution_mode is TaskExecutionMode.READ_ONLY:
+            if (not isinstance(execution_backend, LocalOrchestratorBackend)
+                    or (not foreground_git_resume and task.status is not TaskStatus.CREATED)
+                    or self._cli_code_writes.get(task.id) != (
+                        task.actor, task.metadata.get("session_id"), task.workspace_id,
+                        tuple(task.metadata["coding_preparation_v1"]["writes"]),
+                    )):
+                raise PermissionError("foreground_git_local_preparation_required")
+            foreground_git = ForegroundGitCoding(
+                self, task, workspace, reviewed=foreground_git_resume)
+            if foreground_git_resume:
+                await foreground_git.restore_review()
+
+        if foreground_git is not None:
+            prepared_workspace, read_plan = self._known_read_only_plan(workspace, task)
+            run_tests = "run_tests" in foreground_git.plan["execution"]
+            commands = ("python -m pytest -q",) if run_tests else ()
+            manifest = replace(prepared_workspace.manifest, test_commands=commands)
+        elif task.execution_mode is TaskExecutionMode.READ_ONLY:
             workspace, read_plan = self._known_read_only_plan(
                 workspace, task,
                 scheduling=isinstance(execution_backend, TemporalOrchestratorBackend),
@@ -6294,9 +6454,30 @@ class Runtime:
             steps=steps,
             verification_commands=verification_commands,
         )
+        if foreground_git is not None:
+            evaluation_rounds = iter(range(self._verify_loops()))
+            graph = replace(graph, nodes=tuple(
+                replace(node, metadata={**node.metadata, "foreground_git_apply": True})
+                if node.type is NodeType.APPLY else
+                replace(node, metadata={**node.metadata,
+                                        "foreground_repair_round": next(evaluation_rounds)})
+                if node.type is NodeType.EVALUATION else node for node in graph.nodes
+            ))
         graph = await self._restore_graph(graph)
+        if foreground_git_resume and any(
+            node.status not in ({NodeStatus.PENDING, NodeStatus.READY}
+                                if node.type is NodeType.APPLY
+                                else {NodeStatus.COMPLETED, NodeStatus.SKIPPED})
+            for node in graph.nodes
+        ):
+            raise PermissionError("foreground_git_resume_requires_settled_review")
         recorder = JsonlTrajectoryRecorder(trajectory_path(self._trajectory_dir, task.id))
         executor = self._executor(metadata)
+        if foreground_git is not None:
+            executor._foreground_git = foreground_git
+            executor._isolated_coding_required = True
+            executor._coding_session_factory = foreground_git.session
+            executor._coding_commands = foreground_git.commands
         previous_skills = self.skills.list()
         pinned_skill = await executor.pin_snapshot(recorder, artifact_snapshot, task.id)
         try:
@@ -6329,6 +6510,8 @@ class Runtime:
         authoritative = await metadata.get_task(task.id)
         if authoritative is None:
             raise LookupError(f"Task not found: {task.id}")
+        if "host_acceptance_v2" in authoritative.metadata:
+            return await self._resume_foreground_git(authoritative)
         # Callers may retain a pre-approval snapshot. Never compile a resumed
         # graph from its stale workspace, mode, actor, scope or acceptance data.
         task = authoritative
@@ -6386,6 +6569,46 @@ class Runtime:
         await self._persist_node_products()
         await self._sandbox_lifecycle.finalize(task, result)
         return result
+
+    async def _resume_foreground_git(self, task):
+        from uuid import NAMESPACE_URL, uuid5
+
+        from Sprout.security.local_diagnostics import current
+
+        async with self._workspace_locks.lock(task.workspace_id):
+            store = self._metadata_or_raise()
+            await store.reconcile_filesystem_apply()
+            task = await store.get_task(task.id)
+            if task.status in {TaskStatus.COMPLETED, TaskStatus.CANCELLED,
+                               TaskStatus.ROLLED_BACK, TaskStatus.FAILED}:
+                return TaskResult(task_id=task.id, status=task.status)
+            if "file.apply" not in task.delegation_scope.allowed_actions:
+                raise PermissionError("foreground_git_apply_scope_missing")
+            transaction = str(uuid5(NAMESPACE_URL, "foreground-git-apply:" + task.id))
+            if await store.get_apply_transaction(transaction) is not None:
+                raise PermissionError("foreground_git_apply_reconciliation_required")
+            session_id = task.metadata["session_id"]
+            writes = tuple(task.metadata["coding_preparation_v1"]["writes"])
+            binding = (task.actor, session_id, task.workspace_id, writes)
+            previous = self._cli_code_writes.get(task.id)
+            if previous is not None and previous != binding:
+                raise PermissionError("foreground_git_resume_cli_binding_changed")
+            if previous is None:
+                mode = current(self)
+                if mode is None or (mode.principal, mode.session_id) != (task.actor, session_id):
+                    raise PermissionError("foreground_git_resume_cli_session_required")
+                await mode.require()
+            session = await self._sessions.require_owner(session_id, task.actor)
+            if (self._sessions.frozen_principal(session) != task.actor
+                    or self.session_workspace_id(session) != task.workspace_id):
+                raise PermissionError("foreground_git_resume_session_changed")
+            self._cli_code_writes[task.id] = binding
+            try:
+                return await self._execute_task(
+                    task, artifact_snapshot=None, foreground_git_resume=True)
+            finally:
+                if previous is None:
+                    self._cli_code_writes.pop(task.id, None)
 
     async def _restore_graph(self, graph: ExecutionGraph) -> ExecutionGraph:
         """Overlay persisted node state onto a freshly compiled graph.

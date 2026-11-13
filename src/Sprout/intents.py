@@ -134,6 +134,16 @@ def project_request_text(text: str) -> str:
     )
 
 
+def strip_project_reference(clause: str) -> str:
+    """Remove a leading file citation so the following operation can be classified."""
+    return re.sub(
+        r"^(?:请)?(?:严格\s*)?(?:按照|按|参考|依据)\s*(?:已经读取的\s*)?"
+        r"[A-Za-z0-9_./-]+\.[A-Za-z][A-Za-z0-9_]*(?=\s|[^\x00-\x7F]|$)",
+        "",
+        clause,
+    ).strip()
+
+
 def write_intent_disposition(text: str) -> WriteIntentDisposition:
     """Pure, conservative text judgment; UNKNOWN needs explicit human confirmation.
 
@@ -150,8 +160,19 @@ def write_intent_disposition(text: str) -> WriteIntentDisposition:
     # Ambiguous/mixed/quoted requests require a fresh explicit instruction.
     if any(mark in lowered for mark in ('"', "“", "”", "‘", "’", "`")):
         return WriteIntentDisposition.KNOWN_NONWRITE
+    stripped = strip_project_reference(stripped)
+    lowered = stripped.casefold()
+    clauses = project_clauses(stripped)
+    if _project_write_cancelled(clauses):
+        return WriteIntentDisposition.KNOWN_NONWRITE
+    if len(clauses) > 1 and "\n" not in stripped and not stripped.endswith(("?", "？", "吗", "么")):
+        primary, *details = clauses
+        if (write_intent_disposition(primary) is WriteIntentDisposition.EXPLICIT_WRITE
+                and all(_coding_detail(clause) for clause in details)):
+            return WriteIntentDisposition.EXPLICIT_WRITE
+        if _inspect_then_edit(clauses):
+            return WriteIntentDisposition.EXPLICIT_WRITE
     if "\n" in stripped:
-        clauses = project_clauses(stripped)
         first = clauses[0] if clauses else ""
         # Classify the primary operation independently of subsequent execution
         # requirements and file exclusions. A claimed authorization is not an
@@ -159,9 +180,6 @@ def write_intent_disposition(text: str) -> WriteIntentDisposition:
         primary = write_intent_disposition(first)
         resume = re.fullmatch(r"(?:请)?(?:直接|立即)执行[^。；;\n]*代码修改任务", first)
         edits = [c.removeprefix("只") for c in clauses]
-        cancelled = _project_write_cancelled(clauses)
-        if cancelled:
-            return WriteIntentDisposition.KNOWN_NONWRITE
         if (primary is WriteIntentDisposition.EXPLICIT_WRITE or (resume and any(
             write_intent_disposition(c) is WriteIntentDisposition.EXPLICIT_WRITE
             for c in edits
@@ -275,12 +293,45 @@ def project_clauses(text: str) -> tuple[str, ...]:
 
 def _project_write_cancelled(clauses: tuple[str, ...]) -> bool:
     """Global cancellation remains distinct from file-specific exclusions."""
-    return any(c.removeprefix("请").casefold().startswith((
+    return any(strip_project_reference(c).removeprefix("请").casefold().startswith((
         "取消", "先别执行", "不要执行", "不执行",
         "不要修改任何", "不修改任何", "不做任何修改",
         "只分析", "仅分析", "do not modify any", "don't modify any",
         "only analyze", "only analyse",
     )) for c in clauses)
+
+
+def _inspect_then_edit(clauses: tuple[str, ...]) -> bool:
+    """Inspection can prepare an explicit edit in the same request."""
+    for index, clause in enumerate(clauses):
+        if re.match(r"^(?:请)?(?:先)?(?:分析|检查|读取|阅读|查看)(?=.)", clause):
+            continue
+        action = strip_project_reference(clause)
+        if (index == 0 or re.search(r"(?:方案|建议|思路|计划)$", action)
+                or write_intent_disposition(action) is not WriteIntentDisposition.EXPLICIT_WRITE):
+            return False
+        return all(_coding_detail(detail) for detail in clauses[index + 1:])
+    return False
+
+
+def _coding_detail(clause: str) -> bool:
+    """A trailing file restriction or execution phase qualifies the primary edit."""
+    if re.fullmatch(
+        r"(?:请)?(?:不要|不)(?:修改|改动|写入)\s*"
+        r"(?:[\w./-]+(?:\.[\w-]+|/)|(?:其他|现有|原有)(?:测试)?文件|规格(?:文件)?|"
+        r"(?:现有|原有)测试(?:文件)?)"
+        r"(?:\s*(?:和|及|以及)\s*(?:现有|原有)?测试(?:文件)?)?",
+        clause,
+    ):
+        return True
+    # A phase list may contain a read-only check after applying changes.
+    phases = re.split(r"、|和|以及|及", clause.removeprefix("完成"))
+    if all(re.fullmatch(
+        r"独立验证|验收|审查|review|apply|写回|(?:写回|apply)后只读(?:复测|验证)",
+        phase.strip(), flags=re.IGNORECASE,
+    ) for phase in phases):
+        return True
+    return write_intent_disposition(clause) is not WriteIntentDisposition.KNOWN_NONWRITE
 
 
 def conditional_test_extension(text: str) -> bool:
@@ -293,13 +344,17 @@ def conditional_test_extension(text: str) -> bool:
 
 def project_feature_edit(clause: str) -> bool:
     """A direct feature edit, including one without a named file."""
-    return re.fullmatch(r"(?:请)?完善[^，。；！？]{1,60}功能", clause) is not None
+    return re.fullmatch(
+        r"(?:请)?(?:(?:为|给)(?:当前|当前这个|这个|该|本)项目\s*)?"
+        r"(?:完善|新增|添加|增加|实现)[^，。；！？]{1,60}功能",
+        clause,
+    ) is not None
 
 
 def detect_task_hint(text: str) -> bool:
     """Compatible bool fast path; UNKNOWN is not permission to create a Task."""
     text = project_request_text(text)
-    if "\n" in text and _project_write_cancelled(project_clauses(text)):
+    if _project_write_cancelled(project_clauses(text)):
         return False
     if write_intent_disposition(text) is WriteIntentDisposition.EXPLICIT_WRITE:
         return True

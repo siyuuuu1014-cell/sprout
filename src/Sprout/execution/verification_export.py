@@ -166,7 +166,7 @@ def private_resource(relative, root, overrides=None):
 
 def export_input(
     repo: Path, destination: Path, original: Path, *, classify_overrides=None, exclude_paths=(),
-    manifest_only=False
+    manifest_only=False, selected_paths=None,
 ) -> dict[str, str]:
     repo, original = safe_path(repo), safe_path(original)
     exclusions = []
@@ -187,6 +187,7 @@ def export_input(
         raise ValueError("Export destination must not overlap input or original workspace")
     if not manifest_only:
         destination.mkdir(parents=True, exist_ok=False)
+    selected = None if selected_paths is None else {Path(path) for path in selected_paths}
     manifest = {}
     total = 0
     for parent, directories, files in os.walk(repo, followlinks=False):
@@ -199,7 +200,8 @@ def export_input(
         for name in files:
             path = Path(parent) / name
             relative = path.relative_to(repo)
-            if name.casefold() in EXCLUDED or excluded(path):
+            if (name.casefold() in EXCLUDED or excluded(path)
+                    or selected is not None and relative not in selected):
                 continue
             if private_resource(relative, repo, classify_overrides):
                 raise ValueError("Private/data input requires an explicit supported adapter")

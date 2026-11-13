@@ -21,7 +21,8 @@ from Sprout.task.models import Task, TaskStatus
 from Sprout.workspace.models import Workspace
 
 
-async def fixture(tmp_path, *, actual="2", forged_report=False, auxiliary_mode=None):
+async def fixture(tmp_path, *, actual="2", forged_report=False, auxiliary_mode=None,
+                  extended=False):
     original, evidence = tmp_path / "original", tmp_path / "experiment"
     original.mkdir()
     repo = evidence / "repo"
@@ -35,6 +36,10 @@ async def fixture(tmp_path, *, actual="2", forged_report=False, auxiliary_mode=N
     sandbox = await IsolatedGitWorktreeSandbox(workspace).create()
     (sandbox.root / "app.py").write_text("def run(): return 2\n", encoding="utf-8", newline="")
     spec = {"cases": [{"id": "ok", "target": "app:run", "expected_output": 2}]}
+    if extended:
+        spec["cases"][0].update(
+            args=[[1]], iterable_args=[{"argument": 0, "kind": "iterator"}],
+        )
     image = "sha256:" + "a" * 64
     plan = build_plan(source_task_id="source", revision=git(repo, "rev-parse", "HEAD"),
         mode="code", original=original, repo=repo, tests=("pytest",), regressions=("pytest",),
@@ -111,6 +116,21 @@ async def test_persisted_raw_actuals_bind_source_but_never_authorize_write(tmp_p
         assert result["evidence_binding_passed"] is True
         assert len(result["evidence_fingerprint"]) == 64
         assert result["write_authorized"] is False and result["validation_authorized"] is False
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(("actual", "matched"), [
+    ('{"outcome":"returned","value":2}', True),
+    ('{"outcome":"returned","value":3}', False),
+    ('{"outcome":"raised","exception":"ValueError"}', False),
+])
+async def test_git_evidence_rejudges_v2_observations(tmp_path, actual, matched):
+    store, task, node, _, planner, plan = await fixture(tmp_path, actual=actual, extended=True)
+    try:
+        result = await inspect(store, task, node, planner, plan)
+        assert result["evidence_binding_passed"] is matched
+        assert result["write_authorized"] is False
     finally:
         store.close()
 
